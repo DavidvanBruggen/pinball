@@ -58,16 +58,48 @@ hqd_include_local_window: False
 hqd_every_n: 4
 hqd_reuse_previous: False
 hqd_reuse_max_age: 0
-hqd_topk_l3: 16 #8 #4 #16 #16 # 4
-hqd_topk_l2: 16 #8 #4 #16 #8 #32 # 4
+hqd_topk_l3: 8 #8 #4 #16 #16 # 4
+hqd_topk_l2: 8 #8 #4 #16 #8 #32 # 4
 hqd_topk_l1: 16 #16 #4 #128 #32 #64 # 16
-hqd_topk_l0: 16 #64 #64 #256 #64 #128 # 128
+hqd_topk_l0: 64 #64 #64 #256 #64 #128 # 128
 hqd_l0_topk_enable: True
 hqd_query_level: 0       # query at L0 (token level); query_level>=1 breaks AR causality
 hqd_stop_level: 0
 hqd_handoff_to_l0: false
 hqd_global_topk: 0 #65536
 hqd_use_existing_zipper_projections: true   # reuse the zipper q/k projections
+
+# HQD final-read levels: which selected levels the L0 query attends over. [0] = L0 only
+# (original behavior); [0, 1, 2, 3] also mixes selected L1/L2/L3 summary nodes into the
+# attention (level-aware scoring handles cross-level q.k). Causal-safe at query_level 0.
+hqd_read_levels: [0, 1, 2, 3]
+
+# Per-level window bag: scatter the L0 routing's per-level selections back UP so coarse nodes
+# (L1/L2/L3) also gain lateral reach, not just L0. [] = off.
+#   per_position : each coarse node's bag = its own descendants' selections (re-targeted to the
+#                  query's ancestor). STRICTLY CAUSAL (past-Δ = 0). Recommended for AR.
+#   global       : one shared top-k bag per level. NOT strictly AR-causal (shared top-k sees all
+#                  positions; leak ~1e-7) — use only for masked-diffusion / bidirectional.
+hqd_window_bag_levels: []            # e.g. [1, 2, 3] to give coarse levels lateral reach
+hqd_window_bag_routing: per_position # per_position (causal) | global (non-causal, bidi only)
+# per_position: 0 = natural bound (~descendants x topk_lX edges/node); >0 = hard fixed budget
+#               (top-N descendant selections per coarse node). global: shared bag size (0 -> 16).
+hqd_window_bag_topk: 0
+
+# Witness packets (requires use_hqd + hqd_query_level: 0). Each selected L1 node exposes a
+# bounded packet of L0 child ids it "cannot forget"; these are force-included (via a score
+# bias) into the HQD final-stage candidate set so important/rare tokens survive top-k pruning.
+# Causality-safe at query_level 0 (witnesses inherit the existing candidate causal mask).
+use_witness_packets: false        # master switch (default off = identical to plain HQD)
+use_summary_witnesses: true       # top-k children by graph responsibility (q_parent . k_child)
+use_rare_witnesses: true          # top-k by responsibility + lambda * detached surprise
+summary_witness_per_head: false   # true = top-k per attention head (diversity, ~num_heads x slots)
+witness_k_summary: 4              # summary witnesses per parent (per head if per_head)
+witness_k_rare: 4                # rare/surprise witnesses per parent
+witness_max_per_parent: 0        # cap on total witness slots/parent (0 = uncapped). Set e.g. 16
+                                 # when summary_witness_per_head: true to bound candidate width.
+witness_lambda_rare: 0.3         # weight on normalized aux-reconstruction surprise
+witness_score_bias: 5.0          # logit bonus that force-includes witnesses past final top-k
 
 local_attn_levels: [0, 1, 2, 3]
 local_attn_windows: [32, 16, 64, 128]

@@ -1965,7 +1965,7 @@ class HierarchicalFlowGAT(nn.Module):
         l0_past_parent_min_level: int = 1,          # lowest parent level to emit a staggered L0 edge for (1 = include the past-L1 edge)
         l0_past_parent_max_level: Optional[int] = None,  # highest parent level (None = top level)
         l0_past_l1_edge_type_id: Optional[int] = None,#5,
-        l0_alpha_enable: bool = True, # Whether to apply a learnable alpha to L0 features in the recon head
+        l0_alpha_enable: bool = False, # Whether to apply a learnable alpha to L0 features in the recon head
         l0_local_backend: str = "flash",  # pyg | flash | xformers | sdpa
         l0_local_window: int = 128,
         ablate_levels: Optional[List[int]] = None,  # hierarchy levels to disable (cut all their edges) for ablation studies; L0 cannot be ablated
@@ -2174,6 +2174,28 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_validate_disjoint_children: bool = False,
         hqd_sparse_project_active_only: bool = False,
         hqd_select_inside_message_passing: bool = False,
+        # --- Witness packets: selected coarse nodes expose bounded pointers to exact
+        # lower-level children ("what it cannot forget"), force-included into the HQD
+        # final-stage candidate set so rare/important children survive top-k pruning. ---
+        use_witness_packets: bool = False,
+        use_summary_witnesses: bool = True,
+        use_rare_witnesses: bool = True,
+        summary_witness_per_head: bool = False,
+        witness_k_summary: int = 4,
+        witness_k_rare: int = 4,
+        witness_max_per_parent: int = 0,
+        witness_lambda_rare: float = 0.3,
+        witness_score_bias: float = 5.0,
+        # Which selected levels to mix into the HQD final read. [0] = L0 only (default,
+        # original behavior); [0,1,2,3] also attends to the selected L1/L2/L3 summary nodes.
+        hqd_read_levels: Optional[List[int]] = None,
+        # Per-level "window bag": scatter the L0 routing's per-level selections back up so
+        # coarse nodes also attend to a bounded bag at their level (lateral reach). [] = off.
+        # routing: "global" (all level-L nodes share the union bag) | "per_position" (each
+        # node gets the bag from its own descendants). Causal-safe via src_max <= dst_min.
+        hqd_window_bag_levels: Optional[List[int]] = None,
+        hqd_window_bag_routing: str = "global",
+        hqd_window_bag_topk: int = 0,  # per_position: 0=natural bound, >0=hard per-node cap
         verbose: bool = False,
     ):
         """
@@ -2688,6 +2710,24 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_validate_disjoint_children = bool(hqd_validate_disjoint_children)
         self.hqd_sparse_project_active_only = bool(hqd_sparse_project_active_only)
         self.hqd_select_inside_message_passing = bool(hqd_select_inside_message_passing)
+
+        # Witness packets (see _build_witness_l0_ids). Active only when HQD is enabled,
+        # query_level == 0, and at least one of summary/rare is on.
+        self.use_witness_packets = bool(use_witness_packets)
+        self.use_summary_witnesses = bool(use_summary_witnesses)
+        self.use_rare_witnesses = bool(use_rare_witnesses)
+        self.summary_witness_per_head = bool(summary_witness_per_head)
+        self.witness_k_summary = max(0, int(witness_k_summary))
+        self.witness_k_rare = max(0, int(witness_k_rare))
+        self.witness_max_per_parent = max(0, int(witness_max_per_parent))
+        self.witness_lambda_rare = float(witness_lambda_rare)
+        self.witness_score_bias = float(witness_score_bias)
+        _read_levels = hqd_read_levels if hqd_read_levels is not None else [0]
+        self.hqd_read_levels = sorted({int(l) for l in _read_levels if 0 <= int(l) <= 3}) or [0]
+        self.hqd_window_bag_levels = sorted({int(l) for l in (hqd_window_bag_levels or []) if int(l) in (1, 2, 3)})
+        _bag_routing = str(hqd_window_bag_routing).strip().lower()
+        self.hqd_window_bag_routing = _bag_routing if _bag_routing in {"global", "per_position"} else "global"
+        self.hqd_window_bag_topk = max(0, int(hqd_window_bag_topk))
 
         batch_mode = str(refinement_batch_mode).lower()
         if batch_mode not in {"blockdiag", "true_batch_nozip"}:
@@ -8002,6 +8042,148 @@ class HierarchicalFlowGAT(nn.Module):
         mask = nodes >= 0
         return torch.where(mask, nodes, torch.full_like(nodes, -1)), mask
 
+    def _witness_l0_surprise(
+        self,
+        x_bnh: torch.Tensor,
+        node_level: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        """Detached per-L0-node 'surprise' = reconstruction residual of each L0 node
+        from the mean of its L1 parents (same signal as the hierarchy aux loss, but
+        per-node and not reduced). Returns [B, N], zero for non-L0 / parentless nodes."""
+        B, N, H = x_bnh.shape
+        device = x_bnh.device
+        surprise = torch.zeros(B, N, device=device, dtype=x_bnh.dtype)
+        if edge_index is None or edge_index.numel() == 0:
+            return surprise
+        src, dst = edge_index
+        mask_lh = (node_level[src] == 0) & (node_level[dst] == 1)
+        mask_hl = (node_level[src] == 1) & (node_level[dst] == 0)
+        child_idx = torch.cat([src[mask_lh], dst[mask_hl]], dim=0)   # L0 nodes
+        parent_idx = torch.cat([dst[mask_lh], src[mask_hl]], dim=0)  # L1 nodes
+        if child_idx.numel() == 0:
+            return surprise
+        agg = torch.zeros(B, N, H, device=device, dtype=x_bnh.dtype)
+        cnt = torch.zeros(B, N, 1, device=device, dtype=x_bnh.dtype)
+        agg.index_add_(1, child_idx, x_bnh.index_select(1, parent_idx))
+        ones = torch.ones(B, child_idx.numel(), 1, device=device, dtype=x_bnh.dtype)
+        cnt.index_add_(1, child_idx, ones)
+        has_parent = (cnt.squeeze(-1) > 0)
+        pred = agg / cnt.clamp_min(1.0)
+        resid = ((pred - x_bnh) ** 2).mean(dim=-1)  # [B, N]
+        return (resid * has_parent.to(resid.dtype)).detach()
+
+    def _build_witness_l0_ids(
+        self,
+        q_all: torch.Tensor,
+        k_all: torch.Tensor,
+        l1_to_l0: Dict[str, torch.Tensor],
+        node_ar_time: Optional[torch.Tensor],
+        x_bnh: torch.Tensor,
+        node_level: torch.Tensor,
+        edge_index: torch.Tensor,
+        allow_same_time: bool,
+        causal: bool,
+    ) -> Optional[torch.Tensor]:
+        """For each L1 parent, select a bounded packet of L0 child ids it 'cannot forget':
+          - summary witnesses: top-k children by graph responsibility (q_parent.k_child),
+            either head-averaged (flat) or top-k per head (summary_witness_per_head).
+          - rare witnesses: top-k by responsibility + lambda * normalized detached surprise.
+        Returns a [B, N, slots] long tensor of L0 ids (-1 padded); only L1 rows populated.
+        None if there is nothing to build."""
+        B, N, Hh, Dh = q_all.shape
+        device = q_all.device
+        parent_ids = l1_to_l0.get("parent_ids")
+        children = l1_to_l0.get("children")
+        if parent_ids is None or children is None or parent_ids.numel() == 0:
+            return None
+
+        k_sum = int(self.witness_k_summary) if self.use_summary_witnesses else 0
+        k_rare = int(self.witness_k_rare) if self.use_rare_witnesses else 0
+        per_head = bool(self.summary_witness_per_head)
+        P, C = int(parent_ids.numel()), int(children.size(1))
+        k_sum = min(k_sum, C)
+        k_rare = min(k_rare, C)
+        sum_slots = (k_sum * Hh) if per_head else k_sum
+        slots = sum_slots + k_rare
+        if slots == 0:
+            return None
+
+        child_safe = children.clamp(min=0)                     # [P, C]
+        child_valid = children >= 0                            # [P, C]
+        q_p = q_all.index_select(1, parent_ids)                # [B, P, Hh, Dh]
+        k_c = k_all.index_select(1, child_safe.reshape(-1)).view(B, P, C, Hh, Dh)
+        score_heads = torch.einsum("bphd,bpchd->bpch", q_p, k_c) / math.sqrt(float(Dh))
+
+        valid = child_valid.view(1, P, C).expand(B, P, C).clone()  # [B, P, C]
+        if causal and node_ar_time is not None and node_ar_time.numel() >= N:
+            t = node_ar_time.to(device=device, dtype=torch.long)
+            pt = t.index_select(0, parent_ids).view(1, P, 1)
+            ct = t.index_select(0, child_safe.reshape(-1)).view(1, P, C)
+            valid = valid & ((ct <= pt) if allow_same_time else (ct < pt))
+        neg = torch.finfo(score_heads.dtype).min
+        score_heads = score_heads.masked_fill(~valid.unsqueeze(-1), neg)
+        child_ids_bpc = child_safe.view(1, P, C).expand(B, P, C)
+
+        id_parts: List[torch.Tensor] = []
+        score_parts: List[torch.Tensor] = []
+        if k_sum > 0:
+            if per_head:
+                sh = score_heads.permute(0, 1, 3, 2)            # [B, P, Hh, C]
+                vals, idx = torch.topk(sh, k=k_sum, dim=-1)      # [B, P, Hh, k_sum]
+                ids = child_safe.view(1, P, 1, C).expand(B, P, Hh, C).gather(-1, idx)
+                ids = torch.where(vals > (neg * 0.5), ids, torch.full_like(ids, -1))
+                id_parts.append(ids.reshape(B, P, Hh * k_sum))
+                score_parts.append(vals.reshape(B, P, Hh * k_sum))
+            else:
+                vals, idx = torch.topk(score_heads.mean(dim=-1), k=k_sum, dim=-1)
+                ids = child_ids_bpc.gather(-1, idx)
+                id_parts.append(torch.where(vals > (neg * 0.5), ids, torch.full_like(ids, -1)))
+                score_parts.append(vals)
+
+        if k_rare > 0:
+            score_mean = score_heads.mean(dim=-1)               # [B, P, C], masked -> neg
+            surprise = self._witness_l0_surprise(x_bnh, node_level, edge_index)  # [B, N]
+            sc = surprise.index_select(1, child_safe.reshape(-1)).view(B, P, C).to(score_mean.dtype)
+            vf = valid.to(score_mean.dtype)
+            denom = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            mean_s = (sc * vf).sum(dim=-1, keepdim=True) / denom
+            var_s = (((sc - mean_s) ** 2) * vf).sum(dim=-1, keepdim=True) / denom
+            norm_s = (sc - mean_s) / (var_s.sqrt() + 1e-5)
+            rare_score = torch.where(valid, score_mean + float(self.witness_lambda_rare) * norm_s,
+                                     torch.full_like(score_mean, neg))
+            vals, idx = torch.topk(rare_score, k=k_rare, dim=-1)
+            ids = child_ids_bpc.gather(-1, idx)
+            id_parts.append(torch.where(vals > (neg * 0.5), ids, torch.full_like(ids, -1)))
+            score_parts.append(vals)
+
+        packed = torch.cat(id_parts, dim=-1)                     # [B, P, slots]
+        # Optional max-topk cap: bound the packet width (and thus the downstream candidate
+        # set) regardless of per_head*num_heads, keeping the read linear with a small constant.
+        cap = int(getattr(self, "witness_max_per_parent", 0))
+        if cap > 0 and cap < packed.size(-1):
+            sp = torch.cat(score_parts, dim=-1)
+            sp = torch.where(packed >= 0, sp, torch.full_like(sp, neg))
+            if per_head:
+                # Per-head picks overlap heavily, so the cap would spend slots on duplicates.
+                # Suppress all but the highest-scoring occurrence of each id (tie -> lowest
+                # index) so the cap budget goes to unique witnesses. Skipped for the
+                # head-averaged path, which produces no intra-parent duplicates -> no compute.
+                S = packed.size(-1)
+                eq = packed.unsqueeze(-1) == packed.unsqueeze(-2)          # [B, P, S, S]
+                ar = torch.arange(S, device=device)
+                k_lt_j = ar.unsqueeze(0) < ar.unsqueeze(1)                 # [S, S]: competitor k < j
+                beaten = eq & ((sp.unsqueeze(-2) > sp.unsqueeze(-1)) |
+                               ((sp.unsqueeze(-2) == sp.unsqueeze(-1)) & k_lt_j))
+                sp = torch.where(beaten.any(dim=-1), torch.full_like(sp, neg), sp)
+            top_v, top_i = torch.topk(sp, k=cap, dim=-1)
+            packed = packed.gather(-1, top_i)
+            packed = torch.where(top_v > (neg * 0.5), packed, torch.full_like(packed, -1))
+        slots = int(packed.size(-1))
+        witness = torch.full((B, N, slots), -1, dtype=torch.long, device=device)
+        witness.index_copy_(1, parent_ids, packed)
+        return witness
+
     def _hierarchical_query_descent_ephemeral_batched(
         self,
         transformer,
@@ -8184,6 +8366,7 @@ class HierarchicalFlowGAT(nn.Module):
             l1_to_l0 = skeleton["l1_to_l0"]
 
         level_max_time_cache = skeleton["level_max_time_cache"]
+        level_min_time_cache = skeleton["level_min_time_cache"]
         _profile_add("skeleton_ms", _skeleton_t0)
 
         hqd_topk_l3 = int(self.hqd_topk_l3)
@@ -8198,6 +8381,71 @@ class HierarchicalFlowGAT(nn.Module):
         level_indices = {0: l0_idx, 1: l1_idx, 2: l2_idx, 3: l3_idx}
         query_idx = level_indices.get(hqd_query_level, l0_idx)
         query_chunk_size = min(max(1, int(self.hqd_query_chunk_size)), max(1, int(query_idx.numel())))
+
+        # Witness packets: per-L1-node L0 pointers, recomputed each call from current
+        # features (NOT cached in the feature-agnostic skeleton). Force-included into the
+        # final-stage candidate scores so important/rare children survive top-k pruning.
+        read_coarse_levels = {int(l) for l in getattr(self, "hqd_read_levels", [0]) if int(l) in (1, 2, 3)}
+        # Per-level window bag (lateral reach): accumulate the L0 routing's per-level
+        # selections, then scatter them back to each level's own nodes after the loop.
+        bag_levels = [int(l) for l in getattr(self, "hqd_window_bag_levels", []) if int(l) in (1, 2, 3)] if hqd_query_level == 0 else []
+        bag_routing = str(getattr(self, "hqd_window_bag_routing", "global"))
+        if bag_levels and bag_routing == "global" and causal and not bool(getattr(self, "_hqd_bag_global_causal_warned", False)):
+            logger.warning(
+                "hqd_window_bag_routing='global' is NOT strictly AR-causal: the shared top-k bag "
+                "is selected over all positions' scores, so future queries influence the bag a "
+                "past coarse node attends to (leak ~1e-7, below bf16 precision but real). Use "
+                "'per_position' for strict causal AR; 'global' is intended for masked-diffusion / "
+                "bidirectional training."
+            )
+            self._hqd_bag_global_causal_warned = True
+        bag_accum: Dict[int, Dict[str, List[torch.Tensor]]] = {l: {"nodes": [], "scores": []} for l in bag_levels}
+        # per_position routing: map each L0 node to its level-X ancestor so a coarse node's
+        # bag = its own descendants' selections (re-targeted up). Structural, O(N) to build.
+        bag_ancestors: Dict[int, torch.Tensor] = {}
+        if bag_levels and bag_routing == "per_position":
+            def _invert_children(table: Dict[str, torch.Tensor]) -> torch.Tensor:
+                parent_of = torch.full((int(N),), -1, dtype=torch.long, device=device)
+                pid = table.get("parent_ids")
+                ch = table.get("children")
+                if pid is not None and ch is not None and pid.numel() > 0:
+                    v = ch >= 0
+                    parent_of[ch[v]] = pid.view(-1, 1).expand_as(ch)[v]
+                return parent_of
+            p_l0_l1 = _invert_children(l1_to_l0)
+            p_l1_l2 = _invert_children(l2_to_l1)
+            p_l2_l3 = _invert_children(l3_to_l2)
+            anc1 = p_l0_l1
+            anc2 = torch.where(anc1 >= 0, p_l1_l2.index_select(0, anc1.clamp(min=0)), torch.full_like(anc1, -1))
+            anc3 = torch.where(anc2 >= 0, p_l2_l3.index_select(0, anc2.clamp(min=0)), torch.full_like(anc2, -1))
+            bag_ancestors = {1: anc1, 2: anc2, 3: anc3}
+        # per_position cap: 0 = natural bound (emit all descendant selections in-loop), >0 =
+        # hard per-coarse-node budget (accumulate, then per-ancestor top-k after the loop).
+        bag_cap = int(getattr(self, "hqd_window_bag_topk", 0)) if bag_routing == "per_position" else 0
+        pp_accum: Dict[int, Dict[str, List[torch.Tensor]]] = (
+            {l: {"nodes": [], "scores": [], "valid": []} for l in bag_levels} if (bag_levels and bag_cap > 0) else {}
+        )
+        pp_qpos: List[torch.Tensor] = []
+        witness_table: Optional[torch.Tensor] = None
+        witness_active = (
+            bool(getattr(self, "use_witness_packets", False))
+            and hqd_query_level == 0
+            and (bool(self.use_summary_witnesses) or bool(self.use_rare_witnesses))
+            and (int(self.witness_k_summary) > 0 or int(self.witness_k_rare) > 0)
+        )
+        if witness_active:
+            witness_table = self._build_witness_l0_ids(
+                q_all=q_all,
+                k_all=k_all,
+                l1_to_l0=l1_to_l0,
+                node_ar_time=node_ar_time,
+                x_bnh=x_bnh,
+                node_level=node_level,
+                edge_index=base_edge_index,
+                allow_same_time=allow_same_time,
+                causal=causal,
+            )
+            witness_active = witness_table is not None
 
         if self.hqd_debug and not bool(self._hqd_runtime_logged):
             logger.info(
@@ -8448,6 +8696,21 @@ class HierarchicalFlowGAT(nn.Module):
                         stage_stats["local_window_total"] += local_valid_count
                         stage_stats["local_window_overlap"] += max(0, int(cand0_mask.sum().item()) + local_valid_count - int(final_mask.sum().item()))
 
+                # Witness packets: union the selected L1 parents' L0 witness children into
+                # the candidate pool. They are scored normally (so causal -inf survivors
+                # stay excluded) but get a +bias so the final top-k keeps them.
+                wit_ids = None
+                if witness_active:
+                    slots_w = int(witness_table.size(-1))
+                    wflat = witness_table.reshape(B * N, slots_w)
+                    boff = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1) * N
+                    gidx = (sel1_nodes.clamp(min=0) + boff).reshape(-1)
+                    wit_ids = wflat.index_select(0, gidx).view(B, sel1_nodes.size(1), sel1_nodes.size(2), slots_w)
+                    wit_ids = torch.where(sel1_valid.unsqueeze(-1), wit_ids, torch.full_like(wit_ids, -1))
+                    wit_ids = wit_ids.reshape(B, sel1_nodes.size(1), -1)  # [B, Q, topk_l1*slots]
+                    combined = torch.cat([final_nodes, wit_ids], dim=-1)
+                    final_nodes, final_mask = self._hqd_maybe_dedup_candidates_batched(combined, force=True)
+
                 if collect_stats:
                     stage_stats["final_candidate_total"] += int(final_mask.sum().item())
 
@@ -8461,6 +8724,14 @@ class HierarchicalFlowGAT(nn.Module):
                     causal=causal,
                     allow_same_time=allow_same_time,
                 )
+                if witness_active and wit_ids is not None:
+                    # Membership of each final candidate in the per-query witness set, via
+                    # searchsorted (O(B*Q*F*logW)) rather than a [B,Q,F,W] broadcast — the
+                    # latter explodes at long context (Q ~ seq_len) with per-head witnesses.
+                    ws, _ = torch.sort(wit_ids, dim=-1)
+                    pos = torch.searchsorted(ws, final_nodes).clamp(max=ws.size(-1) - 1)
+                    is_wit = (ws.gather(-1, pos) == final_nodes) & (final_nodes >= 0)
+                    scores0 = scores0 + float(self.witness_score_bias) * is_wit.to(scores0.dtype)
                 if bool(self.hqd_l0_topk_enable):
                     top_nodes, top_scores, top_valid = self._hqd_topk_from_scores_batched(final_nodes, scores0, hqd_topk_l0)
                 else:
@@ -8479,6 +8750,140 @@ class HierarchicalFlowGAT(nn.Module):
                 selected_b.append(batch_idx.expand_as(top_nodes)[keep])
                 selected_src.append(top_nodes[keep])
                 selected_dst.append(query_nodes.view(1, -1, 1).expand(B, -1, top_nodes.size(-1))[keep])
+
+                # Mix selected coarse summary nodes (L1/L2/L3) into the read, per
+                # hqd_read_levels. Their validity masks already encode causal filtering
+                # (a coarse node is valid only if all its descendants precede the query),
+                # so this stays causal-safe at query_level 0. Level-aware scoring in
+                # message_passing handles the cross-level q.k.
+                for _lvl, _nodes, _valid in (
+                    (1, sel1_nodes, sel1_valid),
+                    (2, sel2_nodes, sel2_valid),
+                    (3, sel3_nodes, sel3_valid),
+                ):
+                    if _lvl in read_coarse_levels and _nodes.numel() > 0:
+                        selected_b.append(batch_idx.expand_as(_nodes)[_valid])
+                        selected_src.append(_nodes[_valid])
+                        selected_dst.append(query_nodes.view(1, -1, 1).expand(B, -1, _nodes.size(-1))[_valid])
+
+                # per_position window-bag: re-target each query's level-X selections to the
+                # query's level-X ancestor (dst). Causal by construction: a query's selections
+                # are <= its own time <= the ancestor's max time, so no future-of-ancestor info
+                # enters its bag. src_t <= dst_t is then automatic; we mask it defensively.
+                if bag_levels and bag_routing == "per_position":
+                    if bag_cap <= 0:
+                        for _bl, _bn, _bv in ((1, sel1_nodes, sel1_valid), (2, sel2_nodes, sel2_valid), (3, sel3_nodes, sel3_valid)):
+                            if _bl in bag_levels and _bn.numel() > 0:
+                                anc = bag_ancestors[_bl].index_select(0, query_nodes)        # [Qc]
+                                src_t = level_max_time_cache[_bl].index_select(0, _bn.clamp(min=0).reshape(-1)).view_as(_bn)
+                                dst_t = level_max_time_cache[_bl].index_select(0, anc.clamp(min=0)).view(1, -1, 1)
+                                ok = _bv & (anc.view(1, -1, 1) >= 0) & (src_t >= 0) & (src_t <= dst_t)
+                                dst = anc.view(1, -1, 1).expand(B, int(anc.numel()), _bn.size(-1))
+                                selected_b.append(batch_idx.expand_as(_bn)[ok])
+                                selected_src.append(_bn[ok])
+                                selected_dst.append(dst[ok])
+                    else:
+                        pp_qpos.append(query_nodes)
+                        for _bl, _bn, _bs, _bv in ((1, sel1_nodes, sel1_scores, sel1_valid),
+                                                   (2, sel2_nodes, sel2_scores, sel2_valid),
+                                                   (3, sel3_nodes, sel3_scores, sel3_valid)):
+                            if _bl in pp_accum and _bn.numel() > 0:
+                                pp_accum[_bl]["nodes"].append(_bn)
+                                pp_accum[_bl]["scores"].append(_bs)
+                                pp_accum[_bl]["valid"].append(_bv)
+
+                # Window-bag: stash this chunk's per-level selections (masked invalid -> -inf
+                # score) so the union can be scattered to each level's nodes after the loop.
+                if bag_levels and bag_routing == "global":
+                    for _lvl, _nodes, _scores, _valid in (
+                        (1, sel1_nodes, sel1_scores, sel1_valid),
+                        (2, sel2_nodes, sel2_scores, sel2_valid),
+                        (3, sel3_nodes, sel3_scores, sel3_valid),
+                    ):
+                        if _lvl in bag_accum and _nodes.numel() > 0:
+                            sc = _scores.masked_fill(~_valid, float("-inf"))
+                            bag_accum[_lvl]["nodes"].append(_nodes.reshape(B, -1))
+                            bag_accum[_lvl]["scores"].append(sc.reshape(B, -1))
+
+        # Window-bag scatter (global routing): every level-L node attends to the top bag_topk
+        # level-L nodes the L0 routing surfaced, masked causal via src_max <= dst_min so a
+        # coarse node never sees a sibling whose span reaches its own future (avoids the
+        # query_level>=1 leak). per_position routing is a follow-up.
+        if bag_levels and bag_routing == "global" and selected_b:
+            bag_topk = int(getattr(self, "hqd_window_bag_topk", 0)) or 16
+            for L in bag_levels:
+                if not bag_accum[L]["nodes"]:
+                    continue
+                dst_nodes = level_indices.get(L)
+                if dst_nodes is None or dst_nodes.numel() == 0:
+                    continue
+                nodes = torch.cat(bag_accum[L]["nodes"], dim=1)        # [B, M]
+                scores = torch.cat(bag_accum[L]["scores"], dim=1)      # [B, M]
+                k = min(bag_topk, int(nodes.size(1)))
+                bv, bi = torch.topk(scores, k=k, dim=1)                # [B, k]
+                bag_nodes = nodes.gather(1, bi)                        # [B, k]
+                bag_ok = torch.isfinite(bv)                           # [B, k]
+                src_t = level_max_time_cache[L].index_select(0, bag_nodes.reshape(-1)).view(B, k)
+                dst_min = level_min_time_cache[L].index_select(0, dst_nodes)        # [n_L]
+                nL = int(dst_nodes.numel())
+                src_e = bag_nodes.view(B, 1, k).expand(B, nL, k)
+                ok = (bag_ok.view(B, 1, k) & (src_t.view(B, 1, k) >= 0)
+                      & (src_t.view(B, 1, k) <= dst_min.view(1, nL, 1)))
+                dst_e = dst_nodes.view(1, nL, 1).expand(B, nL, k)
+                bidx_e = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1).expand(B, nL, k)
+                selected_b.append(bidx_e[ok])
+                selected_src.append(src_e[ok])
+                selected_dst.append(dst_e[ok])
+
+        # per_position capped: per coarse node, gather its descendants' selections (nodes +
+        # the descent's own scores), take the top bag_cap by score, emit as bag edges. Causal:
+        # descendants are all <= the coarse node's max time, so the bag carries no future info.
+        if bag_levels and bag_routing == "per_position" and bag_cap > 0 and pp_qpos:
+            query_order = torch.cat(pp_qpos, dim=0)
+            Qtot = int(query_order.numel())
+            inv_query = torch.full((int(N),), -1, dtype=torch.long, device=device)
+            inv_query[query_order] = torch.arange(Qtot, device=device, dtype=torch.long)
+            child_tables = {1: l1_to_l0, 2: l2_to_l1, 3: l3_to_l2}
+            for X in bag_levels:
+                if not pp_accum[X]["nodes"]:
+                    continue
+                nodes_X = level_indices.get(X)
+                if nodes_X is None or nodes_X.numel() == 0:
+                    continue
+                selN = torch.cat(pp_accum[X]["nodes"], dim=1)     # [B, Qtot, kX]
+                selS = torch.cat(pp_accum[X]["scores"], dim=1)
+                selV = torch.cat(pp_accum[X]["valid"], dim=1)
+                kX = int(selN.size(-1)); nX = int(nodes_X.numel())
+                desc = nodes_X.view(1, nX)
+                for lvl in range(X, 0, -1):
+                    ch, cv = self._hqd_expand_children_batched(desc, child_tables[lvl])
+                    ch = ch.reshape(1, nX, -1); cv = cv.reshape(1, nX, -1)
+                    desc = torch.where(cv, ch, torch.full_like(ch, -1))
+                D = int(desc.size(-1))                            # [1, nX, D] L0 ids
+                qp = inv_query.index_select(0, desc.clamp(min=0).reshape(-1)).view(1, nX, D)
+                qp_valid = (desc >= 0) & (qp >= 0)
+                boff = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1) * Qtot
+                gidx = (qp.clamp(min=0).expand(B, nX, D) + boff).reshape(-1)
+                pn = selN.reshape(B * Qtot, kX).index_select(0, gidx).view(B, nX, D, kX)
+                ps = selS.reshape(B * Qtot, kX).index_select(0, gidx).view(B, nX, D, kX)
+                pv = selV.reshape(B * Qtot, kX).index_select(0, gidx).view(B, nX, D, kX)
+                pv = pv & qp_valid.view(1, nX, D, 1) & (pn >= 0)
+                P = D * kX
+                pn = pn.reshape(B, nX, P)
+                ps = ps.reshape(B, nX, P).masked_fill(~pv.reshape(B, nX, P), float("-inf"))
+                k = min(int(bag_cap), P)
+                bv, bi = torch.topk(ps, k=k, dim=-1)
+                bag = torch.where(torch.isfinite(bv), pn.gather(-1, bi), torch.full_like(pn[..., :k], -1))
+                bag, _ = self._hqd_maybe_dedup_candidates_batched(bag, force=True)
+                k2 = int(bag.size(-1))
+                src_t = level_max_time_cache[X].index_select(0, bag.clamp(min=0).reshape(-1)).view(B, nX, k2)
+                dst_t = level_max_time_cache[X].index_select(0, nodes_X).view(1, nX, 1)
+                bok = (bag >= 0) & (src_t >= 0) & (src_t <= dst_t)
+                dst_e = nodes_X.view(1, nX, 1).expand(B, nX, k2)
+                bidx_e = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1).expand(B, nX, k2)
+                selected_b.append(bidx_e[bok])
+                selected_src.append(bag[bok])
+                selected_dst.append(dst_e[bok])
 
         if not selected_b:
             self._hqd_reuse_cache = None

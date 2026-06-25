@@ -7,9 +7,9 @@ modality: text
 tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
-text_file: ./data/pg19_train.txt #/home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 16384 #32768 #1024
-batch_size: 2
+text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
+block_size: 1024 #16384 #32768 #1024
+batch_size: 32
 val_split: 0.01
 
 # Training
@@ -29,7 +29,7 @@ muon_adjust_lr_fn: match_rms_adamw
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
 num_epochs: 100
-samples_per_epoch: 782 #25000
+samples_per_epoch: 25000 #782 #25000
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Periodic generation / checkpointing (in training batches; 0 = per-epoch / end only).
@@ -38,10 +38,10 @@ generate_every: 0
 # Generation prompt/continuation lengths. gen_prompt_tokens defaults to min(64, block_size//2);
 # raise it for long-range PG19 conditioning (must be <= block_size). Leave sample_prompt unset
 # so the prompt is sampled from held-out val text rather than a fixed short string.
-gen_prompt_tokens: 1024
+gen_prompt_tokens: 512
 gen_max_new_tokens: 512
 save_every: 0
-checkpoint_dir: ./pinball/auxloss/checkpoints
+checkpoint_dir: ./pinball/hqd_witness/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -78,7 +78,54 @@ dropout: 0.0
 # Attention / hierarchy toggles
 attn_backend: flash        # pyg | flash | sdpa
 qkv_sharing: shared      # shared | separate
-use_hqd: false             # hierarchical query descent
+use_hqd: true             # hierarchical query descent
+hqd_query_chunk_size: 1024000000 # 4096
+hqd_include_local_window: False
+hqd_every_n: 4
+hqd_reuse_previous: False
+hqd_reuse_max_age: 0
+hqd_topk_l3: 4 #8 #4 #16 #16 # 4
+hqd_topk_l2: 4 #8 #4 #16 #8 #32 # 4
+hqd_topk_l1: 4 #16 #4 #128 #32 #64 # 16
+hqd_topk_l0: 64 #64 #64 #256 #64 #128 # 128
+hqd_l0_topk_enable: False
+hqd_query_level: 0       # query at L0 (token level); query_level>=1 breaks AR causality
+hqd_stop_level: 0
+hqd_handoff_to_l0: false
+hqd_global_topk: 0 #65536
+hqd_use_existing_zipper_projections: true   # reuse the zipper q/k projections
+# HQD final-read levels: which selected levels the L0 query attends over. [0] = L0 only
+# (original behavior); [0, 1, 2, 3] also mixes the selected L1/L2/L3 summary nodes into the
+# attention (level-aware scoring handles the cross-level q.k). Causal-safe at query_level 0.
+# Inert unless use_hqd: true.
+hqd_read_levels: [0, 1, 2, 3]
+
+# Witness packets (require use_hqd: true; inert otherwise). Each selected L1 node exposes a
+# bounded packet of L0 child ids it "cannot forget", force-included (via a score bias) into the
+# HQD final candidate set so important/rare tokens survive top-k pruning. Default off.
+use_witness_packets: true       # master switch
+use_summary_witnesses: true      # top-k children by graph responsibility (q_parent . k_child)
+use_rare_witnesses: true         # top-k by responsibility + lambda * detached surprise
+summary_witness_per_head: false  # true = top-k per attention head (diversity, ~num_heads x slots)
+witness_k_summary: 4             # summary witnesses per parent (per head if per_head)
+witness_k_rare: 4               # rare/surprise witnesses per parent
+witness_max_per_parent: 0      # cap on total witness slots/parent (0 = uncapped). Bounds the
+                                # candidate width so per_head*num_heads can't blow up cost: the
+                                # build is ~0.6% of a step, the inflated candidate set is what scales.
+witness_lambda_rare: 0.3        # weight on normalized aux-reconstruction surprise
+witness_score_bias: 5.0         # logit bonus that force-includes witnesses past final top-k
+
+# Per-level window bag: scatter the L0 routing's per-level selections back UP so coarse nodes
+# (L1/L2/L3) also gain lateral reach. [] = off. Requires use_hqd: true.
+#   per_position : each coarse node's bag = its own descendants' selections. STRICTLY CAUSAL.
+#   global       : one shared top-k bag/level. NOT AR-causal (bidi / masked-diffusion only).
+hqd_window_bag_levels: [1,2,3]            # e.g. [1, 2, 3] to give coarse levels lateral reach
+hqd_window_bag_routing: per_position # per_position (causal) | global (non-causal, bidi only)
+# per_position: 0 = natural bound (every descendant selection, ~descendants x topk_lX per node);
+#               >0 = hard fixed budget (top-N descendant selections per coarse node by score).
+# global: the shared bag size per level (0 -> 16).
+hqd_window_bag_topk: 0
+
 local_attn_levels: [0, 1, 2, 3]
 local_attn_windows: [128, 128, 128, 128]
 local_attn_causal_levels: [0, 1, 2, 3]
@@ -86,4 +133,4 @@ l0_local_window: 128
 learn_edge_from_attention: false
 
 # Hierarchy auxiliary (reconstruction) loss
-use_aux_loss: False
+use_aux_loss: True
