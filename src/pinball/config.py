@@ -69,6 +69,12 @@ def _apply_friendly_aliases(d: dict) -> dict:
         causal = bool(out.pop("ar_graph_causal"))
         out.setdefault("hier_ar_enable", causal)
         out.setdefault("l0_ar_enable", causal)
+        # Without downward edges the AR causal filter detaches every coarse level from L0
+        # (they become inert). Enable the staggered uncut L0->past-parent context edges so
+        # the hierarchy actually informs the prediction. They are strictly-past by
+        # construction, so they survive the AR filter without leaking. Explicit override wins.
+        if causal:
+            out.setdefault("ensure_l0_past_parent_edges", True)
 
     # Friendly alias for the model's gradient-checkpointing flag.
     if "gradient_checkpointing" in out:

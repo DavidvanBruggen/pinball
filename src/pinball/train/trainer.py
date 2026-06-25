@@ -6973,6 +6973,7 @@ class EnhancedHierarchicalTrainer:
         diffusion_final_threshold: float = 0.0,
         diffusion_random_remask_prob: float = 0.0,
         diffusion_random_remask_cutoff: float = 0.0,
+        return_parts: bool = False,  # if True, return (prompt_text, continuation_text) instead of one string
         # use_incremental argument is removed as we now default to imputation
     ) -> str:
         """
@@ -7249,12 +7250,18 @@ class EnhancedHierarchicalTrainer:
                     special_ratio = float(special_count) / float(max(1, len(tail_ids)))
                     logger.info("Generated tail special-token ratio: %.3f", special_ratio)
 
-            # Decode and return
-            return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            # Decode prompt and continuation separately so callers can show the boundary.
+            prompt_text = self.tokenizer.decode(
+                generated_ids[0, :prompt_token_len], skip_special_tokens=True)
+            continuation_text = self.tokenizer.decode(
+                generated_ids[0, prompt_token_len:generated_total_tokens], skip_special_tokens=True)
+            if return_parts:
+                return prompt_text, continuation_text
+            return prompt_text + continuation_text
 
         except Exception as e:
             logger.error(f"Error generating sample: {str(e)}", exc_info=True)
-            return f"Error generating sample: {str(e)}"
+            return ("", f"Error generating sample: {str(e)}") if return_parts else f"Error generating sample: {str(e)}"
         
     
     #old version of generate_sample, does not use mask

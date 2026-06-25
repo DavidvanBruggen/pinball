@@ -1,15 +1,20 @@
-# Pinball hierarchical graph transformer — autoregressive LM on WikiText-103.
+# Pinball hierarchical graph transformer — autoregressive LM on PG19 (long-range books).
 # Friendly toggles (attn_backend / qkv_sharing / train_mode / use_hqd) expand to the
 # underlying flags in pinball.config.PinballConfig. See README for the full toggle table.
+#
+# This config is for testing "thinking cycles": a cheap, global token mixer (Hyena/CNN
+# token U-Net) runs ONCE outside the refinement loop, while unified_refinement_cycles is
+# the iterative reasoning budget over the hierarchy. The U-Net handles long-range transport;
+# the cycles handle reasoning depth. See the "Token U-Net" section below.
 
 model_type: pinball
 modality: text
 tokenizer_name: gpt2
 
-# Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
-text_file: ./data/pg19_train.txt #/home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 16384 #32768 #1024
-batch_size: 2
+# Data — download with scripts/download_pg19.py (writes a single concatenated .txt).
+text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
+block_size: 1024 #16384
+batch_size: 32
 val_split: 0.01
 
 # Training
@@ -29,7 +34,7 @@ muon_adjust_lr_fn: match_rms_adamw
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
 num_epochs: 100
-samples_per_epoch: 782 #25000
+samples_per_epoch: 25000 #782
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Periodic generation / checkpointing (in training batches; 0 = per-epoch / end only).
@@ -38,10 +43,10 @@ generate_every: 0
 # Generation prompt/continuation lengths. gen_prompt_tokens defaults to min(64, block_size//2);
 # raise it for long-range PG19 conditioning (must be <= block_size). Leave sample_prompt unset
 # so the prompt is sampled from held-out val text rather than a fixed short string.
-gen_prompt_tokens: 1024
-gen_max_new_tokens: 512
+gen_prompt_tokens: 512 #1024
+gen_max_new_tokens: 512 #512
 save_every: 0
-checkpoint_dir: ./pinball/auxloss/checkpoints
+checkpoint_dir: ./checkpoints/hyena/pg19
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -56,8 +61,8 @@ ar_graph_causal: true
 # enable_l0_parent_edges: false   # add L0->parent edges across levels
 # l0_parent_edges_bidirectional: false
 # ensure_l0_past_l1_edges: false  # guarantee each L0 node sees past L1 nodes
-# ensure_past_hier_edges_all_levels: false
-# long_range_distance: 3      # max graph hops for long-range edges
+# ensure_past_hier_edges_all_levels: false   # add coarse-to-coarse past bridges (1->2, 2->3)
+# long_range_distance: 3          # max graph hops for long-range edges
 
 # Core shape
 hidden_dim: 768
@@ -66,7 +71,9 @@ num_refinement_layers: 12
 num_layers: [0, 0, 0, 0]
 internal_cycles: [0, 0, 0, 0]
 refinement_style: unified
-unified_refinement_cycles: 1
+unified_refinement_cycles: 4     # <-- THINKING CYCLES: re-runs the pinball hierarchy N times
+                                 #     over the (coarse) tokens. The token U-Net below runs
+                                 #     once and is NOT re-cycled. Bump this to test more thinking.
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0
@@ -79,11 +86,33 @@ dropout: 0.0
 attn_backend: flash        # pyg | flash | sdpa
 qkv_sharing: shared      # shared | separate
 use_hqd: false             # hierarchical query descent
-local_attn_levels: [0, 1, 2, 3]
+local_attn_levels: [ 1, 2, 3]
 local_attn_windows: [128, 128, 128, 128]
-local_attn_causal_levels: [0, 1, 2, 3]
+local_attn_causal_levels: [ 1, 2, 3]
 l0_local_window: 128
 learn_edge_from_attention: false
 
+# Token U-Net — a causal token mixer applied ONCE, outside the refinement-cycle loop.
+# block:  cnn   = local causal conv (CausalResBlock1d; uses token_unet_kernel_size)
+#         hyena = global FFT long conv (HyenaResBlock1d; O(T log T), one shot, kernel ignored)
+# mode:   stem            = mix at token level, L0 stays dense  (MODE 2: cheap global conditioning,
+#                           pinball runs at full token resolution). Use token_unet_scale: 1.
+#         coarse_tokenize = encode dense -> coarse L0, decode back (MODE 1: global-aware pooling,
+#                           fewer L0 nodes -> cheaper cycles).   Use token_unet_scale: >1 (pow2).
+token_unet_enable: true
+token_unet_block: hyena          # cnn | hyena
+token_unet_mode: coarse_tokenize            # stem (mode 2) | coarse_tokenize (mode 1)
+token_unet_dim: 1d               # auto | 1d | 2d  (text is 1d)
+token_unet_scale: 8              # power-of-two. 1 for stem; e.g. 4 for coarse_tokenize pooling
+token_unet_kernel_size: 5        # local conv width (cnn block only; ignored by hyena)
+token_unet_dropout: 0.0
+# Lookahead decode (coarse_tokenize only): a non-causal refinement branch for the right edge.
+token_unet_lookahead_decode_enable: false
+# --- MODE 1 (global-aware pooling) instead: set the three lines above to ---
+# token_unet_mode: coarse_tokenize
+# token_unet_scale: 4
+# --- Plain CNN baseline instead: set ---
+# token_unet_block: cnn
+
 # Hierarchy auxiliary (reconstruction) loss
-use_aux_loss: False
+use_aux_loss: true

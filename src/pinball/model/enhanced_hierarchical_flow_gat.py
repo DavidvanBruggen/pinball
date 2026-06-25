@@ -308,6 +308,11 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         self.enable_unified_skeleton_cache = True
         self._unified_skeleton_cache = {}   # key -> skeleton dict
         self._unified_skeleton_device_cache = {}  # (ukey, device_type, device_idx) -> device tensors
+        # FIFO bounds: training reuses a fixed length (stays hot); generation cycles through many
+        # lengths, so without a bound the device cache grows until OOM. Device cache holds GPU
+        # tensors -> keep it small; host skeleton cache is CPU RAM -> a looser bound is fine.
+        self._skeleton_cache_max = 16
+        self._skeleton_device_cache_max = 4
         self._uf_cache_fast_hits: int = 0
         self._uf_cache_fast_misses: int = 0
         self._uf_cache_seed_count: int = 0
@@ -782,6 +787,10 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         stale_dev_keys = [k for k in self._unified_skeleton_device_cache.keys() if k[0] == ukey]
         for stale_key in stale_dev_keys:
             self._unified_skeleton_device_cache.pop(stale_key, None)
+        # Bound the host skeleton cache (FIFO) so generation's many lengths can't grow it without
+        # bound. Must populate unconditionally: forward()'s RESTART_FORWARD path depends on the
+        # just-built entry being present on the immediate recursive retry.
+        self._evict_skeleton_cache(self._unified_skeleton_cache, self._skeleton_cache_max)
         self._uf_cache_seed_count += 1
         self._uf_cache_last_build_ms = (time.time() - t_build_start) * 1000.0
         logger.info(
@@ -793,6 +802,15 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         )
         return ukey, sk
     
+    @staticmethod
+    def _evict_skeleton_cache(cache: dict, max_entries: int) -> None:
+        """FIFO-evict the oldest entries so `cache` holds at most `max_entries`. Dropped device
+        packs lose their last reference and free their GPU tensors back to the allocator."""
+        if max_entries <= 0:
+            return
+        while len(cache) > max_entries:
+            cache.pop(next(iter(cache)), None)
+
     def _forward_batch_slow(self, input_ids, position_ids=None, attention_mask=None):
         """
         Called only when at least one sample in the batch has no cached unified skeleton.
@@ -1341,6 +1359,10 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                     "node_pos_local": sk["node_pos_local_cpu"].to(device, non_blocking=True) if sk.get("node_pos_local_cpu", None) is not None else None,
                 }
                 self._unified_skeleton_device_cache[dkey] = device_pack
+                # Bound the GPU device cache: generation runs at many sequence lengths, each
+                # seeding a resident device pack. Evict oldest (FIFO) so it can't grow without
+                # bound and OOM. Keep enough for training's fixed length(s) to stay hot.
+                self._evict_skeleton_cache(self._unified_skeleton_device_cache, self._skeleton_device_cache_max)
 
         if device_pack is not None:
             g = Data(
@@ -1634,6 +1656,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         reveal_mask: Optional[torch.Tensor] = None,
         class_labels: Optional[torch.Tensor] = None,
         timesteps: Optional[torch.Tensor] = None,
+        logits_last_only: bool = False,  # AR generation: project only the final position
                                   # retrieval: build the bundle from THIS forward's base L3
                                   # (no separate no-grad forward, which perturbs training).
     ):
@@ -2130,7 +2153,13 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                     #print("Returning token features from EHFGAT fast path.")
                     #return feats
                 #print(batch_size, seq_len, self.hidden_dim)
-                logits = self.output_projection(token_features).view(batch_size, seq_len_dense, -1)
+                if logits_last_only:
+                    # AR generation reads only logits[:, -1]; projecting the whole sequence each
+                    # step is O(T*vocab) compute + a [B,T,vocab] tensor (~1.5 GiB at T=4608) wasted.
+                    # Project just the final position -> [B,1,vocab].
+                    logits = self.output_projection(token_features[:, -1:, :]).view(batch_size, 1, -1)
+                else:
+                    logits = self.output_projection(token_features).view(batch_size, seq_len_dense, -1)
                 if getattr(self, "_force_decode_head", None) == "ae":
                     ae_logits = getattr(self, "_last_autoenc_logits", None)
                     if ae_logits is not None and tuple(ae_logits.shape[:2]) == tuple(logits.shape[:2]):
@@ -2204,6 +2233,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 reveal_target_ids, reveal_mask,
                 class_labels=class_labels,
                 timesteps=timesteps,
+                logits_last_only=logits_last_only,
             )
         # ---
 
@@ -2410,6 +2440,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                         ukey = self._unified_cache_key(level_sizes)
                         if ukey not in self._unified_skeleton_cache:
                             self._unified_skeleton_cache[ukey] = self._skeletonize_unified(unified_graph)
+                            self._evict_skeleton_cache(self._unified_skeleton_cache, self._skeleton_cache_max)
                             self._uf_cache_seed_count += 1
                             self._uf_cache_last_build_ms = None
                             try:

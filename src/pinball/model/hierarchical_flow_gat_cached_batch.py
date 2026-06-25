@@ -703,6 +703,154 @@ class NonCausalResBlock1d(nn.Module):
         return x + h
 
 
+class HyenaOperator(nn.Module):
+    """Causal depthwise long convolution with an implicit, length-agnostic filter,
+    evaluated by FFT in O(T log T). Roughly a single-order Hyena operator.
+
+    Shape: [B, C, T] -> [B, C, T] (channels-first, matching the token U-Net).
+
+    The filter h[C, T] is produced by a small MLP over positional features (so it is
+    recomputed for any length T and carries no length-specific parameters) and shaped by
+    a learnable per-channel exponential decay window (some channels stay near-global, others
+    local). Causality: both h and the signal are right-padded to >= 2T and only the first T
+    outputs are kept, so y[t] depends solely on inputs <= t -- no future leakage. The FFT
+    runs in fp32 for numerical stability even under bf16 autocast.
+
+    `kernel_size` is accepted for signature compatibility with CausalResBlock1d but is
+    unused: the long conv is global, not a fixed local window.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        filter_mlp_dim: int = 64,
+        pos_emb_dim: int = 33,
+        min_decay: float = 0.5,
+        max_decay: float = 6.0,
+        dropout: float = 0.0,
+        gradient_checkpointing: bool = False,
+    ):
+        super().__init__()
+        c = int(channels)
+        self.channels = c
+        # The FFT (fp32, padded to next_pow2(2T)) materializes large complex tensors at the
+        # full sequence length; storing them for backward is the dominant memory cost of a
+        # full-length stem. Checkpointing recomputes the FFT in backward instead.
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.pos_emb_dim = int(pos_emb_dim)
+        # Data-controlled gates + value branch (order-2 Hyena style).
+        self.in_proj = nn.Linear(c, 3 * c)
+        self.out_proj = nn.Linear(c, c)
+        self.dropout = nn.Dropout(max(0.0, float(dropout)))
+        # Implicit filter: positional features -> per-channel filter values.
+        self.filter_mlp = nn.Sequential(
+            nn.Linear(self.pos_emb_dim, int(filter_mlp_dim)),
+            nn.GELU(),
+            nn.Linear(int(filter_mlp_dim), int(filter_mlp_dim)),
+            nn.GELU(),
+            nn.Linear(int(filter_mlp_dim), c),
+        )
+        # Per-channel decay (kept positive via softplus); spread from near-global to local.
+        self.decay_raw = nn.Parameter(torch.linspace(float(min_decay), float(max_decay), c))
+        self._pos_cache: Dict[Tuple[int, str], torch.Tensor] = {}
+
+    def _pos_features(self, length: int, device: torch.device) -> torch.Tensor:
+        key = (int(length), str(device))
+        cached = self._pos_cache.get(key, None)
+        if cached is not None:
+            return cached
+        L = max(1, int(length))
+        t = torch.linspace(0.0, 1.0, steps=L, device=device, dtype=torch.float32).unsqueeze(-1)  # [L,1]
+        feats = [t]
+        n_freqs = (self.pos_emb_dim - 1) // 2
+        for i in range(n_freqs):
+            freq = (2.0 ** i) * math.pi
+            feats.append(torch.sin(freq * t))
+            feats.append(torch.cos(freq * t))
+        f = torch.cat(feats, dim=-1)  # [L, 1 + 2*n_freqs]
+        if f.size(-1) < self.pos_emb_dim:
+            f = F.pad(f, (0, self.pos_emb_dim - f.size(-1)))
+        else:
+            f = f[:, : self.pos_emb_dim]
+        # Only cache during training, where the length is fixed (one entry per resolution).
+        # Generation hits a new length every step; caching those would accumulate resident GPU
+        # tensors that never free. The features are cheap O(L) sin/cos -- recompute in eval.
+        if self.training:
+            self._pos_cache[key] = f
+        return f
+
+    def _filter(self, length: int, device: torch.device) -> torch.Tensor:
+        L = max(1, int(length))
+        pos = self._pos_features(L, device)            # [L, P]
+        h = self.filter_mlp(pos)                       # [L, C]
+        t_norm = torch.linspace(0.0, 1.0, steps=L, device=device, dtype=torch.float32).unsqueeze(-1)  # [L,1]
+        alpha = F.softplus(self.decay_raw).clamp(min=1e-4).unsqueeze(0)  # [1, C]
+        window = torch.exp(-alpha * t_norm)            # [L, C], length-invariant shape
+        h = h * window
+        return h.transpose(0, 1).contiguous()          # [C, L]
+
+    @staticmethod
+    def _fft_conv(v_bct: torch.Tensor, h_ct: torch.Tensor) -> torch.Tensor:
+        # Causal depthwise conv via FFT; fp32 transform for stability.
+        T = int(v_bct.size(-1))
+        n = 1
+        while n < 2 * T:
+            n <<= 1
+        vf = torch.fft.rfft(v_bct.float(), n=n, dim=-1)
+        hf = torch.fft.rfft(h_ct.float(), n=n, dim=-1).unsqueeze(0)  # [1, C, nf]
+        y = torch.fft.irfft(vf * hf, n=n, dim=-1)[..., :T]
+        return y.to(v_bct.dtype)
+
+    def _forward_impl(self, x_bct: torch.Tensor) -> torch.Tensor:
+        B, C, T = x_bct.shape
+        x = x_bct.transpose(1, 2)                       # [B,T,C]
+        v, g_pre, g_post = self.in_proj(x).chunk(3, dim=-1)
+        v = (v * torch.sigmoid(g_pre)).transpose(1, 2)  # [B,C,T] data-controlled pre-gate
+        h = self._filter(T, x_bct.device)               # [C,T]
+        y = self._fft_conv(v, h).transpose(1, 2)        # [B,T,C]
+        y = y * torch.sigmoid(g_post)                   # post-gate
+        y = self.dropout(self.out_proj(y))
+        return y.transpose(1, 2).contiguous()           # [B,C,T]
+
+    def forward(self, x_bct: torch.Tensor) -> torch.Tensor:
+        if self.training and self.gradient_checkpointing and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(self._forward_impl, x_bct, use_reentrant=False)
+        return self._forward_impl(x_bct)
+
+
+class HyenaResBlock1d(nn.Module):
+    """Drop-in replacement for CausalResBlock1d using a global (FFT) Hyena mixer plus a
+    pointwise FFN. Same signature and [B,C,T] -> [B,C,T] contract, so it slots straight
+    into CausalTokenUNet's enc/bottleneck/up block lists."""
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 5,
+        dropout: float = 0.0,
+        filter_mlp_dim: int = 64,
+        pos_emb_dim: int = 33,
+        gradient_checkpointing: bool = False,
+    ):
+        super().__init__()
+        c = int(channels)
+        self.norm1 = ChannelLayerNorm1d(c)
+        self.norm2 = ChannelLayerNorm1d(c)
+        self.hyena = HyenaOperator(
+            c, filter_mlp_dim=filter_mlp_dim, pos_emb_dim=pos_emb_dim, dropout=dropout,
+            gradient_checkpointing=gradient_checkpointing,
+        )
+        # Pointwise position-wise FFN (kernel_size=1 stays causal).
+        self.ff1 = CausalConv1d(c, 2 * c, kernel_size=1)
+        self.ff2 = CausalConv1d(2 * c, c, kernel_size=1)
+        self.dropout = nn.Dropout(max(0.0, float(dropout)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.hyena(F.gelu(self.norm1(x), approximate="tanh"))
+        h = self.ff2(F.gelu(self.ff1(F.gelu(self.norm2(x), approximate="tanh")), approximate="tanh"))
+        return x + self.dropout(h)
+
+
 class ChannelLayerNorm2d(nn.Module):
     """LayerNorm-like normalization over channels for 2D feature maps."""
 
@@ -1292,29 +1440,45 @@ class CausalTokenUNet(nn.Module):
         lookahead_enable: bool = False,
         lookahead_kernel_size: int = 5,
         lookahead_blocks: int = 2,
+        block: str = "cnn",
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         if not _is_power_of_two(int(scale)):
             raise ValueError(f"CausalTokenUNet requires scale as power-of-two, got {scale}")
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.hidden_dim = int(hidden_dim)
         self.scale = int(scale)
         self.n_down = int(math.log2(self.scale))
         self.lookahead_enable = bool(lookahead_enable)
         self.lookahead_kernel_size = int(lookahead_kernel_size)
         self.lookahead_blocks = int(lookahead_blocks)
+        block_norm = str(block).lower()
+        if block_norm not in {"cnn", "hyena"}:
+            logger.warning("Unknown CausalTokenUNet block='%s'; falling back to 'cnn'", block)
+            block_norm = "cnn"
+        self.block = block_norm
 
-        self.enc_blocks = nn.ModuleList(
-            [CausalResBlock1d(self.hidden_dim, kernel_size=kernel_size, dropout=dropout) for _ in range(self.n_down)]
-        )
+        def _resblock() -> nn.Module:
+            # enc/bottleneck/up blocks: causal global (Hyena) or causal local (CNN).
+            # Downsamplers stay strided CausalConv1d, so Hyena mixes globally *before*
+            # each pool (mode 1: global-aware pooling); at scale=1 only the bottleneck
+            # runs, giving a single token-level global op (mode 2).
+            if self.block == "hyena":
+                return HyenaResBlock1d(
+                    self.hidden_dim, kernel_size=kernel_size, dropout=dropout,
+                    gradient_checkpointing=self.gradient_checkpointing,
+                )
+            return CausalResBlock1d(self.hidden_dim, kernel_size=kernel_size, dropout=dropout)
+
+        self.enc_blocks = nn.ModuleList([_resblock() for _ in range(self.n_down)])
         self.downsamplers = nn.ModuleList(
             [CausalConv1d(self.hidden_dim, self.hidden_dim, kernel_size=2, stride=2) for _ in range(self.n_down)]
         )
 
-        self.bottleneck = CausalResBlock1d(self.hidden_dim, kernel_size=kernel_size, dropout=dropout)
+        self.bottleneck = _resblock()
 
-        self.up_blocks = nn.ModuleList(
-            [CausalResBlock1d(self.hidden_dim, kernel_size=kernel_size, dropout=dropout) for _ in range(self.n_down)]
-        )
+        self.up_blocks = nn.ModuleList([_resblock() for _ in range(self.n_down)])
         self.out_norm = ChannelLayerNorm1d(self.hidden_dim)
         self.out_proj = CausalConv1d(self.hidden_dim, self.hidden_dim, kernel_size=1)
 
@@ -1765,7 +1929,7 @@ class HierarchicalFlowGAT(nn.Module):
         share_transformers: bool = True,  # Option to share transformer layers
         num_refinement_layers: int = 2, # For unified style when share=False
         per_level_local_qkv: bool = False,  # per-level intra-level Q/K/V in refinement layers (backbone QKV stays shared)
-        lap_pe_k: int = 0, # Number of Laplacian eigenvectors for positional encoding
+        lap_pe_k: int = 10, # Number of Laplacian eigenvectors for positional encoding
         refinement_style: str = "unified", # Default to new style, "unified" , "iterative_level"
         use_gradient_checkpointing: bool = False,
         local_connectivity_window_size: int = 0,#0#4  # Size of local connectivity window for dense connections
@@ -1801,9 +1965,11 @@ class HierarchicalFlowGAT(nn.Module):
         l0_past_parent_min_level: int = 1,          # lowest parent level to emit a staggered L0 edge for (1 = include the past-L1 edge)
         l0_past_parent_max_level: Optional[int] = None,  # highest parent level (None = top level)
         l0_past_l1_edge_type_id: Optional[int] = None,#5,
-        l0_alpha_enable: bool = False, # Whether to apply a learnable alpha to L0 features in the recon head
+        l0_alpha_enable: bool = True, # Whether to apply a learnable alpha to L0 features in the recon head
         l0_local_backend: str = "flash",  # pyg | flash | xformers | sdpa
         l0_local_window: int = 128,
+        ablate_levels: Optional[List[int]] = None,  # hierarchy levels to disable (cut all their edges) for ablation studies; L0 cannot be ablated
+        report_level_connectivity: bool = False,  # log a per-level connectivity / inert-level report on the first forward
         local_attn_levels: Optional[List[int]] = [0, 1, 2, 3],#None,  # levels for local window attn (default: [0] = L0 only)
         local_attn_windows: Optional[List[int]] = [128, 16, 64, 128],#None,  # per-level windows (if None, use l0_local_window for all)
         local_attn_causal_levels: Optional[List[int]] = None,  # levels where local attn is causal (default: [0])
@@ -1916,6 +2082,7 @@ class HierarchicalFlowGAT(nn.Module):
         token_unet_lookahead_decode_enable: bool = False,
         token_unet_lookahead_kernel_size: int = 5,
         token_unet_lookahead_blocks: int = 2,
+        token_unet_block: str = "cnn",  # "cnn" (local causal conv) | "hyena" (global FFT long conv)
         graph_geometry_mode: str = "sequence",  # "sequence" | "grid2d"
         graph_grid_height: int = 0,
         graph_grid_width: int = 0,
@@ -2040,6 +2207,14 @@ class HierarchicalFlowGAT(nn.Module):
              raise ValueError("Length of overlap_ratios must be num_layers - 1")
         self.num_layers = num_layers
         self.dropout_rate = dropout # Store dropout rate
+        # Level ablation: hierarchy levels whose edges are all cut (nodes kept but isolated),
+        # so they contribute nothing to the L0 prediction. L0 (level 0) is never ablated.
+        self.ablate_levels = sorted({int(l) for l in (ablate_levels or []) if int(l) != 0})
+        if self.ablate_levels:
+            logger.info("Level ablation active: disabling hierarchy levels %s (edges cut)", self.ablate_levels)
+        self.report_level_connectivity_enabled = bool(report_level_connectivity)
+        self._last_topology = None       # (edge_index, node_level) cached each forward for the reporter
+        self._level_report_logged = False
         self.compression_ratios = compression_ratios
         self.input_mode = input_mode # Store input mode
         self.overlap_ratios = overlap_ratios
@@ -2551,6 +2726,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.token_unet_lookahead_decode_enable = bool(token_unet_lookahead_decode_enable)
         self.token_unet_lookahead_kernel_size = int(token_unet_lookahead_kernel_size)
         self.token_unet_lookahead_blocks = int(token_unet_lookahead_blocks)
+        self.token_unet_block = str(token_unet_block).lower()
         self.rgb_token_unet_enable = bool(rgb_token_unet_enable)
         self.rgb_token_unet_downsample = max(1, int(rgb_token_unet_downsample))
         self.rgb_token_unet_base_channels = max(16, int(rgb_token_unet_base_channels))
@@ -2625,6 +2801,8 @@ class HierarchicalFlowGAT(nn.Module):
             elif self.token_unet_dim == "auto":
                 use_2d = str(getattr(self, "graph_geometry_mode", "sequence")).lower() == "grid2d"
             self.token_unet_is_2d = bool(use_2d)
+            if self.token_unet_is_2d and self.token_unet_block == "hyena":
+                logger.warning("token_unet_block='hyena' is 1D-only; using CNN blocks for the 2D token U-Net.")
             if self.token_unet_is_2d:
                 self.token_unet = SpatialTokenUNet2D(
                     hidden_dim=self.hidden_dim,
@@ -2645,11 +2823,14 @@ class HierarchicalFlowGAT(nn.Module):
                     lookahead_enable=self.token_unet_lookahead_decode_enable,
                     lookahead_kernel_size=self.token_unet_lookahead_kernel_size,
                     lookahead_blocks=self.token_unet_lookahead_blocks,
+                    block=self.token_unet_block,
+                    gradient_checkpointing=bool(getattr(self, "use_gradient_checkpointing", False)),
                 )
             logger.info(
-                "Enabled token U-Net: mode=%s dim=%s causal2d=%s scale=%d kernel=%d dropout=%.3f lookahead=%s lookahead_kernel=%d lookahead_blocks=%d",
+                "Enabled token U-Net: mode=%s dim=%s block=%s causal2d=%s scale=%d kernel=%d dropout=%.3f lookahead=%s lookahead_kernel=%d lookahead_blocks=%d",
                 str(self.token_unet_mode),
                 "2d" if self.token_unet_is_2d else "1d",
+                ("cnn" if self.token_unet_is_2d else str(self.token_unet_block)),
                 bool(self.token_unet_2d_causal),
                 int(self.token_unet_scale),
                 int(self.token_unet_kernel_size),
@@ -4767,6 +4948,42 @@ class HierarchicalFlowGAT(nn.Module):
         filtered_edge_type = edge_type[keep] if edge_type is not None else None
         return filtered_edge_index, filtered_edge_type
 
+    def _apply_level_ablation(
+        self,
+        edge_index: torch.Tensor,
+        edge_type: Optional[torch.Tensor],
+        node_level: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Drop every edge incident to an ablated level, isolating those nodes so they
+        contribute nothing to the L0 prediction (level-ablation study dial)."""
+        if not self.ablate_levels or edge_index is None or edge_index.numel() == 0:
+            return edge_index, edge_type
+        abl = torch.tensor(self.ablate_levels, device=edge_index.device, dtype=node_level.dtype)
+        src_abl = torch.isin(node_level[edge_index[0]], abl)
+        dst_abl = torch.isin(node_level[edge_index[1]], abl)
+        keep = ~(src_abl | dst_abl)
+        if bool(keep.all()):
+            return edge_index, edge_type
+        return edge_index[:, keep], (edge_type[keep] if edge_type is not None else None)
+
+    def report_level_connectivity(self, log: bool = True) -> Optional[Dict[str, Any]]:
+        """Report per-level connectivity and inert levels for the most recent forward.
+
+        Returns the report dict (see utils.level_report.compute_level_connectivity) or None
+        if no graph has been built yet. Set ``log=True`` to also emit a formatted table.
+        """
+        from ..utils.level_report import compute_level_connectivity, format_level_connectivity
+        topo = getattr(self, "_last_topology", None)
+        if topo is None or topo[0] is None:
+            if log:
+                logger.warning("report_level_connectivity: no graph built yet (run a forward first).")
+            return None
+        edge_index, node_level = topo
+        report = compute_level_connectivity(edge_index, node_level)
+        if log:
+            logger.info("%s", format_level_connectivity(report))
+        return report
+
     def _augment_unified_graph_twin_shared_l3(
         self,
         unified_x: torch.Tensor,
@@ -5225,6 +5442,13 @@ class HierarchicalFlowGAT(nn.Module):
             else:
                 logger.debug("Twin shared-L3 graph causal audit passed (0 violations).")
 
+        if self.ablate_levels:
+            unified_edge_index, unified_edge_type = self._apply_level_ablation(
+                edge_index=unified_edge_index,
+                edge_type=unified_edge_type,
+                node_level=unified_node_level,
+            )
+
         unified_graph = Data(
             x=unified_x,
             edge_index=unified_edge_index,
@@ -5235,6 +5459,18 @@ class HierarchicalFlowGAT(nn.Module):
         )
         unified_graph.node_pos_local = node_pos_local
         unified_graph.level_grid_shapes = list(level_grid_shapes)
+
+        # Cache lightweight topology (int tensors, no grad) for the level connectivity reporter.
+        self._last_topology = (
+            unified_edge_index.detach() if unified_edge_index is not None else None,
+            unified_node_level.detach(),
+        )
+        if getattr(self, "report_level_connectivity_enabled", False) and not self._level_report_logged:
+            self._level_report_logged = True
+            try:
+                self.report_level_connectivity(log=True)
+            except Exception as exc:  # never let reporting break a forward
+                logger.warning("Level connectivity report failed: %r", exc)
         if twin_mode:
             unified_graph.ae_decoder_l0_slice = ae_decoder_l0_slice
             if node_branch is not None:
@@ -10660,7 +10896,8 @@ class HierarchicalFlowGAT(nn.Module):
                         logits = self.forward(
                             current_ids,
                             num_cycles=cycles,
-                            use_level_prediction=use_level_prediction
+                            use_level_prediction=use_level_prediction,
+                            logits_last_only=True,
                         )
                         # Get logits for the last token
                         next_token_logits = logits[:, -1, :]
@@ -10701,9 +10938,10 @@ class HierarchicalFlowGAT(nn.Module):
                     # Get next token logits from forward pass
                     with torch.no_grad():
                         logits = self.forward(
-                            current_ids, 
+                            current_ids,
                             num_cycles=cycles,
-                            use_level_prediction=use_level_prediction
+                            use_level_prediction=use_level_prediction,
+                            logits_last_only=True,
                         )
                         next_token_logits = logits[:, -1, :]
                     
@@ -10742,9 +10980,10 @@ class HierarchicalFlowGAT(nn.Module):
                 with torch.no_grad():
                     # Process the current sequence
                     logits = self.forward(
-                        current_ids, 
+                        current_ids,
                         num_cycles=cycles,
-                        use_level_prediction=use_level_prediction
+                        use_level_prediction=use_level_prediction,
+                        logits_last_only=True,
                     )
                     # Get logits for the last token
                     next_token_logits = logits[:, -1, :]

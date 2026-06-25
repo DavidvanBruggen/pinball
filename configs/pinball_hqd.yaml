@@ -5,9 +5,10 @@ model_type: pinball
 modality: text
 tokenizer_name: gpt2
 
-text_file: ./data/wikitext_combined.txt
-block_size: 1024
-batch_size: 32
+# Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
+text_file: ./data/pg19_train.txt #./data/wikitext_combined.txt
+block_size: 16384 #32768 #1024
+batch_size: 2
 val_split: 0.01
 
 train_mode: ar
@@ -22,14 +23,14 @@ muon_adjust_lr_fn: match_rms_adamw
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
 num_epochs: 100
-samples_per_epoch: 25000
+samples_per_epoch: 782 # 25000
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Periodic generation / checkpointing (in training batches; 0 = per-epoch / end only).
 # (CLI: --generate-every / --save-every / --checkpoint-dir.)
 generate_every: 0
 save_every: 0
-checkpoint_dir: ./checkpoints_hqd
+checkpoint_dir: ./checkpoints/hqd/pg19/
 ar_graph_causal: true     # causal hierarchy graph for autoregressive training
 
 hidden_dim: 768
@@ -52,24 +53,24 @@ qkv_sharing: shared      # shared | separate
 
 # Hierarchical Query Descent
 use_hqd: true
-hqd_query_chunk_size: 4096 #1024000000
+hqd_query_chunk_size: 1024000000 # 4096
 hqd_include_local_window: False
 hqd_every_n: 4
 hqd_reuse_previous: False
 hqd_reuse_max_age: 0
-hqd_topk_l3: 4 #16 #16 # 4
-hqd_topk_l2: 4 #16 #8 #32 # 4
-hqd_topk_l1: 4 #128 #32 #64 # 16
-hqd_topk_l0: 64 #256 #64 #128 # 128
+hqd_topk_l3: 16 #8 #4 #16 #16 # 4
+hqd_topk_l2: 16 #8 #4 #16 #8 #32 # 4
+hqd_topk_l1: 16 #16 #4 #128 #32 #64 # 16
+hqd_topk_l0: 16 #64 #64 #256 #64 #128 # 128
 hqd_l0_topk_enable: True
 hqd_query_level: 0       # query at L0 (token level); query_level>=1 breaks AR causality
 hqd_stop_level: 0
 hqd_handoff_to_l0: false
-hqd_global_topk: 8192
+hqd_global_topk: 0 #65536
 hqd_use_existing_zipper_projections: true   # reuse the zipper q/k projections
 
 local_attn_levels: [0, 1, 2, 3]
-local_attn_windows: [16, 16, 64, 128]
+local_attn_windows: [32, 16, 64, 128]
 local_attn_causal_levels: [0, 1, 2, 3]
 l0_local_window: 128
 learn_edge_from_attention: false

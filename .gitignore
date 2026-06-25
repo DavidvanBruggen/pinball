@@ -21,3 +21,5 @@ env/
 .idea/
 .vscode/
 tests/test_hqd_causality.py
+data/pg19_test.txt
+data/pg19_train.txt

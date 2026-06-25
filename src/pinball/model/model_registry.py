@@ -125,6 +125,8 @@ def build_pinball_model(
         l0_local_window=int(getattr(args, "l0_local_window", 0)),
         neighbor_sampling_backend=str(getattr(args, "neighbor_sampling_backend", "auto")),
         rope_mode=str(getattr(args, "rope_mode", "auto")),
+        ablate_levels=getattr(args, "ablate_levels", None),
+        report_level_connectivity=bool(getattr(args, "report_level_connectivity", False)),
         local_attn_levels=getattr(args, "local_attn_levels", None),
         local_attn_windows=getattr(args, "local_attn_windows", None) if getattr(args, "local_attn_windows", None) else None,
         local_attn_causal_levels=getattr(args, "local_attn_causal_levels", None),
@@ -178,6 +180,7 @@ def build_pinball_model(
         token_unet_lookahead_decode_enable=bool(getattr(args, "token_unet_lookahead_decode_enable", False)),
         token_unet_lookahead_kernel_size=int(getattr(args, "token_unet_lookahead_kernel_size", 5)),
         token_unet_lookahead_blocks=int(getattr(args, "token_unet_lookahead_blocks", 2)),
+        token_unet_block=str(getattr(args, "token_unet_block", "cnn")),
         rgb_token_unet_enable=bool(
             str(getattr(args, "modality", "text")).lower() == "image"
             and str(getattr(args, "image_token_mode", "latent")).lower() == "rgb_unet"
@@ -203,6 +206,8 @@ def build_pinball_model(
         refine_cond_strength=float(getattr(args, "refine_cond_strength", 1.0)),
         refine_cond_concat_gate_init=float(getattr(args, "refine_cond_concat_gate_init", -2.0)),
         local_connectivity_window_size=int(getattr(args, "local_connectivity_window_size", 4)),
+        # --- Hierarchy auxiliary (reconstruction) loss ---
+        use_aux_loss=bool(getattr(args, "use_aux_loss", False)),
         # --- AR graph connectivity (causal edge construction for autoregressive training) ---
         hier_ar_enable=bool(getattr(args, "hier_ar_enable", False)),
         hier_ar_allow_same_time=bool(getattr(args, "hier_ar_allow_same_time", True)),
@@ -211,6 +216,7 @@ def build_pinball_model(
         l0_parent_edges_bidirectional=bool(getattr(args, "l0_parent_edges_bidirectional", False)),
         ensure_l0_past_l1_edges=bool(getattr(args, "ensure_l0_past_l1_edges", False)),
         ensure_past_hier_edges_all_levels=bool(getattr(args, "ensure_past_hier_edges_all_levels", False)),
+        l0_past_l1_edge_type_id=getattr(args, "l0_past_l1_edge_type_id", None),
         hierarchical_query_descent_enable=bool(getattr(args, "hierarchical_query_descent_enable", False)),
         hqd_topk_l3=int(getattr(args, "hqd_topk_l3", 4)),
         hqd_topk_l2=int(getattr(args, "hqd_topk_l2", 4)),

@@ -4,15 +4,29 @@ model_type: transformer
 modality: text
 tokenizer_name: gpt2
 
-text_file: ./data/wikitext_combined.txt
-block_size: 1024
-batch_size: 8
+# Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
+text_file: ./data/pg19_train.txt #./data/wikitext_combined.txt
+block_size: 16384 #32768 #1024
+batch_size: 2
 val_split: 0.01
+
+num_epochs: 100
+samples_per_epoch: 782 #25000
+gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
+gradient_checkpointing: false    # trade compute for memory in the refinement stack
+# Generation prompt/continuation lengths. gen_prompt_tokens defaults to min(64, block_size//2);
+# raise it for long-range PG19 conditioning (must be <= block_size). Leave sample_prompt unset
+# so the prompt is sampled from held-out val text rather than a fixed short string.
+gen_prompt_tokens: 1024
+gen_max_new_tokens: 512
+save_every: 0
+checkpoint_dir: ./transformer/checkpoints_pg19
 
 train_mode: ar
 learning_rate: 0.0003
 weight_decay: 0.1
-max_steps: 20000
+#max_steps: 20000
+warmup_steps: 1000
 optimizer: muon_hybrid    # adamw | muon_hybrid (Muon on matrices, AdamW on 1D params)
 muon_lr_mult: 6.0
 

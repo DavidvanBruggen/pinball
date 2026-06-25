@@ -118,6 +118,8 @@ Underlying knobs: `hidden_dim`, `num_heads`, `num_refinement_layers`,
 `compression_ratios` / `overlap_ratios` (hierarchy shape), `local_attn_windows` /
 `local_attn_levels` (windowed attention), `unified_refinement_cycles` (refinement passes),
 `hqd_topk_l0..l3` (HQD fan-out), `use_aux_loss` (hierarchy reconstruction auxiliary loss),
+`ablate_levels` (list of hierarchy levels to disable — cuts all their edges so they can't
+inform the L0 prediction; for ablation studies. L0 can't be ablated. CLI: `--ablate-levels 2,3`),
 `use_neighbor_sampling` + `num_neighbors` (PyG NeighborLoader sampling). Fine-grained AR
 connectivity dials: `hier_ar_allow_same_time`, `enable_l0_parent_edges`,
 `l0_parent_edges_bidirectional`, `ensure_l0_past_l1_edges`,
@@ -128,6 +130,14 @@ connectivity dials: `hier_ar_allow_same_time`, `enable_l0_parent_edges`,
 `generate_every` / `save_every` (`--generate-every` / `--save-every`, in batches) drive
 periodic generation and checkpointing mid-run; `checkpoint_dir` (`--checkpoint-dir`) sets the
 output directory.
+
+**Memory / OOM on long sequences.** `pinball-train` sets
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` automatically (via `setdefault`, so a shell
+value still wins) to curb allocator fragmentation — long `block_size` plus variable-size
+FFT/graph buffers otherwise leave large reserved-but-unallocated gaps that OOM at epoch
+boundaries; the trainer also calls `torch.cuda.empty_cache()` once per epoch after
+validation/generation. If you still OOM, lower `block_size`, enable `gradient_checkpointing`,
+reduce `gen_prompt_tokens`, or raise `grad_accum` while lowering `batch_size`.
 
 ### Hierarchical Query Descent (HQD)
 

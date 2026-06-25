@@ -24,6 +24,11 @@ import logging
 import math
 import os
 
+# Reduce CUDA allocator fragmentation (long sequences + variable-size FFT/graph buffers
+# leave large reserved-but-unallocated gaps that OOM at epoch boundaries). Must be set
+# before torch initialises the CUDA caching allocator. setdefault: a shell override wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 from transformers import AutoTokenizer
 
@@ -134,6 +139,12 @@ def main(argv=None) -> None:
                    choices=["pyg", "flash", "sdpa"],
                    help="Local-attention backend (overrides config). Use 'sdpa' or 'pyg' when "
                         "flash-attn is unavailable (e.g. Colab).")
+    p.add_argument("--ablate-levels", "--ablate_levels", dest="ablate_levels", default=None,
+                   help="Comma-separated hierarchy levels to disable for ablation, e.g. '3' or "
+                        "'2,3' (cuts all their edges; L0 cannot be ablated). Overrides config.")
+    p.add_argument("--report-levels", "--report_level_connectivity", dest="report_levels",
+                   action="store_true", default=False,
+                   help="Log a per-level connectivity / inert-level report on the first forward.")
     p.add_argument("--block-size", "--block_size", type=int, default=None, dest="block_size",
                    help="Sequence length (overrides config block_size).")
     p.add_argument("--batch-size", "--batch_size", type=int, default=None, dest="batch_size",
@@ -175,6 +186,10 @@ def main(argv=None) -> None:
         cfg.gradient_accumulation_steps = args.gradient_accumulation_steps
     if args.attn_backend is not None:
         cfg.l0_local_backend = args.attn_backend
+    if args.ablate_levels is not None:
+        cfg.ablate_levels = [int(x) for x in str(args.ablate_levels).split(",") if x.strip() != ""]
+    if args.report_levels:
+        cfg.report_level_connectivity = True
     device = _resolve_device(cfg)
 
     tokenizer = _build_tokenizer(cfg)
@@ -263,19 +278,56 @@ def main(argv=None) -> None:
 
     train_data = {"get_batch": train_loader, "steps_per_epoch": steps_per_epoch}
     val_data = {"get_batch": val_loader, "steps_per_epoch": int(args.eval_batches)}
-    prompt = args.prompt if args.prompt is not None else str(getattr(cfg, "sample_prompt", "The"))
+    # Prompt source: an explicit --prompt / config sample_prompt is used verbatim; otherwise
+    # we sample a fresh chunk of validation text each time (so the continuation is judged
+    # against real held-out context, like the original trainer did).
+    fixed_prompt = args.prompt if args.prompt is not None else getattr(cfg, "sample_prompt", None)
     gen_tokens = int(getattr(cfg, "gen_max_new_tokens", 512))
+    prompt_tokens = int(getattr(cfg, "gen_prompt_tokens", min(64, block_size // 2)))
+    default_prompt = "The"
+
+    def _make_prompt() -> str:
+        if fixed_prompt is not None:
+            return str(fixed_prompt)
+        if val_loader is None:
+            return default_prompt
+        try:
+            batch = val_loader(device)
+            ids = batch.get("input_ids") if isinstance(batch, dict) else None
+            if ids is None or ids.numel() == 0:
+                return default_prompt
+            n = max(1, min(prompt_tokens, int(ids.shape[1])))
+            text = tokenizer.decode(ids[0, :n], skip_special_tokens=True)
+            return text if text.strip() else default_prompt
+        except Exception as exc:
+            logger.warning("val-text prompt fetch failed (%s); using default prompt", exc)
+            return default_prompt
 
     def _generate(tag: str) -> None:
         if args.no_generate:
             return
         was_training = model.training
+        # Generation needs no gradients; release the resident grad buffers (param-sized) and
+        # reserved cache first so the generation forward (full model at the prompt length) has
+        # headroom on top of the training footprint (params + optimizer states + EMA).
         try:
-            text = trainer.generate_sample(
-                prompt, max_new_tokens=gen_tokens, generation_mode="auto",
+            opt = getattr(trainer, "optimizer", None)
+            if opt is not None:
+                opt.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            prompt_text, continuation = trainer.generate_sample(
+                _make_prompt(), max_new_tokens=gen_tokens, generation_mode="auto",
                 do_sample=True, temperature=0.9, top_k=50, top_p=0.95,
+                return_parts=True,
             )
-            logger.info("%s  sample:\n%s\n%s\n%s", tag, "-" * 60, text, "-" * 60)
+            # Long val-text prompts: show only the tail so the continuation boundary is visible.
+            shown = prompt_text if len(prompt_text) <= 300 else "…" + prompt_text[-300:]
+            logger.info("%s  sample:\n%s\n[prompt …] %s\n[continues >>>] %s\n%s",
+                        tag, "-" * 60, shown, continuation, "-" * 60)
         except Exception as exc:  # generation is best-effort; never abort training on it
             logger.warning("%s  generation skipped (%s)", tag, exc)
         finally:
@@ -315,6 +367,13 @@ def main(argv=None) -> None:
                 objective, max_steps, num_epochs, steps_per_epoch, grad_accum,
                 generate_every, save_every, use_amp)
 
+    # Best-checkpoint + early-stopping (monitors val_loss; lower is better).
+    best_val = float("inf")
+    best_epoch = -1
+    patience = 0
+    patience_limit = int(getattr(cfg, "early_stop_patience", 0))   # 0 = disabled
+    min_delta = float(getattr(cfg, "early_stop_min_delta", 0.0))
+
     completed_steps = resumed_steps
     epoch = start_epoch - 1
     for epoch in range(start_epoch, num_epochs):
@@ -336,11 +395,38 @@ def main(argv=None) -> None:
                             metrics.get("copy_token_acc", 0.0), metrics.get("copy_span_exact", 0.0),
                             metrics.get("copy_first_token_acc", 0.0))
 
+            # Best-checkpoint tracking + patience counter.
+            if float(sel_loss) < best_val - min_delta:
+                best_val = float(sel_loss)
+                best_epoch = epoch
+                patience = 0
+                _save("best")
+                logger.info("  ** new best epoch (val_loss=%.4f) -> saved pinball_best.pt **", best_val)
+            else:
+                patience += 1
+                limit_str = str(patience_limit) if patience_limit > 0 else "off"
+                logger.info("  no improvement (best val_loss=%.4f @ epoch %d; patience %d/%s)",
+                            best_val, best_epoch, patience, limit_str)
+                if patience_limit > 0 and patience >= patience_limit:
+                    logger.info("Early stopping: no val_loss improvement for %d epochs (best=%.4f @ epoch %d).",
+                                patience_limit, best_val, best_epoch)
+                    if generate_every <= 0:
+                        _generate(f"epoch {epoch}")
+                    break
+
         # Per-epoch generation, unless step-based generation is already running.
         if generate_every <= 0:
             _generate(f"epoch {epoch}")
 
+        # Reclaim the reserved-but-unallocated segments left by validation/generation so the
+        # next epoch's training starts from a clean pool (avoids epoch-boundary fragmentation
+        # OOMs on long-sequence runs). Cheap: once per epoch, not per step.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     _save("final")
+    if best_epoch >= 0:
+        logger.info("Best epoch: %d  (val_loss=%.4f, saved as pinball_best.pt).", best_epoch, best_val)
     logger.info("Done after %d steps (%d epochs).", completed_steps, epoch + 1)
 
 
