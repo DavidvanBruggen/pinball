@@ -41,7 +41,7 @@ generate_every: 0
 gen_prompt_tokens: 512
 gen_max_new_tokens: 512
 save_every: 0
-checkpoint_dir: ./pinball/hqd_witness/checkpoints
+checkpoint_dir: ./pinball/hqd_bag/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -78,7 +78,7 @@ dropout: 0.0
 # Attention / hierarchy toggles
 attn_backend: flash        # pyg | flash | sdpa
 qkv_sharing: shared      # shared | separate
-use_hqd: true             # hierarchical query descent
+use_hqd: True             # hierarchical query descent
 hqd_query_chunk_size: 1024000000 # 4096
 hqd_include_local_window: False
 hqd_every_n: 4
@@ -87,13 +87,42 @@ hqd_reuse_max_age: 0
 hqd_topk_l3: 4 #8 #4 #16 #16 # 4
 hqd_topk_l2: 4 #8 #4 #16 #8 #32 # 4
 hqd_topk_l1: 4 #16 #4 #128 #32 #64 # 16
-hqd_topk_l0: 64 #64 #64 #256 #64 #128 # 128
-hqd_l0_topk_enable: False
+hqd_topk_l0: 8 #64 #64 #256 #64 #128 # 128
+hqd_l0_topk_enable: True
 hqd_query_level: 0       # query at L0 (token level); query_level>=1 breaks AR causality
 hqd_stop_level: 0
 hqd_handoff_to_l0: false
 hqd_global_topk: 0 #65536
 hqd_use_existing_zipper_projections: true   # reuse the zipper q/k projections
+# HQD final-read attention implementation. Same edge set + same causality either way.
+#   scatter : per-edge gather + segment-softmax + scatter_add (PyG). Default, robust.
+#   dense   : group each destination's edges into a block + fused attention. Only wins
+#             when the HQD apply is a bottleneck AND degrees are ~uniform (bounded K).
+#             PROFILED: with witnesses + bag + read_levels the apply is only ~3-6ms of a
+#             ~164ms step and degrees are ragged (L0 ~28 vs coarse ~128), so dense gives
+#             ~no speedup. dense/sdpa pads to max degree => wasteful on ragged sets (auto
+#             falls back to scatter past hqd_dense_max_pad_ratio); dense/flash (ragged)
+#             ties scatter. Keep scatter unless you have a bounded uniform edge set.
+hqd_attn_impl: scatter        # scatter | dense
+hqd_dense_backend: flash       # sdpa | flash (flash-varlen if installed, else sdpa)
+# Descent shortcut ("bag instead of descend"). 0 = full scored descent (L3,L2,L1,L0).
+#   2 = score L3,L2 then take ALL L1 children of the selected L2 nodes unscored (skip the
+#       L1 scoring stage); the final L0 stage still scores + prunes to topk_l0. Saves one
+#       scoring pass. BEHAVIOUR-CHANGING (alters selection) — validate quality with a run.
+hqd_descent_stop_at: 0       # 0 | 2
+# Shallow bag read ("L0 queries L3, bags down"): stop the SCORED descent at this level and
+# reach L0 only through the selected coarse nodes' precomputed bags, skipping the L2/L1/L0
+# scoring stages (the ~18ms cost). 0 = off. 3 = score L3 only. 2 = score L3,L2. REQUIRES the
+# stop level in witness_levels (the bag is the only path to L0) and use_witness_packets: true.
+# Causal for AR (bag = causal key + src<=dst). Behaviour-changing — validate quality.
+hqd_shallow_read_level: 3     # 0 | 2 | 3
+# Bidirectional coarse routing (option 2): coarse nodes attend among themselves (few nodes =
+# cheap) and matched pairs surface bag<->bag L0 edges — long-range mixing without every token
+# descending. NOT AR-causal (coarse-as-query leaks); auto-disabled under AR with a warning.
+# Use only for masked-diffusion / bidirectional (e.g. masked image, DNA). [] = off. Requires the
+# routed levels in witness_levels.
+hqd_coarse_route_levels: []   # e.g. [3] or [2,3]
+hqd_coarse_route_topk: 8      # neighbours each coarse node routes to
 # HQD final-read levels: which selected levels the L0 query attends over. [0] = L0 only
 # (original behavior); [0, 1, 2, 3] also mixes the selected L1/L2/L3 summary nodes into the
 # attention (level-aware scoring handles the cross-level q.k). Causal-safe at query_level 0.
@@ -112,6 +141,10 @@ witness_k_rare: 4               # rare/surprise witnesses per parent
 witness_max_per_parent: 0      # cap on total witness slots/parent (0 = uncapped). Bounds the
                                 # candidate width so per_head*num_heads can't blow up cost: the
                                 # build is ~0.6% of a step, the inflated candidate set is what scales.
+witness_levels: [3]            # which parent levels expose L0 bags. [1] = L1->L0 direct children.
+                                # [1,2,3] also builds cross-level L2->L0 / L3->L0 bags so a coarse
+                                # selection reaches its important L0 descendants without descending.
+                                # Causal-verified for AR; enables the shallow-read / coarse-route paths.
 witness_lambda_rare: 0.3        # weight on normalized aux-reconstruction surprise
 witness_score_bias: 5.0         # logit bonus that force-includes witnesses past final top-k
 

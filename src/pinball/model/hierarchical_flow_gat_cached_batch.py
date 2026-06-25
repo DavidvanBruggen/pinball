@@ -2173,6 +2173,12 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_assume_disjoint_children: bool = False,
         hqd_validate_disjoint_children: bool = False,
         hqd_sparse_project_active_only: bool = False,
+        hqd_attn_impl: str = "scatter",
+        hqd_dense_backend: str = "sdpa",
+        hqd_descent_stop_at: int = 0,
+        hqd_shallow_read_level: int = 0,
+        hqd_coarse_route_levels: Optional[List[int]] = None,
+        hqd_coarse_route_topk: int = 8,
         hqd_select_inside_message_passing: bool = False,
         # --- Witness packets: selected coarse nodes expose bounded pointers to exact
         # lower-level children ("what it cannot forget"), force-included into the HQD
@@ -2184,6 +2190,7 @@ class HierarchicalFlowGAT(nn.Module):
         witness_k_summary: int = 4,
         witness_k_rare: int = 4,
         witness_max_per_parent: int = 0,
+        witness_levels: Optional[List[int]] = None,
         witness_lambda_rare: float = 0.3,
         witness_score_bias: float = 5.0,
         # Which selected levels to mix into the HQD final read. [0] = L0 only (default,
@@ -2709,6 +2716,14 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_assume_disjoint_children = bool(hqd_assume_disjoint_children)
         self.hqd_validate_disjoint_children = bool(hqd_validate_disjoint_children)
         self.hqd_sparse_project_active_only = bool(hqd_sparse_project_active_only)
+        self.hqd_attn_impl = str(hqd_attn_impl).lower() if str(hqd_attn_impl).lower() in ("scatter", "dense") else "scatter"
+        self.hqd_dense_backend = str(hqd_dense_backend).lower() if str(hqd_dense_backend).lower() in ("sdpa", "flash") else "sdpa"
+        self.hqd_descent_stop_at = int(hqd_descent_stop_at) if int(hqd_descent_stop_at) in (0, 2) else 0
+        self.hqd_shallow_read_level = int(hqd_shallow_read_level) if int(hqd_shallow_read_level) in (0, 2, 3) else 0
+        # Bidirectional coarse routing (option 2): coarse nodes attend among themselves and
+        # surface bag<->bag L0 edges. NOT AR-causal (coarse-as-query). Bidi/masked-diffusion only.
+        self.hqd_coarse_route_levels = sorted({int(l) for l in (hqd_coarse_route_levels or []) if int(l) in (1, 2, 3)})
+        self.hqd_coarse_route_topk = max(1, int(hqd_coarse_route_topk))
         self.hqd_select_inside_message_passing = bool(hqd_select_inside_message_passing)
 
         # Witness packets (see _build_witness_l0_ids). Active only when HQD is enabled,
@@ -2720,6 +2735,10 @@ class HierarchicalFlowGAT(nn.Module):
         self.witness_k_summary = max(0, int(witness_k_summary))
         self.witness_k_rare = max(0, int(witness_k_rare))
         self.witness_max_per_parent = max(0, int(witness_max_per_parent))
+        # Which parent levels expose L0 bags. [1] = today (L1->L0 direct children).
+        # [1,2,3] also builds cross-level L2->L0 / L3->L0 bags so a coarse node can be
+        # read and reach its important L0 descendants without descending.
+        self.witness_levels = sorted({int(l) for l in (witness_levels or [1]) if int(l) in (1, 2, 3)}) or [1]
         self.witness_lambda_rare = float(witness_lambda_rare)
         self.witness_score_bias = float(witness_score_bias)
         _read_levels = hqd_read_levels if hqd_read_levels is not None else [0]
@@ -8073,11 +8092,31 @@ class HierarchicalFlowGAT(nn.Module):
         resid = ((pred - x_bnh) ** 2).mean(dim=-1)  # [B, N]
         return (resid * has_parent.to(resid.dtype)).detach()
 
+    def _hqd_compose_l0_children(
+        self,
+        parent_ids: torch.Tensor,
+        level: int,
+        child_tables: Dict[int, Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Compose a [P, C] table of all L0 descendant ids (-1 padded) for parents at
+        `level`, by chaining the per-level children tables down to L0. Used to build
+        cross-level (L2->L0, L3->L0) witness bags."""
+        desc = parent_ids.view(-1, 1)                       # [P, 1]
+        for lvl in range(int(level), 0, -1):
+            table = child_tables.get(int(lvl))
+            if table is None:
+                return torch.full((int(parent_ids.numel()), 0), -1, dtype=torch.long, device=parent_ids.device)
+            ch, cv = self._hqd_expand_children_batched(desc, table)
+            ch = torch.where(cv, ch, torch.full_like(ch, -1))
+            desc = ch.reshape(desc.size(0), -1)             # [P, C_so_far]
+        return desc                                          # [P, C] L0 ids
+
     def _build_witness_l0_ids(
         self,
         q_all: torch.Tensor,
         k_all: torch.Tensor,
-        l1_to_l0: Dict[str, torch.Tensor],
+        child_tables: Dict[int, Dict[str, torch.Tensor]],
+        level_indices: Dict[int, torch.Tensor],
         node_ar_time: Optional[torch.Tensor],
         x_bnh: torch.Tensor,
         node_level: torch.Tensor,
@@ -8085,16 +8124,67 @@ class HierarchicalFlowGAT(nn.Module):
         allow_same_time: bool,
         causal: bool,
     ) -> Optional[torch.Tensor]:
-        """For each L1 parent, select a bounded packet of L0 child ids it 'cannot forget':
-          - summary witnesses: top-k children by graph responsibility (q_parent.k_child),
-            either head-averaged (flat) or top-k per head (summary_witness_per_head).
+        """Build a [B, N, slots] L0-id bag table (-1 padded), populating the rows of each
+        parent level in self.witness_levels. L1 uses its direct L0 children; L2/L3 compose
+        their full L0 descendant set (cross-level bags). None if nothing to build."""
+        B, N = int(q_all.size(0)), int(q_all.size(1))
+        device = q_all.device
+        out: Optional[torch.Tensor] = None
+        for level in self.witness_levels:
+            if int(level) == 1:
+                table = child_tables.get(1)
+                if table is None:
+                    continue
+                parent_ids = table.get("parent_ids")
+                children = table.get("children")
+            else:
+                parent_ids = level_indices.get(int(level))
+                if parent_ids is None or parent_ids.numel() == 0:
+                    continue
+                children = self._hqd_compose_l0_children(parent_ids, int(level), child_tables)
+            if parent_ids is None or children is None or parent_ids.numel() == 0 or children.size(-1) == 0:
+                continue
+            packed = self._build_witness_packet(
+                parent_ids=parent_ids, children=children, q_all=q_all, k_all=k_all,
+                node_ar_time=node_ar_time, x_bnh=x_bnh, node_level=node_level,
+                edge_index=edge_index, allow_same_time=allow_same_time, causal=causal,
+            )
+            if packed is None:
+                continue
+            slots = int(packed.size(-1))
+            if out is None:
+                out = torch.full((B, N, slots), -1, dtype=torch.long, device=device)
+            elif slots != out.size(-1):
+                # Pad to a common slot width (levels share k config, so normally equal).
+                w = max(slots, out.size(-1))
+                if out.size(-1) < w:
+                    out = torch.cat([out, torch.full((B, N, w - out.size(-1)), -1, dtype=torch.long, device=device)], dim=-1)
+                if slots < w:
+                    packed = torch.cat([packed, torch.full((B, int(parent_ids.numel()), w - slots), -1, dtype=torch.long, device=device)], dim=-1)
+            out.index_copy_(1, parent_ids, packed)
+        return out
+
+    def _build_witness_packet(
+        self,
+        parent_ids: torch.Tensor,
+        children: torch.Tensor,
+        q_all: torch.Tensor,
+        k_all: torch.Tensor,
+        node_ar_time: Optional[torch.Tensor],
+        x_bnh: torch.Tensor,
+        node_level: torch.Tensor,
+        edge_index: torch.Tensor,
+        allow_same_time: bool,
+        causal: bool,
+    ) -> Optional[torch.Tensor]:
+        """Core witness selection for one parent level. `children` is a [P, C] table of L0
+        descendant ids (-1 padded). Returns packed [B, P, slots] of L0 ids it 'cannot forget':
+          - summary witnesses: top-k children by responsibility (q_parent.k_child),
+            head-averaged (flat) or top-k per head (summary_witness_per_head).
           - rare witnesses: top-k by responsibility + lambda * normalized detached surprise.
-        Returns a [B, N, slots] long tensor of L0 ids (-1 padded); only L1 rows populated.
         None if there is nothing to build."""
         B, N, Hh, Dh = q_all.shape
         device = q_all.device
-        parent_ids = l1_to_l0.get("parent_ids")
-        children = l1_to_l0.get("children")
         if parent_ids is None or children is None or parent_ids.numel() == 0:
             return None
 
@@ -8179,10 +8269,7 @@ class HierarchicalFlowGAT(nn.Module):
             top_v, top_i = torch.topk(sp, k=cap, dim=-1)
             packed = packed.gather(-1, top_i)
             packed = torch.where(top_v > (neg * 0.5), packed, torch.full_like(packed, -1))
-        slots = int(packed.size(-1))
-        witness = torch.full((B, N, slots), -1, dtype=torch.long, device=device)
-        witness.index_copy_(1, parent_ids, packed)
-        return witness
+        return packed                                          # [B, P, slots]
 
     def _hierarchical_query_descent_ephemeral_batched(
         self,
@@ -8377,6 +8464,26 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_stop_level = int(getattr(self, "hqd_stop_level", 0))
         hqd_handoff_to_l0 = bool(getattr(self, "hqd_handoff_to_l0", False)) and hqd_query_level > 0 and hqd_stop_level > 0
         hqd_global_topk = int(getattr(self, "hqd_global_topk", 0))
+        # Descent shortcut ("bag instead of descend"): the last level the scored descent
+        # runs. 0 = full (score L3,L2,L1,L0). 2 = score L3,L2 then take ALL L1 children of
+        # the selected L2 nodes unscored (skip the L1 scoring stage); the final L0 stage
+        # still scores + prunes to topk_l0, so attention stays bounded. Changes selection
+        # (behaviour-affecting), query_level 0 only.
+        desc_stop_at = int(getattr(self, "hqd_descent_stop_at", 0)) if hqd_query_level == 0 and hqd_stop_level == 0 else 0
+        # Shallow bag read ("L0 queries L3, bags down"): stop the SCORED descent at this
+        # level and reach L0 only through the selected coarse nodes' precomputed bags
+        # (cross-level witnesses), skipping the L2/L1/L0 scoring stages — the real cost.
+        # 0 = off (full descent). 3 = score L3 only. 2 = score L3,L2. Requires the stop
+        # level to be in witness_levels. query_level 0 only; causal (bag = causal key).
+        shallow_read = int(getattr(self, "hqd_shallow_read_level", 0)) if hqd_query_level == 0 and hqd_stop_level == 0 else 0
+        if shallow_read in (2, 3) and shallow_read not in getattr(self, "witness_levels", [1]) and not bool(getattr(self, "_hqd_shallow_warned", False)):
+            logger.warning(
+                "hqd_shallow_read_level=%d but level %d is not in witness_levels=%s: the shallow "
+                "read reaches L0 only via that level's bag, so add %d to witness_levels or the "
+                "candidate set will be empty.", shallow_read, shallow_read,
+                getattr(self, "witness_levels", [1]), shallow_read,
+            )
+            self._hqd_shallow_warned = True
         local_window_size = int(self.hqd_local_window_size if self.hqd_local_window_size > 0 else getattr(self, "l0_local_window", 0))
         level_indices = {0: l0_idx, 1: l1_idx, 2: l2_idx, 3: l3_idx}
         query_idx = level_indices.get(hqd_query_level, l0_idx)
@@ -8437,7 +8544,8 @@ class HierarchicalFlowGAT(nn.Module):
             witness_table = self._build_witness_l0_ids(
                 q_all=q_all,
                 k_all=k_all,
-                l1_to_l0=l1_to_l0,
+                child_tables={1: l1_to_l0, 2: l2_to_l1, 3: l3_to_l2},
+                level_indices={1: l1_idx, 2: l2_idx, 3: l3_idx},
                 node_ar_time=node_ar_time,
                 x_bnh=x_bnh,
                 node_level=node_level,
@@ -8537,19 +8645,26 @@ class HierarchicalFlowGAT(nn.Module):
                 cand2_nodes, cand2_mask = self._hqd_maybe_dedup_candidates_batched(cand2_nodes_raw)
                 if collect_stats:
                     stage_stats["l2_candidates"] += int(cand2_mask.sum().item())
-                scores2 = self._hqd_score_candidates_batched(
-                    query_vec=q_vec,
-                    key_bank=k_all,
-                    candidate_nodes=cand2_nodes,
-                    candidate_mask=cand2_mask,
-                    query_time=query_time,
-                    candidate_max_time_cache=level_max_time_cache[2],
-                    causal=causal,
-                    allow_same_time=allow_same_time,
-                )
-                sel2_nodes, sel2_scores, sel2_valid = self._hqd_topk_from_scores_batched(cand2_nodes, scores2, hqd_topk_l2)
-                if hqd_global_topk > 0:
-                    sel2_valid = self._hqd_apply_per_batch_global_topk(sel2_scores, sel2_valid, hqd_global_topk)
+                if shallow_read == 3:
+                    # Shallow read at L3: skip L2 scoring; sel2 empty -> reach L0 via L3 bags.
+                    Qc = int(q_vec.size(1))
+                    sel2_nodes = torch.empty(B, Qc, 0, dtype=torch.long, device=device)
+                    sel2_scores = torch.empty(B, Qc, 0, dtype=q_vec.dtype, device=device)
+                    sel2_valid = torch.empty(B, Qc, 0, dtype=torch.bool, device=device)
+                else:
+                    scores2 = self._hqd_score_candidates_batched(
+                        query_vec=q_vec,
+                        key_bank=k_all,
+                        candidate_nodes=cand2_nodes,
+                        candidate_mask=cand2_mask,
+                        query_time=query_time,
+                        candidate_max_time_cache=level_max_time_cache[2],
+                        causal=causal,
+                        allow_same_time=allow_same_time,
+                    )
+                    sel2_nodes, sel2_scores, sel2_valid = self._hqd_topk_from_scores_batched(cand2_nodes, scores2, hqd_topk_l2)
+                    if hqd_global_topk > 0:
+                        sel2_valid = self._hqd_apply_per_batch_global_topk(sel2_scores, sel2_valid, hqd_global_topk)
                 if collect_stats:
                     stage_stats["l2_selected_total"] += int(sel2_valid.sum().item())
                 final_nodes = sel2_nodes
@@ -8607,19 +8722,39 @@ class HierarchicalFlowGAT(nn.Module):
                 cand1_nodes, cand1_mask = self._hqd_maybe_dedup_candidates_batched(cand1_nodes_raw)
                 if collect_stats:
                     stage_stats["l1_candidates"] += int(cand1_mask.sum().item())
-                scores1 = self._hqd_score_candidates_batched(
-                    query_vec=q_vec,
-                    key_bank=k_all,
-                    candidate_nodes=cand1_nodes,
-                    candidate_mask=cand1_mask,
-                    query_time=query_time,
-                    candidate_max_time_cache=level_max_time_cache[1],
-                    causal=causal,
-                    allow_same_time=allow_same_time,
-                )
-                sel1_nodes, sel1_scores, sel1_valid = self._hqd_topk_from_scores_batched(cand1_nodes, scores1, hqd_topk_l1)
-                if hqd_global_topk > 0:
-                    sel1_valid = self._hqd_apply_per_batch_global_topk(sel1_scores, sel1_valid, hqd_global_topk)
+                if shallow_read in (2, 3):
+                    # Shallow read: skip L1 scoring; sel1 empty -> reach L0 via the selected
+                    # L2/L3 nodes' bags (final stage scores + prunes them).
+                    Qc = int(q_vec.size(1))
+                    sel1_nodes = torch.empty(B, Qc, 0, dtype=torch.long, device=device)
+                    sel1_scores = torch.empty(B, Qc, 0, dtype=q_vec.dtype, device=device)
+                    sel1_valid = torch.empty(B, Qc, 0, dtype=torch.bool, device=device)
+                elif desc_stop_at >= 2:
+                    # Shortcut: skip the L1 scoring/top-k. All L1 children of the selected
+                    # L2 nodes become "selected", causally masked (L1 max_time vs query).
+                    # The final L0 stage scores + prunes, so the read stays bounded.
+                    sel1_nodes = cand1_nodes
+                    l1_max_t = level_max_time_cache[1].index_select(0, cand1_nodes.clamp(min=0).reshape(-1)).view_as(cand1_nodes)
+                    if causal:
+                        cmask = (l1_max_t <= query_time.unsqueeze(-1)) if allow_same_time else (l1_max_t < query_time.unsqueeze(-1))
+                        sel1_valid = cand1_mask & cmask & (l1_max_t >= 0)
+                    else:
+                        sel1_valid = cand1_mask
+                    sel1_scores = torch.zeros_like(sel1_nodes, dtype=q_vec.dtype)
+                else:
+                    scores1 = self._hqd_score_candidates_batched(
+                        query_vec=q_vec,
+                        key_bank=k_all,
+                        candidate_nodes=cand1_nodes,
+                        candidate_mask=cand1_mask,
+                        query_time=query_time,
+                        candidate_max_time_cache=level_max_time_cache[1],
+                        causal=causal,
+                        allow_same_time=allow_same_time,
+                    )
+                    sel1_nodes, sel1_scores, sel1_valid = self._hqd_topk_from_scores_batched(cand1_nodes, scores1, hqd_topk_l1)
+                    if hqd_global_topk > 0:
+                        sel1_valid = self._hqd_apply_per_batch_global_topk(sel1_scores, sel1_valid, hqd_global_topk)
                 if collect_stats:
                     stage_stats["l1_selected_total"] += int(sel1_valid.sum().item())
                 final_nodes = sel1_nodes
@@ -8696,20 +8831,31 @@ class HierarchicalFlowGAT(nn.Module):
                         stage_stats["local_window_total"] += local_valid_count
                         stage_stats["local_window_overlap"] += max(0, int(cand0_mask.sum().item()) + local_valid_count - int(final_mask.sum().item()))
 
-                # Witness packets: union the selected L1 parents' L0 witness children into
-                # the candidate pool. They are scored normally (so causal -inf survivors
-                # stay excluded) but get a +bias so the final top-k keeps them.
+                # Witness packets: union the selected coarse parents' L0 bag ids into the
+                # candidate pool. Each active witness level (L1/L2/L3) contributes the bags
+                # of its selected nodes. Scored normally (causal -inf survivors stay
+                # excluded) but get a +bias so the final top-k keeps them. The L2/L3 bags
+                # are cross-level (L0 descendants), letting a coarse selection reach L0
+                # without descending through it.
                 wit_ids = None
                 if witness_active:
                     slots_w = int(witness_table.size(-1))
                     wflat = witness_table.reshape(B * N, slots_w)
                     boff = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1) * N
-                    gidx = (sel1_nodes.clamp(min=0) + boff).reshape(-1)
-                    wit_ids = wflat.index_select(0, gidx).view(B, sel1_nodes.size(1), sel1_nodes.size(2), slots_w)
-                    wit_ids = torch.where(sel1_valid.unsqueeze(-1), wit_ids, torch.full_like(wit_ids, -1))
-                    wit_ids = wit_ids.reshape(B, sel1_nodes.size(1), -1)  # [B, Q, topk_l1*slots]
-                    combined = torch.cat([final_nodes, wit_ids], dim=-1)
-                    final_nodes, final_mask = self._hqd_maybe_dedup_candidates_batched(combined, force=True)
+                    wit_parts: List[torch.Tensor] = []
+                    for _wl, _wn, _wv in ((1, sel1_nodes, sel1_valid),
+                                          (2, sel2_nodes, sel2_valid),
+                                          (3, sel3_nodes, sel3_valid)):
+                        if _wl not in self.witness_levels or _wn.numel() == 0:
+                            continue
+                        gidx = (_wn.clamp(min=0) + boff).reshape(-1)
+                        wp = wflat.index_select(0, gidx).view(B, _wn.size(1), _wn.size(2), slots_w)
+                        wp = torch.where(_wv.unsqueeze(-1), wp, torch.full_like(wp, -1))
+                        wit_parts.append(wp.reshape(B, _wn.size(1), -1))
+                    if wit_parts:
+                        wit_ids = torch.cat(wit_parts, dim=-1)  # [B, Q, Σ topk_lX*slots]
+                        combined = torch.cat([final_nodes, wit_ids], dim=-1)
+                        final_nodes, final_mask = self._hqd_maybe_dedup_candidates_batched(combined, force=True)
 
                 if collect_stats:
                     stage_stats["final_candidate_total"] += int(final_mask.sum().item())
@@ -8884,6 +9030,47 @@ class HierarchicalFlowGAT(nn.Module):
                 selected_b.append(bidx_e[bok])
                 selected_src.append(bag[bok])
                 selected_dst.append(dst_e[bok])
+
+        # Option 2 — bidirectional coarse routing: each coarse node attends to its top-r
+        # same-level neighbours (cheap: few nodes), and matched pairs surface bag<->bag L0
+        # edges. NOT AR-causal (a coarse node queries with its full-span vector), so it is
+        # gated to non-causal (masked-diffusion / bidirectional) runs only.
+        coarse_route_levels = [int(l) for l in getattr(self, "hqd_coarse_route_levels", []) if int(l) in (1, 2, 3)]
+        if coarse_route_levels and causal:
+            if not bool(getattr(self, "_hqd_coarse_route_causal_warned", False)):
+                logger.warning(
+                    "hqd_coarse_route_levels is set but the graph is causal (AR): coarse-as-query "
+                    "leaks future info (~7e-3). Coarse routing is disabled under AR; use it only "
+                    "for masked-diffusion / bidirectional training."
+                )
+                self._hqd_coarse_route_causal_warned = True
+            coarse_route_levels = []
+        if coarse_route_levels and witness_table is not None:
+            route_r = int(getattr(self, "hqd_coarse_route_topk", 8))
+            sw = int(witness_table.size(-1))
+            for L in coarse_route_levels:
+                if L not in self.witness_levels:
+                    continue
+                nodes = level_indices.get(L)
+                if nodes is None or int(nodes.numel()) < 2:
+                    continue
+                nL = int(nodes.numel())
+                qL = q_all.index_select(1, nodes)                    # [B, nL, H, D]
+                kL = k_all.index_select(1, nodes)
+                sc = torch.einsum("bnhd,bmhd->bnm", qL, kL) / float(qL.size(-2) * math.sqrt(float(qL.size(-1))))
+                r = min(route_r, nL)
+                _, ri = torch.topk(sc, k=r, dim=-1)                  # [B, nL, r] -> positions in `nodes`
+                bags = witness_table.index_select(1, nodes)          # [B, nL, sw] L0 ids (-1 pad)
+                nbr_bags = torch.gather(
+                    bags, 1, ri.reshape(B, nL * r, 1).expand(B, nL * r, sw)
+                ).view(B, nL, r, sw)                                 # [B, nL, r, sw]
+                dst_e = bags.view(B, nL, 1, sw, 1).expand(B, nL, r, sw, sw)   # node i's bag = dst
+                src_e = nbr_bags.view(B, nL, r, 1, sw).expand(B, nL, r, sw, sw)  # neighbour j's bag = src
+                valid = (dst_e >= 0) & (src_e >= 0)
+                bidx_e = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1, 1, 1).expand_as(dst_e)
+                selected_b.append(bidx_e[valid])
+                selected_src.append(src_e[valid])
+                selected_dst.append(dst_e[valid])
 
         if not selected_b:
             self._hqd_reuse_cache = None
@@ -9638,6 +9825,8 @@ class HierarchicalFlowGAT(nn.Module):
                     mp.local_attn_runtime_level_grid_shapes = {}
                 mp.local_attn_runtime_spatial_metric = str(getattr(self, "graph_spatial_metric", "chebyshev"))
                 mp.hqd_sparse_project_active_only = bool(getattr(self, "hqd_sparse_project_active_only", False))
+                mp.hqd_attn_impl = str(getattr(self, "hqd_attn_impl", "scatter"))
+                mp.hqd_dense_backend = str(getattr(self, "hqd_dense_backend", "sdpa"))
                 mp.hqd_profile_enable = bool(getattr(self, "hqd_debug", False))
 
         if use_multi_local and not bool(getattr(self, "_l0_local_runtime_logged", False)):

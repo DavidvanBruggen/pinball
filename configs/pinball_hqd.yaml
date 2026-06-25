@@ -68,6 +68,15 @@ hqd_stop_level: 0
 hqd_handoff_to_l0: false
 hqd_global_topk: 0 #65536
 hqd_use_existing_zipper_projections: true   # reuse the zipper q/k projections
+# HQD final-read attention implementation. Same edge set + same causality either way.
+#   scatter : per-edge gather + segment-softmax + scatter_add (PyG). Default.
+#   dense   : group each destination's edges into a padded block + fused attention.
+#             Cheaper at long context; equivalent up to float-summation order.
+hqd_attn_impl: scatter        # scatter | dense
+hqd_dense_backend: sdpa       # sdpa | flash (flash-varlen if installed, else sdpa)
+# Descent shortcut: 0 = full scored descent; 2 = skip the L1 scoring stage (take all L1
+# children of selected L2 unscored, final L0 stage still prunes). BEHAVIOUR-CHANGING.
+hqd_descent_stop_at: 0        # 0 | 2
 
 # HQD final-read levels: which selected levels the L0 query attends over. [0] = L0 only
 # (original behavior); [0, 1, 2, 3] also mixes selected L1/L2/L3 summary nodes into the

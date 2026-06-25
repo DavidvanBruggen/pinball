@@ -507,6 +507,9 @@ class HierarchicalMessagePassing(MessagePassing):
         self._local_attn_runtime_logged_keys = set()
         self.local_attn_dense_mask_max_tokens = 8192
         self.hqd_sparse_project_active_only = False
+        self.hqd_attn_impl = "scatter"        # scatter (edge softmax+scatter_add) | dense (fused gathered SDPA/flash)
+        self.hqd_dense_backend = "sdpa"        # sdpa | flash (flash-varlen, falls back to sdpa)
+        self.hqd_dense_max_pad_ratio = 1.5     # dense/sdpa: fall back to scatter if padded slots (G*Kmax) exceed this x #edges
         self.hqd_profile_enable = False
         self._last_hqd_apply_ms: Optional[float] = None
         self.hqd_runtime_selector: Optional[Callable[[torch.Tensor, torch.Tensor], Any]] = None
@@ -1719,11 +1722,19 @@ class HierarchicalMessagePassing(MessagePassing):
 
         if hqd_edges is not None:
             hqd_b_idx, hqd_src_idx, hqd_dst_idx = hqd_edges
-            hqd_out = self._compute_hqd_sparse_attn(
-                q=q, k=k, v=v,
-                b_idx=hqd_b_idx, src_idx=hqd_src_idx, dst_idx=hqd_dst_idx,
-                num_nodes=num_nodes, B=B,
-            )
+            if str(getattr(self, "hqd_attn_impl", "scatter")).lower() == "dense":
+                hqd_out = self._compute_hqd_dense_attn(
+                    q=q, k=k, v=v,
+                    b_idx=hqd_b_idx, src_idx=hqd_src_idx, dst_idx=hqd_dst_idx,
+                    num_nodes=num_nodes, B=B,
+                    backend=str(getattr(self, "hqd_dense_backend", "sdpa")).lower(),
+                )
+            else:
+                hqd_out = self._compute_hqd_sparse_attn(
+                    q=q, k=k, v=v,
+                    b_idx=hqd_b_idx, src_idx=hqd_src_idx, dst_idx=hqd_dst_idx,
+                    num_nodes=num_nodes, B=B,
+                )
             if hqd_out is not None:
                 if source_gates is not None:
                     hqd_out = source_gates["hqd"] * hqd_out
@@ -2148,6 +2159,132 @@ class HierarchicalMessagePassing(MessagePassing):
         out = out_flat.view(B, num_nodes, num_heads, head_dim)
         out = out.reshape(B, num_nodes, num_heads * head_dim)
         out = self.out_proj(out)
+        self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
+        return out
+
+    def _compute_hqd_dense_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        b_idx: torch.Tensor,
+        src_idx: torch.Tensor,
+        dst_idx: torch.Tensor,
+        num_nodes: int,
+        B: int,
+        backend: str = "sdpa",
+    ) -> Optional[torch.Tensor]:
+        """Dense per-destination attention over the HQD edge set.
+
+        Mathematically the same operation as ``_compute_hqd_sparse_attn`` (each
+        destination attends, with a softmax, over the candidate sources on its
+        incident edges), but instead of an edge-wise gather + segment-softmax +
+        ``scatter_add`` it groups each destination's edges into a padded
+        ``[G, Kmax, H, D]`` block and runs a fused attention (SDPA, or
+        flash-varlen when available). The edge *set* is identical, so causality
+        is identical: a destination only ever sees causal sources, and a padded
+        slot is masked out of the softmax. This trades the bandwidth/launch-bound
+        scatter for a fused kernel, the dominant HQD-read cost at long context.
+        """
+        if b_idx.numel() == 0:
+            return None
+        profile_enabled = bool(getattr(self, "hqd_profile_enable", False))
+        _t0 = time.monotonic() if profile_enabled else 0.0
+
+        device = q.device
+        b_idx = b_idx.to(device=device, dtype=torch.long)
+        src_idx = src_idx.to(device=device, dtype=torch.long)
+        dst_idx = dst_idx.to(device=device, dtype=torch.long)
+        head_dim = max(1, int(q.size(-1)))
+        num_heads = max(1, int(q.size(-2)))
+
+        # Group edges by (batch, dst). uniq is sorted; inv maps each edge -> group.
+        group_idx = b_idx * num_nodes + dst_idx
+        uniq, inv = torch.unique(group_idx, sorted=True, return_inverse=True)
+        G = int(uniq.numel())
+        group_b = torch.div(uniq, num_nodes, rounding_mode="floor")
+        group_dst = uniq - group_b * num_nodes
+
+        counts = torch.bincount(inv, minlength=G)
+        # Per-edge rank within its group (stable sort -> deterministic ordering).
+        order = torch.argsort(inv, stable=True)
+        first_offset = torch.zeros(G, device=device, dtype=torch.long)
+        if G > 1:
+            first_offset[1:] = torch.cumsum(counts, dim=0)[:-1]
+        E = int(inv.numel())
+        rank_sorted = torch.arange(E, device=device, dtype=torch.long) - first_offset.index_select(0, inv.index_select(0, order))
+        rank = torch.empty(E, device=device, dtype=torch.long)
+        rank[order] = rank_sorted
+
+        q_g = q[group_b, group_dst]                      # [G, H, D]
+
+        flash_varlen = None
+        if backend == "flash":
+            try:  # best-effort; falls back to padded SDPA below
+                from flash_attn import flash_attn_varlen_func as flash_varlen  # type: ignore
+            except Exception:
+                flash_varlen = None
+
+        if flash_varlen is not None and q_g.is_cuda:
+            # Ragged path: no padding. flash_attn_varlen_func wants packed 3D tensors
+            # q [total_q, H, D] and k/v [total_k, H, D] with int32 cu_seqlens. One query
+            # per group (cu_q = arange), keys/values concatenated in group order.
+            edge_b = group_b.index_select(0, inv.index_select(0, order))
+            edge_src = src_idx.index_select(0, order)
+            k_var = k[edge_b, edge_src].contiguous()    # [E, H, D]
+            v_var = v[edge_b, edge_src].contiguous()
+            cu_q = torch.arange(0, G + 1, device=device, dtype=torch.int32)
+            cu_k = torch.zeros(G + 1, device=device, dtype=torch.int32)
+            cu_k[1:] = torch.cumsum(counts, dim=0).to(torch.int32)
+            max_k = int(counts.max().item()) if G > 0 else 0
+            out_g = flash_varlen(
+                q_g.contiguous(),                       # [G, H, D] -> total_q=G, seqlen 1
+                k_var, v_var,
+                cu_q, cu_k, 1, max_k,
+                causal=False,
+            )                                           # [G, H, D]
+        else:
+            Kmax = int(counts.max().item()) if G > 0 else 0
+            # Padded SDPA pads every destination to the *max* degree, so it only wins
+            # when degrees are roughly uniform. With a ragged HQD edge set (e.g. L0
+            # queries ~28 edges but coarse bag nodes ~128), padding wastes most of the
+            # block (G*Kmax >> #edges) and is several x slower than scatter. Fall back
+            # to scatter when the padding-waste ratio is too high; flash-varlen (ragged)
+            # has no padding and is the right dense backend for uneven degrees.
+            pad_ratio = float(getattr(self, "hqd_dense_max_pad_ratio", 1.5))
+            if G > 0 and int(G) * Kmax > pad_ratio * int(b_idx.numel()):
+                return self._compute_hqd_sparse_attn(
+                    q=q, k=k, v=v, b_idx=b_idx, src_idx=src_idx, dst_idx=dst_idx,
+                    num_nodes=num_nodes, B=B,
+                )
+            cand_src = torch.full((G, Kmax), -1, device=device, dtype=torch.long)
+            cand_src[inv, rank] = src_idx
+            valid = cand_src >= 0                       # [G, Kmax]
+            safe = cand_src.clamp(min=0)
+            gb = group_b.view(G, 1).expand(G, Kmax)
+            k_g = k[gb, safe]                           # [G, Kmax, H, D]
+            v_g = v[gb, safe]
+            # Canonical SDPA layout [G(batch), H, L, D]; contiguous so the fused/
+            # mem-efficient backward kernel reads correct strides (non-contiguous
+            # permuted views cause an illegal memory access in backward on CUDA).
+            q_s = q_g.unsqueeze(2).contiguous()         # [G, H, 1, D]
+            k_s = k_g.permute(0, 2, 1, 3).contiguous()  # [G, H, Kmax, D]
+            v_s = v_g.permute(0, 2, 1, 3).contiguous()
+            attn_mask = valid.view(G, 1, 1, Kmax)       # broadcast over heads
+            out = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=attn_mask)  # [G, H, 1, D]
+            out_g = out.squeeze(2)                      # [G, H, D]
+
+        if bool(getattr(self, "hqd_sparse_project_active_only", False)):
+            active_hidden = out_g.reshape(G, num_heads * head_dim)
+            active_proj = self.out_proj(active_hidden)
+            out_flat = torch.zeros((B * num_nodes, num_heads * head_dim), device=device, dtype=active_proj.dtype)
+            out_flat.index_copy_(0, uniq, active_proj)
+            self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
+            return out_flat.view(B, num_nodes, num_heads * head_dim)
+
+        out_flat = torch.zeros((B * num_nodes, num_heads, head_dim), device=device, dtype=out_g.dtype)
+        out_flat.index_copy_(0, uniq, out_g)
+        out = self.out_proj(out_flat.reshape(B, num_nodes, num_heads * head_dim))
         self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
         return out
 
