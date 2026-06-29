@@ -174,6 +174,73 @@ def test_shallow_read_causality():
         assert edges and edges > 0, f"shallow read (level={lvl}) produced no edges — bag missing?"
 
 
+def test_packed_graph_witness_read_causality():
+    # Experimental efficient path: the current graph attention pass captures direct
+    # child witnesses, HQD scores only L3, then composes L3->L2->L1->L0 packed witness
+    # ids consumed inside message passing without flattening an L0 sparse edge list.
+    T = BASE_CFG["block_size"]
+    torch.manual_seed(1)
+    tok0 = AutoTokenizer.from_pretrained(BASE_CFG["tokenizer_name"])
+    ids = torch.randint(0, tok0.vocab_size, (1, T))
+    j = T - 8
+    ids2 = ids.clone()
+    ids2[0, j] = (ids2[0, j].item() + 12345) % tok0.vocab_size
+
+    model, _ = _build(dict(
+        hqd_shallow_read_level=3,
+        hqd_select_inside_message_passing=True,
+        hqd_graph_witness_enable=True,
+        hqd_graph_witness_topk=4,
+        hqd_packed_witness_read=True,
+        hqd_topk_l0=8,
+    ))
+    base = _feats(model, ids)
+    det = (base - _feats(model, ids)).abs().max().item()
+    pert = _feats(model, ids2)
+    past = (base - pert).abs().flatten(start_dim=2).amax(dim=-1)[0][:j]
+    pd = past.max().item()
+    stats = getattr(model, "_last_hqd_stage_stats", {}) or {}
+    packed = int(stats.get("packed_witness_l0", 0))
+    print(f"[packed graph witnesses] determinism={det:.1e}  max|delta| past={pd:.3e}  packed={packed}")
+    assert packed > 0, "packed graph-witness path produced no L0 witness reads"
+    assert det < 1e-6 and pd < 1e-6, f"packed graph witnesses leaked ({pd:.3e})"
+
+
+def test_packed_recomputed_witness_read_causality():
+    # Use the original recomputed witness table as the source, but consume selected
+    # rows through packed fixed-K L0 attention instead of materialized sparse edges.
+    T = BASE_CFG["block_size"]
+    torch.manual_seed(1)
+    tok0 = AutoTokenizer.from_pretrained(BASE_CFG["tokenizer_name"])
+    ids = torch.randint(0, tok0.vocab_size, (1, T))
+    j = T - 8
+    ids2 = ids.clone()
+    ids2[0, j] = (ids2[0, j].item() + 12345) % tok0.vocab_size
+
+    model, _ = _build(dict(
+        hqd_shallow_read_level=3,
+        hqd_select_inside_message_passing=True,
+        hqd_graph_witness_enable=False,
+        hqd_packed_witness_read=True,
+        hqd_packed_witness_source="recompute",
+        use_witness_packets=True,
+        use_summary_witnesses=True,
+        use_rare_witnesses=True,
+        witness_levels=[3],
+        hqd_topk_l0=8,
+    ))
+    base = _feats(model, ids)
+    det = (base - _feats(model, ids)).abs().max().item()
+    pert = _feats(model, ids2)
+    past = (base - pert).abs().flatten(start_dim=2).amax(dim=-1)[0][:j]
+    pd = past.max().item()
+    stats = getattr(model, "_last_hqd_stage_stats", {}) or {}
+    packed = int(stats.get("packed_witness_l0", 0))
+    print(f"[packed recomputed witnesses] determinism={det:.1e}  max|delta| past={pd:.3e}  packed={packed}")
+    assert packed > 0, "recomputed packed witness path did not run"
+    assert det < 1e-6 and pd < 1e-6, f"packed recomputed witnesses leaked ({pd:.3e})"
+
+
 def test_coarse_route_gating():
     # Option 2: bidirectional coarse routing (coarse-as-query) is NOT AR-causal, so it must
     # auto-disable under AR (no leak), and run + produce routing edges under bidirectional.
@@ -229,11 +296,69 @@ def test_dense_backward_runs():
         assert torch.isfinite(loss) and gnorm > 0, "dense backward produced no/NaN grads"
 
 
+def test_packed_graph_witness_backward_runs():
+    T = BASE_CFG["block_size"]
+    torch.manual_seed(3)
+    tok0 = AutoTokenizer.from_pretrained(BASE_CFG["tokenizer_name"])
+    ids = torch.randint(0, tok0.vocab_size, (1, T))
+    model, _ = _build(dict(
+        hqd_shallow_read_level=3,
+        hqd_select_inside_message_passing=True,
+        hqd_graph_witness_enable=True,
+        hqd_graph_witness_topk=4,
+        hqd_packed_witness_read=True,
+        hqd_topk_l0=8,
+    ))
+    model.train()
+    out = model(ids)
+    feats = out[0] if isinstance(out, (tuple, list)) else out
+    loss = feats.float().pow(2).mean()
+    loss.backward()
+    stats = getattr(model, "_last_hqd_stage_stats", {}) or {}
+    packed = int(stats.get("packed_witness_l0", 0))
+    gnorm = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
+    print(f"[packed graph witnesses backward] packed={packed} loss={loss.item():.4f} grad_sum={gnorm:.3e}")
+    assert packed > 0 and torch.isfinite(loss) and gnorm > 0, "packed witness backward produced no reads/grads"
+
+
+def test_packed_recomputed_witness_backward_runs():
+    T = BASE_CFG["block_size"]
+    torch.manual_seed(4)
+    tok0 = AutoTokenizer.from_pretrained(BASE_CFG["tokenizer_name"])
+    ids = torch.randint(0, tok0.vocab_size, (1, T))
+    model, _ = _build(dict(
+        hqd_shallow_read_level=3,
+        hqd_select_inside_message_passing=True,
+        hqd_graph_witness_enable=False,
+        hqd_packed_witness_read=True,
+        hqd_packed_witness_source="recompute",
+        use_witness_packets=True,
+        use_summary_witnesses=True,
+        use_rare_witnesses=True,
+        witness_levels=[3],
+        hqd_topk_l0=8,
+    ))
+    model.train()
+    out = model(ids)
+    feats = out[0] if isinstance(out, (tuple, list)) else out
+    loss = feats.float().pow(2).mean()
+    loss.backward()
+    stats = getattr(model, "_last_hqd_stage_stats", {}) or {}
+    packed = int(stats.get("packed_witness_l0", 0))
+    gnorm = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
+    print(f"[packed recomputed witnesses backward] packed={packed} loss={loss.item():.4f} grad_sum={gnorm:.3e}")
+    assert packed > 0 and torch.isfinite(loss) and gnorm > 0, "recomputed packed witness backward failed"
+
+
 if __name__ == "__main__":
     test_dense_causality_and_equivalence()
     test_descent_shortcut_causality()
     test_cross_level_witness_causality()
     test_shallow_read_causality()
+    test_packed_graph_witness_read_causality()
+    test_packed_recomputed_witness_read_causality()
     test_coarse_route_gating()
     test_dense_backward_runs()
+    test_packed_graph_witness_backward_runs()
+    test_packed_recomputed_witness_backward_runs()
     print("done")

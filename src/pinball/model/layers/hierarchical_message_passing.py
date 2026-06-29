@@ -442,6 +442,8 @@ class HierarchicalMessagePassing(MessagePassing):
         edge_node_condition_mode: str = "src_dst_prod",
         edge_node_condition_zero_init: bool = True,
         edge_gate_scale: float = 0.1,
+        attn_sparse_qk_mult: float = 1.0,
+        attn_sparse_v_mult: float = 1.0,
     ):
         super().__init__(aggr='mean', node_dim=0)
         self.hidden_dim = hidden_dim
@@ -511,6 +513,11 @@ class HierarchicalMessagePassing(MessagePassing):
         self.hqd_dense_backend = "sdpa"        # sdpa | flash (flash-varlen, falls back to sdpa)
         self.hqd_dense_max_pad_ratio = 1.5     # dense/sdpa: fall back to scatter if padded slots (G*Kmax) exceed this x #edges
         self.hqd_profile_enable = False
+        self.hqd_graph_witness_enable = False
+        self.hqd_graph_witness_topk = 4
+        self.hqd_packed_witness_chunk_size = 2048
+        self._last_graph_witness_ids: Optional[Dict[int, torch.Tensor]] = None
+        self._last_graph_witness_scores: Optional[Dict[int, torch.Tensor]] = None
         self._last_hqd_apply_ms: Optional[float] = None
         self.hqd_runtime_selector: Optional[Callable[[torch.Tensor, torch.Tensor], Any]] = None
         self._last_hqd_runtime_added_total: Optional[int] = None
@@ -620,6 +627,51 @@ class HierarchicalMessagePassing(MessagePassing):
         
         # Output projection
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # --- Fat-QKV: decoupled wide Q/K and V head dims for the SPARSE-SCATTER paths
+        # (cross-level graph message passing + HQD scatter read). Flash/SDPA local-window
+        # attention requires qk_head_dim == v_head_dim, so it always keeps the shared
+        # head_dim projections above; only the scatter paths consult the wide ones.
+        #   attn_sparse_qk_mult: widen qk_head_dim (lifts the per-head routing-form rank,
+        #       which is currently capped at head_dim < model_dim). Useful up to qk==model_dim.
+        #   attn_sparse_v_mult : widen v_head_dim (richer payload carried THROUGH the sparse
+        #       aggregation — the capacity a dense model can't afford). Down-projected by out.
+        # Both default to 1.0 (off): the scatter paths reuse q/k/v_proj + out_proj and are
+        # bit-identical to the baseline. The wide modules are created only when enabled.
+        self.attn_sparse_qk_mult = float(attn_sparse_qk_mult)
+        self.attn_sparse_v_mult = float(attn_sparse_v_mult)
+        self.qk_head_dim_w = max(1, int(round(self.head_dim * self.attn_sparse_qk_mult)))
+        self.v_head_dim_w = max(1, int(round(self.head_dim * self.attn_sparse_v_mult)))
+        self.sparse_qk_wide = self.qk_head_dim_w != self.head_dim
+        self.sparse_v_wide = self.v_head_dim_w != self.head_dim
+        self.sparse_wide_enable = bool(self.sparse_qk_wide or self.sparse_v_wide)
+        if self.sparse_wide_enable:
+            qk_dim_w = self.num_heads * self.qk_head_dim_w
+            v_dim_w = self.num_heads * self.v_head_dim_w
+            self.q_proj_w = nn.Linear(hidden_dim, qk_dim_w)
+            self.k_proj_w = nn.Linear(hidden_dim, qk_dim_w)
+            self.v_proj_w = nn.Linear(hidden_dim, v_dim_w)
+            self.out_proj_w = nn.Linear(v_dim_w, hidden_dim)
+            # Wide edge-feature projection so the additive q_i·edge_features term matches the
+            # wide qk head dim (only needed when qk is widened and edge features are used).
+            if self.sparse_qk_wide and use_edge_attr and edge_dim is not None:
+                self.edge_proj_w = nn.Linear(edge_dim, qk_dim_w)
+            # Separate RoPE sized to the wide qk head dim (RoPE rotates pairs within head_dim).
+            if self.sparse_qk_wide:
+                self.rotary_pos_enc_w = RotaryPositionalEncoding(
+                    dim=self.qk_head_dim_w,
+                    max_seq_len=max_seq_len,
+                    rope_mode=self.rope_mode,
+                )
+            else:
+                self.rotary_pos_enc_w = self.rotary_pos_enc
+            # Wide qk is incompatible with the additive edge_proj feature term (sized to
+            # head_dim) and per-channel value gating (sized to head_dim); the scatter paths
+            # fall back to the dim-agnostic scalar variants when wide. See _forward_batched.
+            logger.info(
+                "Fat-QKV enabled on sparse paths: qk_head_dim %d->%d, v_head_dim %d->%d",
+                self.head_dim, self.qk_head_dim_w, self.head_dim, self.v_head_dim_w,
+            )
         self.dropout = nn.Dropout(dropout)
 
         
@@ -769,6 +821,33 @@ class HierarchicalMessagePassing(MessagePassing):
         if values.dim() == 4 and value_gate.dim() == 3:
             return values * value_gate.unsqueeze(0)
         return values * value_gate
+
+    # --- Fat-QKV accessors for the sparse-scatter paths (cross-level + HQD). When the
+    # wide flags are off these return the shared baseline projections / head_dim, so the
+    # callers are bit-identical to the original code.
+    @property
+    def sparse_qk_head_dim(self) -> int:
+        return self.qk_head_dim_w if getattr(self, "sparse_wide_enable", False) else self.head_dim
+
+    @property
+    def sparse_v_head_dim(self) -> int:
+        return self.v_head_dim_w if getattr(self, "sparse_wide_enable", False) else self.head_dim
+
+    def sparse_proj_q(self, x: torch.Tensor) -> torch.Tensor:
+        return (self.q_proj_w if getattr(self, "sparse_wide_enable", False) else self.q_proj)(x)
+
+    def sparse_proj_k(self, x: torch.Tensor) -> torch.Tensor:
+        return (self.k_proj_w if getattr(self, "sparse_wide_enable", False) else self.k_proj)(x)
+
+    def sparse_proj_v(self, x: torch.Tensor) -> torch.Tensor:
+        return (self.v_proj_w if getattr(self, "sparse_wide_enable", False) else self.v_proj)(x)
+
+    def sparse_out_proj(self, x: torch.Tensor) -> torch.Tensor:
+        return (self.out_proj_w if getattr(self, "sparse_wide_enable", False) else self.out_proj)(x)
+
+    def sparse_apply_rope(self, qk_flat: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        rope = self.rotary_pos_enc_w if getattr(self, "sparse_qk_wide", False) else self.rotary_pos_enc
+        return rope.apply_rotary_pos_emb(qk_flat, pos)
 
     def _edge_level_attention_bias(
         self,
@@ -1263,6 +1342,8 @@ class HierarchicalMessagePassing(MessagePassing):
         B, num_nodes, _ = x.shape
         device = x.device
         source_gates = self._compute_source_gates(x)
+        self._last_graph_witness_ids = None
+        self._last_graph_witness_scores = None
 
 
         active_level_set = None if active_levels is None else {int(level) for level in active_levels}
@@ -1401,6 +1482,7 @@ class HierarchicalMessagePassing(MessagePassing):
             if active_level_set is None:
                 attn = self._apply_graph_trace_bias(attn, num_edges)
             attn_flat = softmax(attn.reshape(B * num_edges, self.num_heads), index_flat)
+            self._capture_graph_witnesses(attn_flat.view(B, num_edges, self.num_heads), src, dst, node_level, int(num_nodes))
             if active_level_set is None:
                 self._update_graph_edge_trace(attn_flat.view(B, num_edges, self.num_heads), dst, int(num_nodes))
             attn_flat = self.dropout(attn_flat)
@@ -1564,7 +1646,12 @@ class HierarchicalMessagePassing(MessagePassing):
             q = q_flat.view(B, num_nodes, self.num_heads, self.head_dim)
             k = k_flat.view(B, num_nodes, self.num_heads, self.head_dim)
 
-        out = self._sparse_graph_attention_chunked_batched(
+        # The above narrow (head_dim) q/k/v feed BOTH the cross-level scatter aggregation
+        # and the flash/sdpa local-window path below, which require qk==v==head_dim. Under
+        # fat-QKV the cross-level scatter instead consumes separate WIDE q/k/v (computed in
+        # the explicit block below); the chunked fast path can't carry decoupled dims, so we
+        # bypass it and fall through to the explicit aggregation.
+        out = None if getattr(self, "sparse_wide_enable", False) else self._sparse_graph_attention_chunked_batched(
             q=q,
             k=k,
             v=v,
@@ -1577,11 +1664,30 @@ class HierarchicalMessagePassing(MessagePassing):
         )
         new_edge_attr = None
         if out is None:
-            q_i = q[:, dst]  # [B, E, H, D]
-            k_j = k[:, src]  # [B, E, H, D]
-            v_j = v[:, src]  # [B, E, H, D]
+            # Fat-QKV: the cross-level scatter aggregation uses its own wide q/k/v so the
+            # narrow tensors above remain intact for the flash/sdpa local path. qk_hd/v_hd
+            # equal head_dim when the wide flags are off (qg/kg/vg are then just q/k/v).
+            qk_hd = self.sparse_qk_head_dim
+            v_hd = self.sparse_v_head_dim
+            if getattr(self, "sparse_wide_enable", False):
+                qg = self.sparse_proj_q(x).view(B, num_nodes, self.num_heads, qk_hd)
+                kg = self.sparse_proj_k(x).view(B, num_nodes, self.num_heads, qk_hd)
+                vg = self.sparse_proj_v(x).view(B, num_nodes, self.num_heads, v_hd)
+                if hasattr(self, 'rotary_pos_enc') and rope_pos is not None:
+                    if getattr(self, "sparse_qk_wide", False):
+                        self.rotary_pos_enc_w.local_attn_runtime_level_grid_shapes = dict(
+                            getattr(self, "local_attn_runtime_level_grid_shapes", {}))
+                    qg_flat = self.sparse_apply_rope(qg.reshape(B * num_nodes, self.num_heads, qk_hd), pos_rep)
+                    kg_flat = self.sparse_apply_rope(kg.reshape(B * num_nodes, self.num_heads, qk_hd), pos_rep)
+                    qg = qg_flat.view(B, num_nodes, self.num_heads, qk_hd)
+                    kg = kg_flat.view(B, num_nodes, self.num_heads, qk_hd)
+            else:
+                qg, kg, vg = q, k, v
+            q_i = qg[:, dst]  # [B, E, H, Dqk]
+            k_j = kg[:, src]  # [B, E, H, Dqk]
+            v_j = vg[:, src]  # [B, E, H, Dv]
 
-            attn = (q_i * k_j).sum(dim=-1) / math.sqrt(self.head_dim)  # [B, E, H]
+            attn = (q_i * k_j).sum(dim=-1) / math.sqrt(qk_hd)  # [B, E, H]
 
             level_bias = self._edge_level_attention_bias(node_level, src, dst, device)
             attn = attn + level_bias.unsqueeze(0)
@@ -1610,8 +1716,11 @@ class HierarchicalMessagePassing(MessagePassing):
                     attn = attn + edge_attn
                 elif self.edge_dim is not None and feat_dim == self.edge_dim:
                     edge_attr_flat = edge_attr_b.reshape(B * num_edges, feat_dim)
-                    edge_features = self.edge_proj(edge_attr_flat).view(B, num_edges, self.num_heads, self.head_dim)
-                    edge_attn = (q_i * edge_features).sum(dim=-1) / math.sqrt(self.head_dim)
+                    # Under wide qk, project the edge feature to the wide qk head dim so it
+                    # matches q_i (edge_proj_w is created alongside the wide projections).
+                    e_proj = self.edge_proj_w if getattr(self, "sparse_qk_wide", False) else self.edge_proj
+                    edge_features = e_proj(edge_attr_flat).view(B, num_edges, self.num_heads, qk_hd)
+                    edge_attn = (q_i * edge_features).sum(dim=-1) / math.sqrt(qk_hd)
                     attn = attn + edge_attn
                 else:
                     raise ValueError(
@@ -1629,12 +1738,17 @@ class HierarchicalMessagePassing(MessagePassing):
                 )
             else:
                 edge_logit_bias, edge_value_gate = None, None
+            # A per-channel value gate is sized to head_dim and can't broadcast over a wide
+            # v_head_dim; drop it under fat-V (the per-head logit bias above is dim-agnostic).
+            if getattr(self, "sparse_v_wide", False):
+                edge_value_gate = None
             attn = self._apply_edge_logit_bias(attn, edge_logit_bias)
             index_flat = self._batched_dst_index_flat(dst, B, num_nodes)  # [B*E]
 
             attn = self._apply_graph_trace_bias(attn, num_edges)
             attn_flat = attn.reshape(B * num_edges, self.num_heads)
             attn_flat = softmax(attn_flat, index_flat)
+            self._capture_graph_witnesses(attn_flat.view(B, num_edges, self.num_heads), src, dst, node_level, int(num_nodes))
             self._update_graph_edge_trace(attn_flat.view(B, num_edges, self.num_heads), dst, int(num_nodes))
 
             if self.learn_edge_from_attn:
@@ -1651,13 +1765,13 @@ class HierarchicalMessagePassing(MessagePassing):
             attn = attn_flat.view(B, num_edges, self.num_heads)
 
             v_j = self._apply_edge_value_gate(v_j, edge_value_gate)
-            messages = v_j * attn.unsqueeze(-1)  # [B,E,H,D]
-            messages_flat = messages.reshape(B * num_edges, self.num_heads, self.head_dim)
+            messages = v_j * attn.unsqueeze(-1)  # [B,E,H,Dv]
+            messages_flat = messages.reshape(B * num_edges, self.num_heads, v_hd)
             out_flat = scatter_add(messages_flat, index_flat, dim=0, dim_size=B * num_nodes)
 
-            out = out_flat.view(B, num_nodes, self.num_heads, self.head_dim)
-            out = out.reshape(B, num_nodes, self.hidden_dim)
-            out = self.out_proj(out)
+            out = out_flat.view(B, num_nodes, self.num_heads, v_hd)
+            out = out.reshape(B, num_nodes, self.num_heads * v_hd)
+            out = self.sparse_out_proj(out)
         if source_gates is not None:
             out = source_gates["graph"] * out
 
@@ -1709,32 +1823,64 @@ class HierarchicalMessagePassing(MessagePassing):
         self._last_hqd_runtime_added_total = None
         self._last_hqd_runtime_stage_stats = None
         self._last_hqd_runtime_profile_stats = None
+        hqd_packed_l0 = None
         if hqd_edges is None and self.hqd_runtime_selector is not None:
             with torch.no_grad():
                 selected = self.hqd_runtime_selector(q.detach(), k.detach())
             if selected is not None:
-                hqd_b_idx, hqd_src_idx, hqd_dst_idx, added_total, stage_stats, profile_stats = selected
+                if isinstance(selected, dict):
+                    edges = selected.get("edges", None)
+                    if edges is not None:
+                        hqd_b_idx, hqd_src_idx, hqd_dst_idx = edges
+                    else:
+                        hqd_b_idx = hqd_src_idx = hqd_dst_idx = None
+                    hqd_packed_l0 = selected.get("packed_l0", None)
+                    added_total = int(selected.get("added_total", 0))
+                    stage_stats = selected.get("stage_stats", None)
+                    profile_stats = selected.get("profile_stats", None)
+                else:
+                    hqd_b_idx, hqd_src_idx, hqd_dst_idx, added_total, stage_stats, profile_stats = selected
                 self._last_hqd_runtime_added_total = int(added_total)
                 self._last_hqd_runtime_stage_stats = dict(stage_stats) if stage_stats is not None else None
                 self._last_hqd_runtime_profile_stats = dict(profile_stats) if profile_stats is not None else None
                 if hqd_b_idx is not None and hqd_b_idx.numel() > 0:
                     hqd_edges = (hqd_b_idx, hqd_src_idx, hqd_dst_idx)
 
+        # Fat-V: the HQD final read carries a wide value payload through the sparse
+        # aggregation (selection still uses the narrow q/k above). v_hqd == v when off.
+        if getattr(self, "sparse_v_wide", False) and (hqd_edges is not None or hqd_packed_l0 is not None):
+            # x is already input-normed above (matching how the narrow v was projected).
+            v_hqd = self.sparse_proj_v(x).view(B, num_nodes, self.num_heads, self.sparse_v_head_dim)
+        else:
+            v_hqd = v
+
         if hqd_edges is not None:
             hqd_b_idx, hqd_src_idx, hqd_dst_idx = hqd_edges
             if str(getattr(self, "hqd_attn_impl", "scatter")).lower() == "dense":
                 hqd_out = self._compute_hqd_dense_attn(
-                    q=q, k=k, v=v,
+                    q=q, k=k, v=v_hqd,
                     b_idx=hqd_b_idx, src_idx=hqd_src_idx, dst_idx=hqd_dst_idx,
                     num_nodes=num_nodes, B=B,
                     backend=str(getattr(self, "hqd_dense_backend", "sdpa")).lower(),
                 )
             else:
                 hqd_out = self._compute_hqd_sparse_attn(
-                    q=q, k=k, v=v,
+                    q=q, k=k, v=v_hqd,
                     b_idx=hqd_b_idx, src_idx=hqd_src_idx, dst_idx=hqd_dst_idx,
                     num_nodes=num_nodes, B=B,
                 )
+            if hqd_out is not None:
+                if source_gates is not None:
+                    hqd_out = source_gates["hqd"] * hqd_out
+                out = out + hqd_out
+
+        if hqd_packed_l0 is not None:
+            packed_dst, packed_candidates = hqd_packed_l0
+            hqd_out = self._compute_hqd_packed_l0_attn(
+                q=q, k=k, v=v_hqd,
+                dst_nodes=packed_dst, candidate_nodes=packed_candidates,
+                num_nodes=num_nodes, B=B,
+            )
             if hqd_out is not None:
                 if source_gates is not None:
                     hqd_out = source_gates["hqd"] * hqd_out
@@ -2132,6 +2278,9 @@ class HierarchicalMessagePassing(MessagePassing):
         k_src = k[b_idx, src_idx]
         head_dim = max(1, int(q_dst.size(-1)))
         num_heads = max(1, int(q_dst.size(-2)))
+        # Fat-V: the value head dim may differ from the qk head dim. Read it from v (==
+        # head_dim when fat-V is off) and down-project with the matching out projection.
+        v_dim = max(1, int(v.size(-1)))
 
         scores = (q_dst * k_src).sum(dim=-1) / math.sqrt(float(head_dim))
 
@@ -2144,21 +2293,147 @@ class HierarchicalMessagePassing(MessagePassing):
         if bool(getattr(self, "hqd_sparse_project_active_only", False)):
             unique_groups, inverse = torch.unique(group_idx, sorted=False, return_inverse=True)
             active_heads = scatter_add(msg, inverse, dim=0, dim_size=int(unique_groups.numel()))
-            active_hidden = active_heads.reshape(active_heads.size(0), num_heads * head_dim)
-            active_proj = self.out_proj(active_hidden)
+            active_hidden = active_heads.reshape(active_heads.size(0), num_heads * v_dim)
+            active_proj = self.sparse_out_proj(active_hidden)
             out_flat = torch.zeros(
-                (B * num_nodes, num_heads * head_dim),
+                (B * num_nodes, self.hidden_dim),
                 device=q.device,
                 dtype=active_proj.dtype,
             )
             out_flat.index_copy_(0, unique_groups, active_proj)
             self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
-            return out_flat.view(B, num_nodes, num_heads * head_dim)
+            return out_flat.view(B, num_nodes, self.hidden_dim)
 
         out_flat = scatter_add(msg, group_idx, dim=0, dim_size=B * num_nodes)
-        out = out_flat.view(B, num_nodes, num_heads, head_dim)
-        out = out.reshape(B, num_nodes, num_heads * head_dim)
-        out = self.out_proj(out)
+        out = out_flat.view(B, num_nodes, num_heads, v_dim)
+        out = out.reshape(B, num_nodes, num_heads * v_dim)
+        out = self.sparse_out_proj(out)
+        self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
+        return out
+
+    def _capture_graph_witnesses(
+        self,
+        weights: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        node_level: torch.Tensor,
+        num_nodes: int,
+    ) -> None:
+        """Store top contributing direct children from the existing graph attention.
+
+        For each parent level L, rows in the resulting table contain top-k direct
+        level-(L-1) source nodes that contributed to that parent during the current
+        graph attention pass. This is intentionally detached metadata: later HQD can
+        look it up without re-scoring the hierarchy or materializing an L0 edge list.
+        """
+        if not bool(getattr(self, "hqd_graph_witness_enable", False)):
+            self._last_graph_witness_ids = None
+            self._last_graph_witness_scores = None
+            return
+        k_top = max(1, int(getattr(self, "hqd_graph_witness_topk", 4)))
+        if weights.numel() == 0 or src.numel() == 0 or dst.numel() == 0:
+            self._last_graph_witness_ids = None
+            self._last_graph_witness_scores = None
+            return
+
+        with torch.no_grad():
+            device = weights.device
+            B = int(weights.size(0))
+            nl = node_level.to(device=device, dtype=torch.long)
+            src_l = nl.index_select(0, src.to(device=device, dtype=torch.long))
+            dst_l = nl.index_select(0, dst.to(device=device, dtype=torch.long))
+            score_e = weights.detach().mean(dim=-1)  # [B, E]
+            ids_by_level: Dict[int, torch.Tensor] = {}
+            scores_by_level: Dict[int, torch.Tensor] = {}
+            for level in (1, 2, 3):
+                mask = (dst_l == int(level)) & (src_l == int(level - 1))
+                if not bool(mask.any()):
+                    continue
+                edge_pos = torch.nonzero(mask, as_tuple=False).view(-1)
+                src_m = src.index_select(0, edge_pos).to(device=device, dtype=torch.long)
+                dst_m = dst.index_select(0, edge_pos).to(device=device, dtype=torch.long)
+                ids = torch.full((B, int(num_nodes), k_top), -1, device=device, dtype=torch.long)
+                vals_out = torch.full((B, int(num_nodes), k_top), float("-inf"), device=device, dtype=score_e.dtype)
+                for b in range(B):
+                    scores = score_e[b].index_select(0, edge_pos)
+                    if scores.numel() == 0:
+                        continue
+                    # Stable sort by score first, then by destination; within each destination
+                    # the stable order remains descending score, so rank is top-k per parent.
+                    by_score = torch.argsort(scores, descending=True, stable=True)
+                    dst_s = dst_m.index_select(0, by_score)
+                    src_s = src_m.index_select(0, by_score)
+                    score_s = scores.index_select(0, by_score)
+                    by_dst = torch.argsort(dst_s, descending=False, stable=True)
+                    dst_s = dst_s.index_select(0, by_dst)
+                    src_s = src_s.index_select(0, by_dst)
+                    score_s = score_s.index_select(0, by_dst)
+                    _, counts = torch.unique_consecutive(dst_s, return_counts=True)
+                    starts = torch.cumsum(counts, dim=0) - counts
+                    rank = torch.arange(dst_s.numel(), device=device, dtype=torch.long) - torch.repeat_interleave(starts, counts)
+                    keep = rank < k_top
+                    if bool(keep.any()):
+                        ids[b, dst_s[keep], rank[keep]] = src_s[keep]
+                        vals_out[b, dst_s[keep], rank[keep]] = score_s[keep]
+                ids_by_level[int(level)] = ids
+                scores_by_level[int(level)] = vals_out
+            self._last_graph_witness_ids = ids_by_level or None
+            self._last_graph_witness_scores = scores_by_level or None
+
+    def _compute_hqd_packed_l0_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dst_nodes: torch.Tensor,
+        candidate_nodes: torch.Tensor,
+        num_nodes: int,
+        B: int,
+    ) -> Optional[torch.Tensor]:
+        """Packed fixed-K L0 witness read, avoiding flattened sparse edge materialization."""
+        if dst_nodes.numel() == 0 or candidate_nodes.numel() == 0:
+            return None
+        profile_enabled = bool(getattr(self, "hqd_profile_enable", False))
+        _t0 = time.monotonic() if profile_enabled else 0.0
+        device = q.device
+        dst_nodes = dst_nodes.to(device=device, dtype=torch.long)
+        candidate_nodes = candidate_nodes.to(device=device, dtype=torch.long)
+        Bc, Q, K = int(candidate_nodes.size(0)), int(candidate_nodes.size(1)), int(candidate_nodes.size(2))
+        if Bc != int(B) or Q != int(dst_nodes.numel()) or K <= 0:
+            return None
+
+        num_heads = max(1, int(q.size(-2)))
+        head_dim = max(1, int(q.size(-1)))
+        v_dim = max(1, int(v.size(-1)))  # Fat-V: value head dim (== head_dim when off)
+        out_flat = torch.zeros((int(B) * int(num_nodes), num_heads, v_dim), device=device, dtype=q.dtype)
+        chunk = max(1, int(getattr(self, "hqd_packed_witness_chunk_size", 2048)))
+        neg = torch.finfo(q.dtype).min
+        batch_offsets = torch.arange(int(B), device=device, dtype=torch.long).view(int(B), 1, 1) * int(num_nodes)
+        flat_k = k.reshape(int(B) * int(num_nodes), num_heads, head_dim)
+        flat_v = v.reshape(int(B) * int(num_nodes), num_heads, v_dim)
+
+        for start in range(0, Q, chunk):
+            end = min(Q, start + chunk)
+            cand = candidate_nodes[:, start:end, :]
+            valid = cand >= 0
+            if not bool(valid.any()):
+                continue
+            safe = cand.clamp(min=0)
+            gather_idx = (safe + batch_offsets).reshape(-1)
+            k_c = flat_k.index_select(0, gather_idx).view(int(B), end - start, K, num_heads, head_dim)
+            v_c = flat_v.index_select(0, gather_idx).view(int(B), end - start, K, num_heads, v_dim)
+            q_c = q.index_select(1, dst_nodes[start:end])  # [B,Qc,H,D]
+            scores = (q_c.unsqueeze(2) * k_c).sum(dim=-1) / math.sqrt(float(head_dim))  # [B,Qc,K,H]
+            scores = scores.masked_fill(~valid.unsqueeze(-1), neg)
+            weights = torch.softmax(scores, dim=2)
+            weights = torch.where(valid.unsqueeze(-1), weights, torch.zeros_like(weights))
+            msg = (weights.unsqueeze(-1) * v_c).sum(dim=2)  # [B,Qc,H,Dv]
+            msg = msg.to(dtype=out_flat.dtype)
+            groups = (torch.arange(int(B), device=device, dtype=torch.long).view(int(B), 1) * int(num_nodes)) + dst_nodes[start:end].view(1, -1)
+            out_flat.index_add_(0, groups.reshape(-1), msg.reshape(int(B) * (end - start), num_heads, v_dim))
+
+        out = out_flat.view(int(B), int(num_nodes), num_heads, v_dim).reshape(int(B), int(num_nodes), num_heads * v_dim)
+        out = self.sparse_out_proj(out)
         self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
         return out
 
@@ -2197,6 +2472,7 @@ class HierarchicalMessagePassing(MessagePassing):
         dst_idx = dst_idx.to(device=device, dtype=torch.long)
         head_dim = max(1, int(q.size(-1)))
         num_heads = max(1, int(q.size(-2)))
+        v_dim = max(1, int(v.size(-1)))  # Fat-V: value head dim (== head_dim when off)
 
         # Group edges by (batch, dst). uniq is sorted; inv maps each edge -> group.
         group_idx = b_idx * num_nodes + dst_idx
@@ -2219,7 +2495,9 @@ class HierarchicalMessagePassing(MessagePassing):
         q_g = q[group_b, group_dst]                      # [G, H, D]
 
         flash_varlen = None
-        if backend == "flash":
+        # flash-varlen requires the value head dim to match qk; under fat-V (v_dim != head_dim)
+        # use the SDPA path, which supports a differing value dim.
+        if backend == "flash" and v_dim == head_dim:
             try:  # best-effort; falls back to padded SDPA below
                 from flash_attn import flash_attn_varlen_func as flash_varlen  # type: ignore
             except Exception:
@@ -2263,28 +2541,29 @@ class HierarchicalMessagePassing(MessagePassing):
             safe = cand_src.clamp(min=0)
             gb = group_b.view(G, 1).expand(G, Kmax)
             k_g = k[gb, safe]                           # [G, Kmax, H, D]
-            v_g = v[gb, safe]
+            v_g = v[gb, safe]                           # [G, Kmax, H, Dv]
             # Canonical SDPA layout [G(batch), H, L, D]; contiguous so the fused/
             # mem-efficient backward kernel reads correct strides (non-contiguous
             # permuted views cause an illegal memory access in backward on CUDA).
+            # SDPA permits Dv != D: scores come from q,k (D); the output follows v (Dv).
             q_s = q_g.unsqueeze(2).contiguous()         # [G, H, 1, D]
             k_s = k_g.permute(0, 2, 1, 3).contiguous()  # [G, H, Kmax, D]
-            v_s = v_g.permute(0, 2, 1, 3).contiguous()
+            v_s = v_g.permute(0, 2, 1, 3).contiguous()  # [G, H, Kmax, Dv]
             attn_mask = valid.view(G, 1, 1, Kmax)       # broadcast over heads
-            out = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=attn_mask)  # [G, H, 1, D]
-            out_g = out.squeeze(2)                      # [G, H, D]
+            out = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=attn_mask)  # [G, H, 1, Dv]
+            out_g = out.squeeze(2)                      # [G, H, Dv]
 
         if bool(getattr(self, "hqd_sparse_project_active_only", False)):
-            active_hidden = out_g.reshape(G, num_heads * head_dim)
-            active_proj = self.out_proj(active_hidden)
-            out_flat = torch.zeros((B * num_nodes, num_heads * head_dim), device=device, dtype=active_proj.dtype)
+            active_hidden = out_g.reshape(G, num_heads * v_dim)
+            active_proj = self.sparse_out_proj(active_hidden)
+            out_flat = torch.zeros((B * num_nodes, self.hidden_dim), device=device, dtype=active_proj.dtype)
             out_flat.index_copy_(0, uniq, active_proj)
             self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
-            return out_flat.view(B, num_nodes, num_heads * head_dim)
+            return out_flat.view(B, num_nodes, self.hidden_dim)
 
-        out_flat = torch.zeros((B * num_nodes, num_heads, head_dim), device=device, dtype=out_g.dtype)
+        out_flat = torch.zeros((B * num_nodes, num_heads, v_dim), device=device, dtype=out_g.dtype)
         out_flat.index_copy_(0, uniq, out_g)
-        out = self.out_proj(out_flat.reshape(B, num_nodes, num_heads * head_dim))
+        out = self.sparse_out_proj(out_flat.reshape(B, num_nodes, num_heads * v_dim))
         self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
         return out
 
@@ -3208,7 +3487,9 @@ class HierarchicalTransformerLayer(nn.Module):
         edge_node_condition_mode: str = "src_dst_prod",
         edge_node_condition_zero_init: bool = True,
         edge_gate_scale: float = 0.1,
-    ): 
+        attn_sparse_qk_mult: float = 1.0,
+        attn_sparse_v_mult: float = 1.0,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
@@ -3279,6 +3560,8 @@ class HierarchicalTransformerLayer(nn.Module):
             edge_node_condition_mode=edge_node_condition_mode,
             edge_node_condition_zero_init=edge_node_condition_zero_init,
             edge_gate_scale=edge_gate_scale,
+            attn_sparse_qk_mult=attn_sparse_qk_mult,
+            attn_sparse_v_mult=attn_sparse_v_mult,
         )
 
         class SwiGLUFFN(nn.Module):

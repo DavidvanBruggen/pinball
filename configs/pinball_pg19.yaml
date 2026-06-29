@@ -86,9 +86,9 @@ dropout: 0.0
 attn_backend: flash        # pyg | flash | sdpa
 qkv_sharing: shared      # shared | separate
 use_hqd: false             # hierarchical query descent
-local_attn_levels: [ 1, 2, 3]
+local_attn_levels: [0, 1, 2, 3]
 local_attn_windows: [128, 128, 128, 128]
-local_attn_causal_levels: [ 1, 2, 3]
+local_attn_causal_levels: [0, 1, 2, 3]
 l0_local_window: 128
 learn_edge_from_attention: false
 
@@ -100,7 +100,7 @@ learn_edge_from_attention: false
 #         coarse_tokenize = encode dense -> coarse L0, decode back (MODE 1: global-aware pooling,
 #                           fewer L0 nodes -> cheaper cycles).   Use token_unet_scale: >1 (pow2).
 token_unet_enable: true
-token_unet_block: hyena          # cnn | hyena
+token_unet_block: cnn          # cnn | hyena
 token_unet_mode: coarse_tokenize            # stem (mode 2) | coarse_tokenize (mode 1)
 token_unet_dim: 1d               # auto | 1d | 2d  (text is 1d)
 token_unet_scale: 8              # power-of-two. 1 for stem; e.g. 4 for coarse_tokenize pooling

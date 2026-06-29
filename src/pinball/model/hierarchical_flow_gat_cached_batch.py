@@ -2016,6 +2016,8 @@ class HierarchicalFlowGAT(nn.Module):
         edge_node_condition_mode: str = "src_dst_prod",
         edge_node_condition_zero_init: bool = True,
         edge_gate_scale: float = 0.1,
+        attn_sparse_qk_mult: float = 1.0,
+        attn_sparse_v_mult: float = 1.0,
         rope_level_axis_enable: bool = False,
         rope_level_axis_scale: float = 32.0,
         TRM: bool = False, # Whether to use the last cycle gradient
@@ -2180,6 +2182,11 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_coarse_route_levels: Optional[List[int]] = None,
         hqd_coarse_route_topk: int = 8,
         hqd_select_inside_message_passing: bool = False,
+        hqd_graph_witness_enable: bool = False,
+        hqd_graph_witness_topk: int = 4,
+        hqd_packed_witness_read: bool = False,
+        hqd_packed_witness_source: str = "graph",
+        hqd_packed_witness_chunk_size: int = 2048,
         # --- Witness packets: selected coarse nodes expose bounded pointers to exact
         # lower-level children ("what it cannot forget"), force-included into the HQD
         # final-stage candidate set so rare/important children survive top-k pruning. ---
@@ -2554,6 +2561,8 @@ class HierarchicalFlowGAT(nn.Module):
         self.edge_node_condition_mode = str(edge_node_condition_mode).lower()
         self.edge_node_condition_zero_init = bool(edge_node_condition_zero_init)
         self.edge_gate_scale = float(edge_gate_scale)
+        self.attn_sparse_qk_mult = float(attn_sparse_qk_mult)
+        self.attn_sparse_v_mult = float(attn_sparse_v_mult)
         if self.rope_level_axis_enable and self.local_attn_level_role_bias_enable:
             logger.info(
                 "Level-axis RoPE enabled; auto-disabling local-attn level role bias to preserve flash eligibility where possible."
@@ -2725,6 +2734,12 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_coarse_route_levels = sorted({int(l) for l in (hqd_coarse_route_levels or []) if int(l) in (1, 2, 3)})
         self.hqd_coarse_route_topk = max(1, int(hqd_coarse_route_topk))
         self.hqd_select_inside_message_passing = bool(hqd_select_inside_message_passing)
+        self.hqd_graph_witness_enable = bool(hqd_graph_witness_enable)
+        self.hqd_graph_witness_topk = max(1, int(hqd_graph_witness_topk))
+        self.hqd_packed_witness_read = bool(hqd_packed_witness_read)
+        _packed_src = str(hqd_packed_witness_source).strip().lower()
+        self.hqd_packed_witness_source = _packed_src if _packed_src in {"graph", "recompute"} else "graph"
+        self.hqd_packed_witness_chunk_size = max(1, int(hqd_packed_witness_chunk_size))
 
         # Witness packets (see _build_witness_l0_ids). Active only when HQD is enabled,
         # query_level == 0, and at least one of summary/rare is on.
@@ -3017,6 +3032,8 @@ class HierarchicalFlowGAT(nn.Module):
                         edge_node_condition_mode=self.edge_node_condition_mode,
                         edge_node_condition_zero_init=self.edge_node_condition_zero_init,
                         edge_gate_scale=self.edge_gate_scale,
+                        attn_sparse_qk_mult=self.attn_sparse_qk_mult,
+                        attn_sparse_v_mult=self.attn_sparse_v_mult,
                     )
                 )
             self.level_transformers.append(level_modules)
@@ -3089,6 +3106,8 @@ class HierarchicalFlowGAT(nn.Module):
                         edge_node_condition_mode=self.edge_node_condition_mode,
                         edge_node_condition_zero_init=self.edge_node_condition_zero_init,
                         edge_gate_scale=self.edge_gate_scale,
+                        attn_sparse_qk_mult=self.attn_sparse_qk_mult,
+                        attn_sparse_v_mult=self.attn_sparse_v_mult,
                     ))
             else:
                 logger.warning("Unified refinement selected with share_transformers=False but num_refinement_layers=0. No dedicated refinement layers created.")
@@ -6669,13 +6688,15 @@ class HierarchicalFlowGAT(nn.Module):
         mp = transformer.message_passing
         if x_in is None:
             x_in = transformer.norm1(x_bnh) if hasattr(transformer, "norm1") else x_bnh
-        v_all = mp.v_proj(x_in).view(B, N, mp.num_heads, mp.head_dim)
+        # Fat-V: wide value head dim on this zipper apply (== head_dim when off).
+        v_hd = mp.sparse_v_head_dim
+        v_all = mp.sparse_proj_v(x_in).view(B, N, mp.num_heads, v_hd)
         msg = v_all[b_idx, src_idx] * weights.view(-1, 1, 1)
 
-        out_flat = torch.zeros(B * N, mp.num_heads, mp.head_dim, device=device, dtype=x_bnh.dtype)
+        out_flat = torch.zeros(B * N, mp.num_heads, v_hd, device=device, dtype=x_bnh.dtype)
         out_flat.index_add_(0, group_idx, msg)
-        m_zip = out_flat.view(B, N, mp.num_heads, mp.head_dim).reshape(B, N, mp.hidden_dim)
-        m_zip = mp.out_proj(m_zip)
+        m_zip = out_flat.view(B, N, mp.num_heads, v_hd).reshape(B, N, mp.num_heads * v_hd)
+        m_zip = mp.sparse_out_proj(m_zip)
 
         if (not bool(getattr(self, "zip_paramfree_gate", True))) and bool(getattr(self, "zip_use_beta_gate", True)):
             beta_layer = getattr(transformer, "zip_lin_beta_attn", None)
@@ -7608,18 +7629,20 @@ class HierarchicalFlowGAT(nn.Module):
         mp = transformer.message_passing
         if x_in is None:
             x_in = transformer.norm1(x_bnh) if hasattr(transformer, "norm1") else x_bnh
-        v_all = mp.v_proj(x_in).view(B, N, mp.num_heads, mp.head_dim)
+        # Fat-V: wide value head dim on this zipper apply (== head_dim when off).
+        v_hd = mp.sparse_v_head_dim
+        v_all = mp.sparse_proj_v(x_in).view(B, N, mp.num_heads, v_hd)
         msg = v_all[b_idx, src_idx] * weights.view(-1, 1, 1)
 
         # Phase 5: reuse workspace buffer only when autograd is off.
         flat_size = B * N
-        ws_key = (flat_size, mp.num_heads, mp.head_dim, str(device), str(x_bnh.dtype))
+        ws_key = (flat_size, mp.num_heads, v_hd, str(device), str(x_bnh.dtype))
         use_workspace_cache = not torch.is_grad_enabled()
         ws = self._zipper_inject_workspace.get(ws_key) if use_workspace_cache else None
-        if ws is not None and ws.shape == (flat_size, mp.num_heads, mp.head_dim) and ws.device == device and ws.dtype == x_bnh.dtype:
+        if ws is not None and ws.shape == (flat_size, mp.num_heads, v_hd) and ws.device == device and ws.dtype == x_bnh.dtype:
             out_flat = ws.zero_()
         else:
-            out_flat = torch.zeros(flat_size, mp.num_heads, mp.head_dim, device=device, dtype=x_bnh.dtype)
+            out_flat = torch.zeros(flat_size, mp.num_heads, v_hd, device=device, dtype=x_bnh.dtype)
             # Cache for future reuse only when gradients are disabled.
             if use_workspace_cache:
                 if len(self._zipper_inject_workspace) >= self._zipper_inject_workspace_max_entries:
@@ -7627,8 +7650,8 @@ class HierarchicalFlowGAT(nn.Module):
                     del self._zipper_inject_workspace[oldest]
                 self._zipper_inject_workspace[ws_key] = out_flat
         out_flat.index_add_(0, group_idx, msg)
-        m_zip = out_flat.view(B, N, mp.num_heads, mp.head_dim).reshape(B, N, mp.hidden_dim)
-        m_zip = mp.out_proj(m_zip)
+        m_zip = out_flat.view(B, N, mp.num_heads, v_hd).reshape(B, N, mp.num_heads * v_hd)
+        m_zip = mp.sparse_out_proj(m_zip)
 
         if bool(apply_zip_gates):
             eta = float(getattr(self, "zip_msg_eta", 1.0))
@@ -8290,6 +8313,259 @@ class HierarchicalFlowGAT(nn.Module):
             x_in=x_in,
             _qk_cache=_qk_cache,
         )
+
+    def _hierarchical_query_descent_packed_witness_batched(
+        self,
+        transformer,
+        x_bnh: torch.Tensor,
+        base_edge_index: torch.Tensor,
+        node_level: torch.Tensor,
+        node_ar_time: Optional[torch.Tensor],
+        q_all: torch.Tensor,
+        k_all: torch.Tensor,
+    ) -> Optional[Dict[str, Any]]:
+        """L0->L3 selection, then captured graph-witness lookup, returned as packed L0 ids.
+
+        This is the efficient variant of shallow L3 witness reads: hierarchy attention from
+        the current message-passing layer has already stored direct child witnesses per
+        parent, so HQD only scores L0 queries against L3 summaries and composes
+        L3->L2->L1->L0 witness tables. The returned packed candidate tensor is consumed by
+        message passing without flattening into a sparse L0 edge list.
+        """
+        if int(getattr(self, "hqd_query_level", 0)) != 0 or int(getattr(self, "hqd_shallow_read_level", 0)) != 3:
+            return None
+        mp = getattr(transformer, "message_passing", None)
+        direct = getattr(mp, "_last_graph_witness_ids", None) if mp is not None else None
+        if not isinstance(direct, dict) or not all(level in direct for level in (1, 2, 3)):
+            return None
+
+        device = x_bnh.device
+        B, N, _ = x_bnh.shape
+        causal = self._hqd_effective_causal()
+        allow_same_time = bool(getattr(self, "hier_ar_allow_same_time", False))
+        profile_enabled = bool(getattr(self, "hqd_debug", False))
+        t0 = time.monotonic() if profile_enabled else 0.0
+        profile_stats: Dict[str, float] = {}
+
+        l0_idx = torch.nonzero(node_level == 0, as_tuple=False).view(-1).to(device=device, dtype=torch.long)
+        l1_idx = torch.nonzero(node_level == 1, as_tuple=False).view(-1).to(device=device, dtype=torch.long)
+        l2_idx = torch.nonzero(node_level == 2, as_tuple=False).view(-1).to(device=device, dtype=torch.long)
+        l3_idx = torch.nonzero(node_level == 3, as_tuple=False).view(-1).to(device=device, dtype=torch.long)
+        if l0_idx.numel() == 0 or l1_idx.numel() == 0 or l2_idx.numel() == 0 or l3_idx.numel() == 0:
+            return None
+
+        if node_ar_time is not None and node_ar_time.numel() >= int(N):
+            t_all = node_ar_time.to(device=device, dtype=torch.long)
+            l0_time = t_all.index_select(0, l0_idx)
+            l3_time = t_all.index_select(0, l3_idx)
+        else:
+            l0_time = torch.arange(l0_idx.numel(), device=device, dtype=torch.long)
+            # Conservative fallback: if explicit AR time is absent, use descendant intervals.
+            l3_to_l2 = self._zipper_build_children_table_cached(base_edge_index, node_level, 3, 2)
+            l2_to_l1 = self._zipper_build_children_table_cached(base_edge_index, node_level, 2, 1)
+            l1_to_l0 = self._zipper_build_children_table_cached(base_edge_index, node_level, 1, 0)
+            min0 = torch.full((int(N),), -1, dtype=torch.long, device=device)
+            max0 = torch.full((int(N),), -1, dtype=torch.long, device=device)
+            min0[l0_idx] = l0_time
+            max0[l0_idx] = l0_time
+            min1, max1 = self._hqd_build_descendant_interval_cache(l1_idx, min0, max0, l1_to_l0, int(N))
+            min2, max2 = self._hqd_build_descendant_interval_cache(l2_idx, min1, max1, l2_to_l1, int(N))
+            _, max3 = self._hqd_build_descendant_interval_cache(l3_idx, min2, max2, l3_to_l2, int(N))
+            l3_time = max3.index_select(0, l3_idx)
+            t_all = max0
+
+        q_l0 = q_all.index_select(1, l0_idx)
+        k_l3 = k_all.index_select(1, l3_idx)
+        head_dim = max(1, int(q_l0.size(-1)))
+        num_heads = max(1, int(q_l0.size(-2)))
+        scores3 = torch.einsum("bqhd,bkhd->bqk", q_l0, k_l3) / float(num_heads * math.sqrt(float(head_dim)))
+        if causal:
+            valid3 = (l3_time.view(1, 1, -1) <= l0_time.view(1, -1, 1)) if allow_same_time else (l3_time.view(1, 1, -1) < l0_time.view(1, -1, 1))
+            valid3 = valid3 & (l3_time.view(1, 1, -1) >= 0)
+            scores3 = scores3.masked_fill(~valid3, float("-inf"))
+        sel3, _, sel3_valid = self._hqd_topk_from_scores_batched(
+            l3_idx.view(1, 1, -1).expand(int(B), int(l0_idx.numel()), -1),
+            scores3,
+            int(getattr(self, "hqd_topk_l3", 4)),
+        )
+
+        def _lookup(table: torch.Tensor, nodes: torch.Tensor, valid: torch.Tensor, cap: int) -> Tuple[torch.Tensor, torch.Tensor]:
+            slots = int(table.size(-1))
+            safe = nodes.clamp(min=0)
+            batch_offsets = torch.arange(int(B), device=device, dtype=torch.long).view(int(B), 1, 1) * int(N)
+            flat = table.to(device=device, dtype=torch.long).reshape(int(B) * int(N), slots)
+            out = flat.index_select(0, (safe + batch_offsets).reshape(-1)).view(int(B), nodes.size(1), nodes.size(2), slots)
+            out = torch.where(valid.unsqueeze(-1), out, torch.full_like(out, -1))
+            out = out.reshape(int(B), nodes.size(1), -1)
+            out, mask = self._hqd_maybe_dedup_candidates_batched(out, force=True)
+            out = torch.where(mask, out, torch.full_like(out, -1))
+            out, _ = torch.sort(out, dim=-1, descending=True)
+            mask = out >= 0
+            keep = min(max(1, int(cap)), int(out.size(-1)))
+            out = out[..., :keep]
+            mask = mask[..., :keep] & (out >= 0)
+            return out, mask
+
+        l2_nodes, l2_valid = _lookup(direct[3], sel3, sel3_valid, int(getattr(self, "hqd_topk_l2", 4)))
+        l1_nodes, l1_valid = _lookup(direct[2], l2_nodes, l2_valid, int(getattr(self, "hqd_topk_l1", 4)))
+        l0_nodes, l0_valid = _lookup(direct[1], l1_nodes, l1_valid, int(getattr(self, "hqd_topk_l0", 8)))
+
+        if causal:
+            cand_t = t_all.index_select(0, l0_nodes.clamp(min=0).reshape(-1)).view_as(l0_nodes)
+            causal_ok = (cand_t <= l0_time.view(1, -1, 1)) if allow_same_time else (cand_t < l0_time.view(1, -1, 1))
+            l0_valid = l0_valid & causal_ok & (cand_t >= 0)
+        l0_nodes = torch.where(l0_valid, l0_nodes, torch.full_like(l0_nodes, -1))
+        added_total = int(l0_valid.sum().item())
+        if added_total <= 0:
+            return None
+
+        stage_stats = {
+            "queries": int(B * l0_idx.numel()),
+            "l3_selected_total": int(sel3_valid.sum().item()),
+            "l2_selected_total": int(l2_valid.sum().item()),
+            "l1_selected_total": int(l1_valid.sum().item()),
+            "l0_selected_total": int(added_total),
+            "final_selected_total": int(added_total),
+            "final_candidates": int(added_total),
+            "packed_witness_l0": int(added_total),
+        }
+        if profile_enabled:
+            profile_stats["packed_witness_select_ms"] = (time.monotonic() - t0) * 1000.0
+        return {
+            "edges": None,
+            "packed_l0": (l0_idx, l0_nodes),
+            "added_total": int(added_total),
+            "stage_stats": stage_stats,
+            "profile_stats": profile_stats if profile_enabled else None,
+        }
+
+    def _hierarchical_query_descent_recomputed_packed_witness_batched(
+        self,
+        transformer,
+        x_bnh: torch.Tensor,
+        base_edge_index: torch.Tensor,
+        node_level: torch.Tensor,
+        node_ar_time: Optional[torch.Tensor],
+        q_all: torch.Tensor,
+        k_all: torch.Tensor,
+    ) -> Optional[Dict[str, Any]]:
+        """Use the existing recomputed witness table, but consume it as packed L0 reads."""
+        if int(getattr(self, "hqd_query_level", 0)) != 0 or int(getattr(self, "hqd_shallow_read_level", 0)) != 3:
+            return None
+        if not bool(getattr(self, "use_witness_packets", False)):
+            return None
+        if 3 not in getattr(self, "witness_levels", [1]):
+            return None
+
+        device = x_bnh.device
+        B, N, _ = x_bnh.shape
+        causal = self._hqd_effective_causal()
+        allow_same_time = bool(getattr(self, "hier_ar_allow_same_time", False))
+        profile_enabled = bool(getattr(self, "hqd_debug", False))
+        t0 = time.monotonic() if profile_enabled else 0.0
+        profile_stats: Dict[str, float] = {}
+
+        l0_idx = torch.nonzero(node_level == 0, as_tuple=False).view(-1).to(device=device, dtype=torch.long)
+        l1_idx = torch.nonzero(node_level == 1, as_tuple=False).view(-1).to(device=device, dtype=torch.long)
+        l2_idx = torch.nonzero(node_level == 2, as_tuple=False).view(-1).to(device=device, dtype=torch.long)
+        l3_idx = torch.nonzero(node_level == 3, as_tuple=False).view(-1).to(device=device, dtype=torch.long)
+        if l0_idx.numel() == 0 or l1_idx.numel() == 0 or l2_idx.numel() == 0 or l3_idx.numel() == 0:
+            return None
+
+        l3_to_l2 = self._zipper_build_children_table_cached(base_edge_index, node_level, 3, 2)
+        l2_to_l1 = self._zipper_build_children_table_cached(base_edge_index, node_level, 2, 1)
+        l1_to_l0 = self._zipper_build_children_table_cached(base_edge_index, node_level, 1, 0)
+        if node_ar_time is not None and node_ar_time.numel() >= int(N):
+            t_all = node_ar_time.to(device=device, dtype=torch.long)
+        else:
+            t_all = torch.full((int(N),), -1, dtype=torch.long, device=device)
+            t_all[l0_idx] = torch.arange(l0_idx.numel(), device=device, dtype=torch.long)
+            _, max1 = self._hqd_build_descendant_interval_cache(l1_idx, t_all, t_all, l1_to_l0, int(N))
+            _, max2 = self._hqd_build_descendant_interval_cache(l2_idx, max1, max1, l2_to_l1, int(N))
+            _, max3 = self._hqd_build_descendant_interval_cache(l3_idx, max2, max2, l3_to_l2, int(N))
+            t_all = torch.maximum(torch.maximum(torch.maximum(t_all, max1), max2), max3)
+        l0_time = t_all.index_select(0, l0_idx)
+        l3_time = t_all.index_select(0, l3_idx)
+
+        witness_table = self._build_witness_l0_ids(
+            q_all=q_all,
+            k_all=k_all,
+            child_tables={1: l1_to_l0, 2: l2_to_l1, 3: l3_to_l2},
+            level_indices={1: l1_idx, 2: l2_idx, 3: l3_idx},
+            node_ar_time=node_ar_time,
+            x_bnh=x_bnh,
+            node_level=node_level,
+            edge_index=base_edge_index,
+            allow_same_time=allow_same_time,
+            causal=causal,
+        )
+        if witness_table is None or witness_table.numel() == 0:
+            return None
+
+        q_l0 = q_all.index_select(1, l0_idx)
+        k_l3 = k_all.index_select(1, l3_idx)
+        head_dim = max(1, int(q_l0.size(-1)))
+        num_heads = max(1, int(q_l0.size(-2)))
+        scores3 = torch.einsum("bqhd,bkhd->bqk", q_l0, k_l3) / float(num_heads * math.sqrt(float(head_dim)))
+        if causal:
+            valid3 = (l3_time.view(1, 1, -1) <= l0_time.view(1, -1, 1)) if allow_same_time else (l3_time.view(1, 1, -1) < l0_time.view(1, -1, 1))
+            valid3 = valid3 & (l3_time.view(1, 1, -1) >= 0)
+            scores3 = scores3.masked_fill(~valid3, float("-inf"))
+        sel3, _, sel3_valid = self._hqd_topk_from_scores_batched(
+            l3_idx.view(1, 1, -1).expand(int(B), int(l0_idx.numel()), -1),
+            scores3,
+            int(getattr(self, "hqd_topk_l3", 4)),
+        )
+
+        slots = int(witness_table.size(-1))
+        wflat = witness_table.to(device=device, dtype=torch.long).reshape(int(B) * int(N), slots)
+        boff = torch.arange(int(B), device=device, dtype=torch.long).view(int(B), 1, 1) * int(N)
+        wit = wflat.index_select(0, (sel3.clamp(min=0) + boff).reshape(-1)).view(int(B), sel3.size(1), sel3.size(2), slots)
+        wit = torch.where(sel3_valid.unsqueeze(-1), wit, torch.full_like(wit, -1)).reshape(int(B), sel3.size(1), -1)
+        wit, wit_mask = self._hqd_maybe_dedup_candidates_batched(wit, force=True)
+        wit = torch.where(wit_mask, wit, torch.full_like(wit, -1))
+        wit, _ = torch.sort(wit, dim=-1, descending=True)
+        wit_mask = wit >= 0
+        if causal:
+            cand_t = t_all.index_select(0, wit.clamp(min=0).reshape(-1)).view_as(wit)
+            causal_ok = (cand_t <= l0_time.view(1, -1, 1)) if allow_same_time else (cand_t < l0_time.view(1, -1, 1))
+            wit_mask = wit_mask & causal_ok & (cand_t >= 0)
+            wit = torch.where(wit_mask, wit, torch.full_like(wit, -1))
+
+        scores0 = self._hqd_score_candidates_batched(
+            query_vec=q_l0,
+            key_bank=k_all,
+            candidate_nodes=wit,
+            candidate_mask=wit_mask,
+            query_time=l0_time.view(1, -1).expand(int(B), -1),
+            candidate_max_time_cache=t_all,
+            causal=causal,
+            allow_same_time=allow_same_time,
+        )
+        top_nodes, _, top_valid = self._hqd_topk_from_scores_batched(wit, scores0, int(getattr(self, "hqd_topk_l0", 8)))
+        top_nodes = torch.where(top_valid, top_nodes, torch.full_like(top_nodes, -1))
+        added_total = int(top_valid.sum().item())
+        if added_total <= 0:
+            return None
+
+        stage_stats = {
+            "queries": int(B * l0_idx.numel()),
+            "l3_selected_total": int(sel3_valid.sum().item()),
+            "l0_selected_total": int(added_total),
+            "final_selected_total": int(added_total),
+            "final_candidates": int(added_total),
+            "packed_witness_l0": int(added_total),
+            "packed_witness_source_recompute": 1,
+        }
+        if profile_enabled:
+            profile_stats["packed_witness_select_ms"] = (time.monotonic() - t0) * 1000.0
+        return {
+            "edges": None,
+            "packed_l0": (l0_idx, top_nodes),
+            "added_total": int(added_total),
+            "stage_stats": stage_stats,
+            "profile_stats": profile_stats if profile_enabled else None,
+        }
 
     def _hierarchical_query_descent_vectorized_batched(
         self,
@@ -9828,6 +10104,9 @@ class HierarchicalFlowGAT(nn.Module):
                 mp.hqd_attn_impl = str(getattr(self, "hqd_attn_impl", "scatter"))
                 mp.hqd_dense_backend = str(getattr(self, "hqd_dense_backend", "sdpa"))
                 mp.hqd_profile_enable = bool(getattr(self, "hqd_debug", False))
+                mp.hqd_graph_witness_enable = bool(getattr(self, "hqd_graph_witness_enable", False))
+                mp.hqd_graph_witness_topk = int(getattr(self, "hqd_graph_witness_topk", 4))
+                mp.hqd_packed_witness_chunk_size = int(getattr(self, "hqd_packed_witness_chunk_size", 2048))
 
         if use_multi_local and not bool(getattr(self, "_l0_local_runtime_logged", False)):
             for lvl in sorted(active_local_levels):
@@ -10131,6 +10410,36 @@ class HierarchicalFlowGAT(nn.Module):
                         _base_nl=base_nl,
                         _base_ar_time=base_ar_time,
                     ):
+                        if bool(getattr(self, "hqd_packed_witness_read", False)):
+                            if str(getattr(self, "hqd_packed_witness_source", "graph")) == "recompute":
+                                packed = self._hierarchical_query_descent_recomputed_packed_witness_batched(
+                                    transformer=_transformer,
+                                    x_bnh=_x,
+                                    base_edge_index=_refine_ei,
+                                    node_level=_base_nl,
+                                    node_ar_time=_base_ar_time,
+                                    q_all=q_runtime,
+                                    k_all=k_runtime,
+                                )
+                            else:
+                                packed = self._hierarchical_query_descent_packed_witness_batched(
+                                    transformer=_transformer,
+                                    x_bnh=_x,
+                                    base_edge_index=_refine_ei,
+                                    node_level=_base_nl,
+                                    node_ar_time=_base_ar_time,
+                                    q_all=q_runtime,
+                                    k_all=k_runtime,
+                                )
+                            if packed is not None:
+                                return packed
+                            return {
+                                "edges": None,
+                                "packed_l0": None,
+                                "added_total": 0,
+                                "stage_stats": {"packed_witness_l0": 0},
+                                "profile_stats": None,
+                            }
                         b_sel, src_sel, dst_sel, added, stage = self._hierarchical_query_descent_ephemeral_batched(
                             transformer=_transformer,
                             x_bnh=_x,

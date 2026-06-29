@@ -7,9 +7,9 @@ modality: text
 tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
-text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 1024 #16384 #32768 #1024
-batch_size: 32
+text_file: ./data/pg19_train.txt #/home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
+block_size: 16384 #32768 #1024
+batch_size: 1
 val_split: 0.01
 
 # Training
@@ -29,8 +29,8 @@ muon_adjust_lr_fn: match_rms_adamw
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
 num_epochs: 100
-samples_per_epoch: 25000 #782 #25000
-gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
+samples_per_epoch: 782 #25000
+gradient_accumulation_steps: 2   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Periodic generation / checkpointing (in training batches; 0 = per-epoch / end only).
 # (CLI: --generate-every / --save-every / --checkpoint-dir.)
@@ -41,7 +41,7 @@ generate_every: 0
 gen_prompt_tokens: 512
 gen_max_new_tokens: 512
 save_every: 0
-checkpoint_dir: ./pinball/hqd_bag/checkpoints
+checkpoint_dir: ./pinball/sepqkv_gpt2_large/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -60,9 +60,23 @@ ar_graph_causal: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 768
-num_heads: 12
-num_refinement_layers: 12
+hidden_dim: 1536 #768
+num_heads: 16 #12
+# Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
+# on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
+# qk==v head_dim). Both default 1.0 = off (bit-identical).
+#   attn_sparse_v_mult : widen v_head_dim — a richer value payload carried THROUGH the sparse
+#     aggregation (the capacity a dense model can't afford), down-projected on output. Applies
+#     to BOTH sparse paths: the cross-level (vertical) message passing AND the HQD read.
+#   attn_sparse_qk_mult: widen qk_head_dim. Your head_dim is 64 < model_dim 128, so the per-head
+#     routing form is rank-capped at 64; mult 2.0 -> head_dim 128 = full rank. Helps up to ==128.
+#     Applies to the cross-level message passing; the HQD descent SELECTION stays at head_dim
+#     (its q/k entangle with the shared zipper-qk cache + witness scoring — widening there is a
+#     separate follow-up). HQD still gets the fat-V payload above.
+# (To add more independent routing patterns instead, raise num_heads above — uncapped, compounding.)
+attn_sparse_qk_mult: 1.0    # try 2.0 to lift cross-level routing rank 64 -> 128
+attn_sparse_v_mult: 1.0     # try 2.0 / 4.0 for fat-V (both sparse paths)
+num_refinement_layers: 24 #12
 num_layers: [0, 0, 0, 0]
 internal_cycles: [0, 0, 0, 0]
 refinement_style: unified
@@ -73,15 +87,15 @@ local_connectivity_window_size: 0
 compression_ratios: [16, 4, 4]
 overlap_ratios: [0.5, 0.5, 0.5]
 norm_type: layernorm
-dropout: 0.0
+dropout: 0.1
 
 # Attention / hierarchy toggles
 attn_backend: flash        # pyg | flash | sdpa
-qkv_sharing: shared      # shared | separate
-use_hqd: True             # hierarchical query descent
+qkv_sharing: separate      # shared | separate
+use_hqd: False              # enables packed witness runtime hook
 hqd_query_chunk_size: 1024000000 # 4096
 hqd_include_local_window: False
-hqd_every_n: 4
+hqd_every_n: 3                 # packed witness read every refinement layer
 hqd_reuse_previous: False
 hqd_reuse_max_age: 0
 hqd_topk_l3: 4 #8 #4 #16 #16 # 4
@@ -103,8 +117,17 @@ hqd_use_existing_zipper_projections: true   # reuse the zipper q/k projections
 #             ~no speedup. dense/sdpa pads to max degree => wasteful on ragged sets (auto
 #             falls back to scatter past hqd_dense_max_pad_ratio); dense/flash (ragged)
 #             ties scatter. Keep scatter unless you have a bounded uniform edge set.
-hqd_attn_impl: scatter        # scatter | dense
+hqd_attn_impl: scatter        # scatter | dense; inert when hqd_packed_witness_read=true succeeds
 hqd_dense_backend: flash       # sdpa | flash (flash-varlen if installed, else sdpa)
+# Recompute the existing parent->L0 witness table, but consume selected rows as packed
+# fixed-K reads inside message passing. This avoids materializing a flattened L0 witness
+# edge list while preserving the old summary/rare witness selection behavior.
+hqd_select_inside_message_passing: false
+hqd_graph_witness_enable: false
+hqd_graph_witness_topk: 4
+hqd_packed_witness_read: true
+hqd_packed_witness_source: recompute # recompute | graph
+hqd_packed_witness_chunk_size: 2048
 # Descent shortcut ("bag instead of descend"). 0 = full scored descent (L3,L2,L1,L0).
 #   2 = score L3,L2 then take ALL L1 children of the selected L2 nodes unscored (skip the
 #       L1 scoring stage); the final L0 stage still scores + prunes to topk_l0. Saves one
@@ -123,16 +146,14 @@ hqd_shallow_read_level: 3     # 0 | 2 | 3
 # routed levels in witness_levels.
 hqd_coarse_route_levels: []   # e.g. [3] or [2,3]
 hqd_coarse_route_topk: 8      # neighbours each coarse node routes to
-# HQD final-read levels: which selected levels the L0 query attends over. [0] = L0 only
-# (original behavior); [0, 1, 2, 3] also mixes the selected L1/L2/L3 summary nodes into the
-# attention (level-aware scoring handles the cross-level q.k). Causal-safe at query_level 0.
-# Inert unless use_hqd: true.
-hqd_read_levels: [0, 1, 2, 3]
+# Original HQD edge-read settings are kept inert by hqd_packed_witness_read=true:
+# the runtime selector returns only packed L0 witness ids and never materializes the
+# old flattened HQD L0/coarse edge list. Keep these minimal as a safety/default.
+hqd_read_levels: [0]
 
-# Witness packets (require use_hqd: true; inert otherwise). Each selected L1 node exposes a
-# bounded packet of L0 child ids it "cannot forget", force-included (via a score bias) into the
-# HQD final candidate set so important/rare tokens survive top-k pruning. Default off.
-use_witness_packets: true       # master switch
+# Recomputed witness packets are the selection source for packed reads; they are not
+# materialized as old sparse HQD edges when hqd_packed_witness_read=true succeeds.
+use_witness_packets: true        # build parent->L0 witness table
 use_summary_witnesses: true      # top-k children by graph responsibility (q_parent . k_child)
 use_rare_witnesses: true         # top-k by responsibility + lambda * detached surprise
 summary_witness_per_head: false  # true = top-k per attention head (diversity, ~num_heads x slots)
@@ -141,7 +162,7 @@ witness_k_rare: 4               # rare/surprise witnesses per parent
 witness_max_per_parent: 0      # cap on total witness slots/parent (0 = uncapped). Bounds the
                                 # candidate width so per_head*num_heads can't blow up cost: the
                                 # build is ~0.6% of a step, the inflated candidate set is what scales.
-witness_levels: [3]            # which parent levels expose L0 bags. [1] = L1->L0 direct children.
+witness_levels: [3]             # packed shallow L3 read looks up selected L3 rows only.
                                 # [1,2,3] also builds cross-level L2->L0 / L3->L0 bags so a coarse
                                 # selection reaches its important L0 descendants without descending.
                                 # Causal-verified for AR; enables the shallow-read / coarse-route paths.
@@ -152,7 +173,7 @@ witness_score_bias: 5.0         # logit bonus that force-includes witnesses past
 # (L1/L2/L3) also gain lateral reach. [] = off. Requires use_hqd: true.
 #   per_position : each coarse node's bag = its own descendants' selections. STRICTLY CAUSAL.
 #   global       : one shared top-k bag/level. NOT AR-causal (bidi / masked-diffusion only).
-hqd_window_bag_levels: [1,2,3]            # e.g. [1, 2, 3] to give coarse levels lateral reach
+hqd_window_bag_levels: []       # old HQD edge-bag path disabled; packed witnesses carry long reads
 hqd_window_bag_routing: per_position # per_position (causal) | global (non-causal, bidi only)
 # per_position: 0 = natural bound (every descendant selection, ~descendants x topk_lX per node);
 #               >0 = hard fixed budget (top-N descendant selections per coarse node by score).
@@ -163,7 +184,14 @@ local_attn_levels: [0, 1, 2, 3]
 local_attn_windows: [128, 128, 128, 128]
 local_attn_causal_levels: [0, 1, 2, 3]
 l0_local_window: 128
+
+# Attention-derived edge state.
+use_edge_embedding: false
 learn_edge_from_attention: false
 
+# Runtime trace bias from recent attention weights.
+lateral_edge_trace_enable: false
+lateral_edge_trace_mode: true_lateral   # windowed_approx | true_scatter | true_lateral
+
 # Hierarchy auxiliary (reconstruction) loss
-use_aux_loss: True
+use_aux_loss: False
