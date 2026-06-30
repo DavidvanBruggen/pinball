@@ -2177,6 +2177,9 @@ class EnhancedHierarchicalTrainer:
         lambda_copy_loss=1.0,
         eval_ppl_ignore_prefix_tokens=0,
         eval_report_truncated_ppl=True,
+        longctx_diag_every=0,        # >0: every N validations, log next-token PPL bucketed by
+                                     # in-context recurrence distance (cheap, reuses val batches)
+        longctx_diag_max_seqs=64,    # cap sequences scanned for the diagnostic (keeps it cheap)
         ce_label_smoothing_train=0.0,
         copy_task_enable=False,
         copy_task_train_prob=0.1,
@@ -2309,6 +2312,9 @@ class EnhancedHierarchicalTrainer:
         self.lambda_copy_loss = float(lambda_copy_loss)
         self.eval_ppl_ignore_prefix_tokens = max(0, int(eval_ppl_ignore_prefix_tokens))
         self.eval_report_truncated_ppl = bool(eval_report_truncated_ppl)
+        self.longctx_diag_every = max(0, int(longctx_diag_every))
+        self.longctx_diag_max_seqs = max(1, int(longctx_diag_max_seqs))
+        self._longctx_diag_calls = 0
         self.ce_label_smoothing_train = max(0.0, float(ce_label_smoothing_train))
         self.copy_task_enable = bool(copy_task_enable)
         self.copy_task_train_prob = max(0.0, min(1.0, float(copy_task_train_prob)))
@@ -6174,6 +6180,51 @@ class EnhancedHierarchicalTrainer:
         return model(input_ids, attention_mask=attention_mask,
                      reveal_target_ids=reveal_target_ids, reveal_mask=reveal_mask)
 
+    # Long-context diagnostic: next-token PPL bucketed by in-context recurrence distance
+    # (distance to the target token's previous occurrence within the same sequence). The
+    # split that matters is <128 (inside the local window) vs >=128 (needs the hierarchy).
+    _LCD_LABELS = ("never", "<128", "128-511", "512-2k", ">2k")
+
+    @staticmethod
+    def _lcd_bucket(dist):
+        if dist is None:
+            return 0
+        if dist < 128:
+            return 1
+        if dist < 512:
+            return 2
+        if dist < 2048:
+            return 3
+        return 4
+
+    def _accumulate_longctx_diag(self, input_ids, shift_logits, valid_2d, acc, seqs_done):
+        """Accumulate per-token NLL into recurrence-distance buckets. `acc` is a list of
+        [sum_nll, count] per bucket; returns the updated sequence count. Cheap + read-only:
+        reuses the already-computed validation logits, capped at longctx_diag_max_seqs."""
+        B, Tm1, V = shift_logits.shape
+        with torch.no_grad():
+            nll = F.cross_entropy(
+                shift_logits.reshape(-1, V), input_ids[:, 1:].reshape(-1),
+                reduction="none",
+            ).view(B, Tm1).float().cpu()
+        ids_cpu = input_ids.detach().cpu()
+        valid_cpu = valid_2d.detach().cpu()
+        for b in range(B):
+            if seqs_done >= self.longctx_diag_max_seqs:
+                break
+            seq = ids_cpu[b].tolist()
+            last = {}
+            for j in range(len(seq)):
+                tid = seq[j]
+                # target token at index j is predicted from shifted position j-1
+                if j >= 1 and bool(valid_cpu[b, j - 1]):
+                    prev = last.get(tid)
+                    bi = self._lcd_bucket(j - prev if prev is not None else None)
+                    acc[bi][0] += float(nll[b, j - 1]); acc[bi][1] += 1
+                last[tid] = j
+            seqs_done += 1
+        return seqs_done
+
     def validate(self, data_provider, use_ema = False):
         """
         Validate the model using an objective that mirrors the hybrid training loss,
@@ -6190,6 +6241,11 @@ class EnhancedHierarchicalTrainer:
             self.ema_model.eval()
         else:
             self.model.eval()
+        # Long-context diagnostic gate: run every `longctx_diag_every` validations.
+        _lcd_on = self.longctx_diag_every > 0 and (self._longctx_diag_calls % self.longctx_diag_every == 0)
+        self._longctx_diag_calls += 1
+        _lcd_acc = [[0.0, 0] for _ in self._LCD_LABELS]
+        _lcd_seqs = 0
         total_combined_loss = 0.0
         total_masked_loss_component = 0.0 # Track masked loss separately
         total_masked_loss_numer = 0.0
@@ -6521,6 +6577,10 @@ class EnhancedHierarchicalTrainer:
                 else:
                     valid_next = torch.ones_like(shift_labels_flat, dtype=torch.bool)
 
+                if _lcd_on and objective_mode == "ar" and _lcd_seqs < self.longctx_diag_max_seqs:
+                    _lcd_seqs = self._accumulate_longctx_diag(
+                        input_ids, shift_logits, valid_next.view(shift_labels.shape), _lcd_acc, _lcd_seqs)
+
                 current_next_token_loss_trunc = 0.0
                 trunc_ignore = int(getattr(self, "eval_ppl_ignore_prefix_tokens", 0))
                 if trunc_ignore > 0:
@@ -6779,6 +6839,14 @@ class EnhancedHierarchicalTrainer:
             perplexity_source = "next-token CE"
 
         self.val_losses.append(avg_combined_loss) # Store combined loss for best model tracking
+
+        if _lcd_on and any(c for _, c in _lcd_acc):
+            parts = []
+            for lbl, (s, c) in zip(self._LCD_LABELS, _lcd_acc):
+                if c:
+                    parts.append(f"{lbl}={math.exp(min(20.0, s / c)):.1f}(n{c})")
+            logger.info("[LONGCTX] next-token PPL by in-context recurrence distance (%d seqs): %s",
+                        _lcd_seqs, "  ".join(parts))
 
         copy_token_acc = (copy_token_correct / copy_token_total) if copy_token_total > 0 else 0.0
         copy_span_exact = (copy_span_correct / copy_span_total) if copy_span_total > 0 else 0.0

@@ -1933,7 +1933,7 @@ class HierarchicalFlowGAT(nn.Module):
         refinement_style: str = "unified", # Default to new style, "unified" , "iterative_level"
         use_gradient_checkpointing: bool = False,
         local_connectivity_window_size: int = 0,#0#4  # Size of local connectivity window for dense connections
-        l0_windowgraph: int = 1, # 1 , add dense edges in l0 graph it's k either side, making a window k*2+1 total connectivity
+        l0_windowgraph: int = 0, # 1 , add dense edges in l0 graph it's k either side, making a window k*2+1 total connectivity
         rope_mode: str = "auto",  # "auto" | "1d" | "2d_axial"
         lambda_ce_anchor: float = 0,#0.0,
         use_aux_loss: bool = False, # Whether to compute the hierarchy reconstruction auxiliary loss
@@ -1976,6 +1976,8 @@ class HierarchicalFlowGAT(nn.Module):
         local_attn_level_role_bias_enable: bool = False,
         local_attn_level_role_bias_scale: float = 1.0,
         local_attn_flash_dtype_cast: bool = False,
+        cross_level_packed: bool = False,
+        cross_level_qkv: str = "shared",
         local_attn_sampled_mode: str = "safe_sdpa",
         sparse_attn_mode: str = "off",
         sparse_attn_chunk_size: int = 0,
@@ -2515,6 +2517,8 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_attn_level_role_bias_enable = bool(local_attn_level_role_bias_enable)
         self.local_attn_level_role_bias_scale = float(local_attn_level_role_bias_scale)
         self.local_attn_flash_dtype_cast = bool(local_attn_flash_dtype_cast)
+        self.cross_level_packed = bool(cross_level_packed)
+        self.cross_level_qkv = str(cross_level_qkv or "shared").lower()
         self.local_attn_sampled_mode = str(local_attn_sampled_mode).lower()
         if self.local_attn_sampled_mode not in {"safe_sdpa", "flash_sorted", "off"}:
             self.local_attn_sampled_mode = "safe_sdpa"
@@ -2987,6 +2991,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_level_role_bias_enable=self.local_attn_level_role_bias_enable,
                         local_attn_level_role_bias_scale=self.local_attn_level_role_bias_scale,
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
+                        cross_level_packed=self.cross_level_packed,
+                        cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
                         sparse_attn_mode=self.sparse_attn_mode,
                         sparse_attn_chunk_size=self.sparse_attn_chunk_size,
@@ -3061,6 +3067,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_level_role_bias_enable=self.local_attn_level_role_bias_enable,
                         local_attn_level_role_bias_scale=self.local_attn_level_role_bias_scale,
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
+                        cross_level_packed=self.cross_level_packed,
+                        cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
                         sparse_attn_mode=self.sparse_attn_mode,
                         sparse_attn_chunk_size=self.sparse_attn_chunk_size,
@@ -10491,20 +10499,49 @@ class HierarchicalFlowGAT(nn.Module):
                         and len(active_levels) < len(all_pinball_levels)
                     ):
                         active_compute_levels = active_levels
-                    x, new_edge_attr = self._refine_step_true_batch_native(
-                        transformer=transformer,
-                        x_bnh=x,
-                        edge_index=refine_ei,
-                        node_level=base_nl,
-                        level_offsets=base_lo,
-                        pos_local=pos_local,
-                        edge_attr_work=edge_attr_work,
-                        edge_type_work=refine_et,
-                        hqd_b_idx=hqd_b_idx,
-                        hqd_src_idx=hqd_src_idx,
-                        hqd_dst_idx=hqd_dst_idx,
-                        active_levels=active_compute_levels,
+                    _use_ckpt = (
+                        bool(getattr(self, "use_gradient_checkpointing", False))
+                        and self.training
+                        and torch.is_grad_enabled()
                     )
+                    if _use_ckpt:
+                        # Checkpoint the per-layer refinement step: free its internal
+                        # activations (attention/FFN) and recompute them in backward.
+                        # Loop-varying args are bound as defaults so the backward
+                        # recompute uses THIS layer's snapshot (edge_attr_work is
+                        # reassigned later in the loop).
+                        def _ckpt_refine(
+                            x_in,
+                            _t=transformer, _ei=refine_ei, _nl=base_nl, _lo=base_lo,
+                            _pl=pos_local, _ea=edge_attr_work, _et=refine_et,
+                            _bi=hqd_b_idx, _si=hqd_src_idx, _di=hqd_dst_idx,
+                            _al=active_compute_levels,
+                        ):
+                            return self._refine_step_true_batch_native(
+                                transformer=_t, x_bnh=x_in, edge_index=_ei,
+                                node_level=_nl, level_offsets=_lo, pos_local=_pl,
+                                edge_attr_work=_ea, edge_type_work=_et,
+                                hqd_b_idx=_bi, hqd_src_idx=_si, hqd_dst_idx=_di,
+                                active_levels=_al,
+                            )
+                        x, new_edge_attr = torch.utils.checkpoint.checkpoint(
+                            _ckpt_refine, x, use_reentrant=False,
+                        )
+                    else:
+                        x, new_edge_attr = self._refine_step_true_batch_native(
+                            transformer=transformer,
+                            x_bnh=x,
+                            edge_index=refine_ei,
+                            node_level=base_nl,
+                            level_offsets=base_lo,
+                            pos_local=pos_local,
+                            edge_attr_work=edge_attr_work,
+                            edge_type_work=refine_et,
+                            hqd_b_idx=hqd_b_idx,
+                            hqd_src_idx=hqd_src_idx,
+                            hqd_dst_idx=hqd_dst_idx,
+                            active_levels=active_compute_levels,
+                        )
                 finally:
                     self._hqd_inside_mp_active = False
 
@@ -11736,8 +11773,106 @@ class HierarchicalFlowGAT(nn.Module):
                 hierarchical_features.append(refined_graph.x[start:end])
             
             return logits, hierarchical_features
-        
+
         return logits
+
+    # ------------------------------------------------------------------
+    # Incremental KV-cached decode (Tier 5). ADDITIVE + opt-in: the normal
+    # generate() path is untouched and is the always-available fallback.
+    #
+    # Staged build:
+    #   S1 (this): dedicated entry point + verify harness + tunable frontier
+    #              width plumbing. Correct by construction (full forward/token).
+    #   S2: per-(refinement layer, level) K/V cache populated on the prompt forward.
+    #   S3: refinement "decode mode" that recomputes only the frontier node set
+    #       (last `frontier_width` L0 + open coarse + parents) while reading cached
+    #       K/V for settled neighbours -> the actual O(1)/token speedup.
+    #   S4: frontier bookkeeping (settle closed windows). S5: graph-edge fallback.
+    #
+    # `frontier_width` is the tunable correctness/speed knob (user choice):
+    #   None -> auto (= max local window + max compression, the measured drift span)
+    #   0    -> approx (recompute only the new token; coarse treated as settled)
+    #   big  -> exact (recompute enough recent context to match full forward in bf16)
+    # ------------------------------------------------------------------
+    def _generate_incremental(
+        self,
+        current_ids: torch.Tensor,
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
+        use_level_prediction: bool = False,
+        num_cycles: Optional[int] = None,
+        frontier_width: Optional[int] = None,
+        verify: bool = False,
+    ) -> torch.Tensor:
+        device = current_ids.device
+        cycles = num_cycles if num_cycles is not None else self.refinement_cycles
+
+        # Auto frontier width = the measured drift span: the widest local window
+        # plus the coarsest compression stride (positions whose coarse summary can
+        # still re-pool under append). Stored for S3; S1 below is full-forward exact.
+        if frontier_width is None:
+            try:
+                win = max([int(self.l0_local_window)] + [int(w) for w in (getattr(self, "local_attn_windows", []) or [])])
+            except Exception:
+                win = int(getattr(self, "l0_local_window", 128) or 128)
+            try:
+                comp = int(max(getattr(self, "compression_ratios", [16]) or [16]))
+            except Exception:
+                comp = 16
+            frontier_width = max(1, win + comp)
+        self._kv_frontier_width = int(frontier_width)
+
+        # Use bf16 autocast so the flash local-attention path is available during
+        # decode (generation otherwise runs fp32, which flash rejects).
+        import contextlib
+        amp_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        use_amp = device.type == "cuda"
+
+        eos_token_id = min(self.vocab_size - 1, int(getattr(self, "eos_token_id", self.vocab_size - 1)))
+        max_verify_err = 0.0
+
+        for _ in range(int(max_new_tokens)):
+            if current_ids.size(1) >= self.max_seq_len:
+                break
+            with torch.no_grad():
+                ctx = torch.autocast("cuda", dtype=amp_dtype) if use_amp else contextlib.nullcontext()
+                with ctx:
+                    # S1: correct-by-construction full forward. S3 replaces this with the
+                    # cached frontier-subset refinement; `verify` will then compare the two.
+                    logits = self.forward(
+                        current_ids,
+                        num_cycles=cycles,
+                        use_level_prediction=use_level_prediction,
+                        logits_last_only=True,
+                    )
+                    next_token_logits = logits[:, -1, :]
+                    if verify:
+                        # In S1 the incremental path *is* the full forward, so the
+                        # invariant is trivially satisfied (0 error). Wired now so S3
+                        # only has to point the reference at the cached path.
+                        ref = next_token_logits
+                        max_verify_err = max(max_verify_err, float((next_token_logits - ref).abs().max().item()))
+
+            next_token = self._safe_sampling(
+                next_token_logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                current_ids=current_ids,
+                do_sample=do_sample,
+            )
+            current_ids = torch.cat([current_ids, next_token], dim=1)
+            if next_token.item() == eos_token_id:
+                break
+
+        if verify:
+            logger.info("[KV-CACHE] verify_incremental max|logit err| = %.3e (S1: full-forward path)", max_verify_err)
+        return current_ids
 
     def generate(
         self,
@@ -11752,6 +11887,9 @@ class HierarchicalFlowGAT(nn.Module):
         use_direct_prediction: bool = False,
         rebuild_graph: bool = False,  # New option to rebuild the graph for each token
         num_cycles: int = None,  # Allow overriding cycles
+        use_kv_cache: bool = False,        # opt-in incremental KV-cached decode (additive)
+        kv_frontier_width: Optional[int] = None,  # 0 = approx, large = exact; None = auto
+        verify_incremental: bool = False,  # assert incremental logits == full-forward (debug)
     ) -> torch.Tensor:
         """
         Generate text using hierarchical flow with multiple generation options.
@@ -11783,7 +11921,28 @@ class HierarchicalFlowGAT(nn.Module):
         # Initialize level_mappings if needed
         if not hasattr(self, 'level_mappings') or self.level_mappings is None:
             self.level_mappings = []
-        
+
+        # CASE 0: Incremental KV-cached decode (opt-in, additive). Falls back to the normal
+        # rebuild loop on any error so the default path is never compromised.
+        if use_kv_cache:
+            try:
+                return self._generate_incremental(
+                    current_ids,
+                    max_new_tokens=max_length,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    use_level_prediction=use_level_prediction,
+                    num_cycles=cycles,
+                    frontier_width=kv_frontier_width,
+                    verify=verify_incremental,
+                )
+            except Exception as e:
+                logger.warning("[KV-CACHE] incremental decode failed (%s); falling back to full rebuild.", e)
+                rebuild_graph = True
+
         # CASE 1: Rebuild Graph approach
         if rebuild_graph:
             try:

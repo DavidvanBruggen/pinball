@@ -131,6 +131,8 @@ def build_pinball_model(
         local_attn_windows=getattr(args, "local_attn_windows", None) if getattr(args, "local_attn_windows", None) else None,
         local_attn_causal_levels=getattr(args, "local_attn_causal_levels", None),
         local_attn_flash_dtype_cast=bool(getattr(args, "local_attn_flash_dtype_cast", False)),
+        cross_level_packed=bool(getattr(args, "cross_level_packed", False)),
+        cross_level_qkv=str(getattr(args, "cross_level_qkv", "shared") or "shared"),
         local_attn_sampled_mode=str(getattr(args, "local_attn_sampled_mode", "safe_sdpa")),
         attention_source_gating_enable=bool(getattr(args, "attention_source_gating_enable", False)),
         attention_source_gate_init_graph=float(getattr(args, "attention_source_gate_init_graph", 1.0)),

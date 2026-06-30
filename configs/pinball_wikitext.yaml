@@ -7,9 +7,9 @@ modality: text
 tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
-text_file: ./data/pg19_train.txt #/home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 16384 #32768 #1024
-batch_size: 1
+text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
+block_size: 1024 #16384 #32768 #1024
+batch_size: 32
 val_split: 0.01
 
 # Training
@@ -29,9 +29,15 @@ muon_adjust_lr_fn: match_rms_adamw
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
 num_epochs: 100
-samples_per_epoch: 782 #25000
-gradient_accumulation_steps: 2   # accumulate grads over N batches before an optimizer step
+samples_per_epoch: 25000 #782 #25000
+gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
+# Long-context diagnostic: every N validations, log next-token PPL bucketed by in-context
+# recurrence distance (never / <128 / 128-511 / 512-2k / >2k). Cheap — reuses the val batches,
+# no extra forward. The split that matters: <128 (inside local window) vs >=128 (needs the
+# hierarchy). 0 = off. longctx_diag_max_seqs caps sequences scanned per run (default 64).
+longctx_diag_every: 1
+# longctx_diag_max_seqs: 64
 # Periodic generation / checkpointing (in training batches; 0 = per-epoch / end only).
 # (CLI: --generate-every / --save-every / --checkpoint-dir.)
 generate_every: 0
@@ -41,7 +47,7 @@ generate_every: 0
 gen_prompt_tokens: 512
 gen_max_new_tokens: 512
 save_every: 0
-checkpoint_dir: ./pinball/sepqkv_gpt2_large/checkpoints
+checkpoint_dir: ./pinball/sepqkv_gpt2/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -60,8 +66,8 @@ ar_graph_causal: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 1536 #768
-num_heads: 16 #12
+hidden_dim: 768 #768
+num_heads: 12 #12
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -76,7 +82,7 @@ num_heads: 16 #12
 # (To add more independent routing patterns instead, raise num_heads above — uncapped, compounding.)
 attn_sparse_qk_mult: 1.0    # try 2.0 to lift cross-level routing rank 64 -> 128
 attn_sparse_v_mult: 1.0     # try 2.0 / 4.0 for fat-V (both sparse paths)
-num_refinement_layers: 24 #12
+num_refinement_layers: 12 #12
 num_layers: [0, 0, 0, 0]
 internal_cycles: [0, 0, 0, 0]
 refinement_style: unified
@@ -92,6 +98,25 @@ dropout: 0.1
 # Attention / hierarchy toggles
 attn_backend: flash        # pyg | flash | sdpa
 qkv_sharing: separate      # shared | separate
+# Tier-3 packed cross-level backbone attention: a dense/batched fast lane for the
+# cross-level message passing (groups each destination's parents into a padded fixed-K
+# block per level, runs [B,Q,K,H,D] attention instead of gather/segment-softmax/scatter).
+# Mathematically identical to the scatter default (validated 2.1e-6); scatter stays the
+# default + the fallback for every graph feature it can't pack (edge feats/conditioning,
+# learned edges, trace, witnesses, fat-QKV). ~1.2-1.3x on uniform cross-level degree;
+# pays off on large/dense graphs, negligible at this config's sparse cross-level edges.
+cross_level_packed: false
+# Per-level cross-level (backbone + HQD) QKV. With qkv_sharing:separate the WINDOWS already
+# have per-level QKV; this gives the VERTICAL (cross-level) path the same, so an L0 query
+# attends to an L3 key in a level-specific subspace (vs today's single shared projection +
+# additive level-pair bias). Feeds packed/scatter cross-level AND the HQD selector; the local
+# window path keeps its own QKV. Copy-initialized from shared (starts bit-identical, fp32
+# parity 0.0). ~1-3% slower (same FLOPs, each node projected once by its level). Modes:
+#   shared        : single q/k/v_proj for all levels (default, current behaviour)
+#   per_level_qk  : per-level Q and K, shared V  (~+57M params; routing lives in q.k)
+#   per_level_qkv : per-level Q, K and V         (~+85M params; max expressiveness)
+#   reuse_local   : reuse the per-level LOCAL window projections (no new params)
+cross_level_qkv: shared
 use_hqd: False              # enables packed witness runtime hook
 hqd_query_chunk_size: 1024000000 # 4096
 hqd_include_local_window: False
@@ -194,4 +219,4 @@ lateral_edge_trace_enable: false
 lateral_edge_trace_mode: true_lateral   # windowed_approx | true_scatter | true_lateral
 
 # Hierarchy auxiliary (reconstruction) loss
-use_aux_loss: False
+use_aux_loss: True

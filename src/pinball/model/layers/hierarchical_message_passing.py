@@ -394,6 +394,8 @@ class HierarchicalMessagePassing(MessagePassing):
         local_attn_level_role_bias_enable: bool = True,
         local_attn_level_role_bias_scale: float = 1.0,
         local_attn_flash_dtype_cast: bool = False,
+        cross_level_packed: bool = False,
+        cross_level_qkv: str = "shared",
         local_attn_sampled_mode: str = "safe_sdpa",
         sparse_attn_mode: str = "off",
         sparse_attn_chunk_size: int = 0,
@@ -478,6 +480,7 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_attn_level_role_bias_enable = bool(local_attn_level_role_bias_enable)
         self.local_attn_level_role_bias_scale = float(local_attn_level_role_bias_scale)
         self.local_attn_flash_dtype_cast = bool(local_attn_flash_dtype_cast)
+        self.cross_level_packed = bool(cross_level_packed)
         self.local_attn_sampled_mode = str(local_attn_sampled_mode).lower()
         if self.local_attn_sampled_mode not in {"safe_sdpa", "flash_sorted", "off"}:
             self.local_attn_sampled_mode = "safe_sdpa"
@@ -617,7 +620,29 @@ class HierarchicalMessagePassing(MessagePassing):
 
         # Level embedding
         self.level_embedding = nn.Embedding(4, level_dim)  # 4 levels: L0, L1, L2, L3
-        
+
+        # Per-level cross-level (backbone + HQD) Q/K/V. Default "shared" reuses the single
+        # q/k/v_proj (current behaviour). The other modes route each node through its LEVEL's
+        # projection so an L0 query attends to an L3 key in a level-specific subspace (the
+        # vertical-routing analogue of per-level local QKV). Copy-initialized from the shared
+        # projections so an enabled model starts bit-identical, then specializes.
+        #   per_level_qk  : per-level Q and K, shared V (routing lives in q.k; V is the payload)
+        #   per_level_qkv : per-level Q, K and V
+        #   reuse_local   : reuse the existing per-level LOCAL projections (no new params)
+        self.cross_level_qkv = str(cross_level_qkv or "shared").lower()
+        _nlv = int(self.level_embedding.num_embeddings)
+        if self.cross_level_qkv in ("per_level_qk", "per_level_qkv"):
+            self.q_proj_xlevel = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(_nlv)])
+            self.k_proj_xlevel = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(_nlv)])
+            if self.cross_level_qkv == "per_level_qkv":
+                self.v_proj_xlevel = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(_nlv)])
+            self._sync_cross_level_qkv_from_shared()
+            # Resuming a checkpoint that predates this feature: the xlevel projections are
+            # "missing" -> fan them out from the just-loaded shared q/k/v so the warm start
+            # is bit-identical to shared and then specializes.
+            self.register_load_state_dict_post_hook(self._xlevel_load_post_hook)
+
+
         # Edge transformation (if edge attributes available)
         if use_edge_attr and edge_dim is not None:
             self.edge_proj = nn.Linear(edge_dim, hidden_dim)
@@ -905,6 +930,126 @@ class HierarchicalMessagePassing(MessagePassing):
         self._batched_dst_index_cache = cache
         return index_flat
 
+    # ------------------------------------------------------------------
+    # Tier-3 packed cross-level backbone attention (additive, opt-in).
+    # A dense/batched alternative to the per-edge scatter aggregation: group each
+    # destination's parents into a padded fixed-K block (PER DESTINATION LEVEL, so
+    # each level gets its own K) and run [B,Q,K,H,D] attention. Tensor-core friendly,
+    # no segment-softmax/scatter. Pays off at high, fairly-uniform cross-level degree.
+    #
+    # CONSERVE GRAPH OPS: opt-in via `cross_level_packed`; the scatter path stays the
+    # default and the fallback for every graph feature this v1 doesn't pack (edge
+    # features, edge conditioning, learned edges, graph trace, witness capture, fat-QKV).
+    # Mathematically identical to scatter for the supported (basic backbone) case.
+    # ------------------------------------------------------------------
+    def _cross_level_packed_eligible(self, edge_attr) -> bool:
+        if not bool(getattr(self, "cross_level_packed", False)):
+            return False
+        if getattr(self, "sparse_wide_enable", False):
+            return False  # fat-QKV uses decoupled wide q/k/v; v1 packs the narrow shared q/k/v
+        if edge_attr is not None and self.use_edge_attr:
+            return False
+        if self._edge_conditioning_active():
+            return False
+        if bool(getattr(self, "learn_edge_from_attn", False)):
+            return False
+        if self._trace_mode_allows_graph():
+            return False
+        if bool(getattr(self, "hqd_graph_witness_enable", False)):
+            return False
+        return True
+
+    def _build_cross_level_packed_candidates(self, src, dst, node_level, num_nodes):
+        """Per-destination-level padded parent lists. Static for an edge set -> cached.
+        Returns list of (level, dst_nodes[QL], cand[QL,Kmax] (-1 pad), src_levels[QL,Kmax])."""
+        cache = getattr(self, "_cross_level_packed_cache", {})
+        key = (int(src.data_ptr()), int(dst.data_ptr()), int(num_nodes), str(dst.device))
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        device = dst.device
+        nl = node_level.to(device=device, dtype=torch.long)
+        dst_level_e = nl.index_select(0, dst)
+        blocks = []
+        for L in torch.unique(dst_level_e).tolist():
+            emask = dst_level_e == int(L)
+            d = dst[emask]
+            s = src[emask]
+            if d.numel() == 0:
+                continue
+            dst_nodes, inv = torch.unique(d, return_inverse=True)  # [QL], inv[E_L]
+            QL = int(dst_nodes.numel())
+            order = torch.argsort(inv, stable=True)
+            inv_s = inv.index_select(0, order)
+            s_s = s.index_select(0, order)
+            counts = torch.bincount(inv_s, minlength=QL)
+            Kmax = int(counts.max().item()) if QL > 0 else 0
+            if Kmax <= 0:
+                continue
+            group_start = torch.zeros(QL, dtype=torch.long, device=device)
+            if QL > 1:
+                group_start[1:] = counts.cumsum(0)[:-1]
+            slot = torch.arange(inv_s.numel(), device=device, dtype=torch.long) - group_start.index_select(0, inv_s)
+            cand = torch.full((QL, Kmax), -1, dtype=torch.long, device=device)
+            cand[inv_s, slot] = s_s
+            cand_levels = nl.index_select(0, cand.clamp(min=0).reshape(-1)).view(QL, Kmax)
+            src_levels = torch.where(cand >= 0, cand_levels, torch.full_like(cand, -1))
+            blocks.append((int(L), dst_nodes, cand, src_levels))
+        if len(cache) > 8:
+            cache.clear()
+        cache[key] = blocks
+        self._cross_level_packed_cache = cache
+        return blocks
+
+    def _cross_level_packed_attention(self, q, k, v, src, dst, node_level, num_nodes, B, qk_hd, v_hd):
+        """Packed dense cross-level attention; returns [B, num_nodes, H, v_hd] (pre out_proj),
+        mathematically equal to the scatter aggregation for the basic backbone case."""
+        blocks = self._build_cross_level_packed_candidates(src, dst, node_level, int(num_nodes))
+        if not blocks:
+            return None
+        device = q.device
+        H = self.num_heads
+        nl = node_level.to(device=device, dtype=torch.long)
+        num_levels = int(self.level_embedding.num_embeddings)
+        # Same level-pair bias table the scatter path uses (per (dst_level, src_level)).
+        emb = self.level_embedding.weight
+        pair_dst = torch.arange(num_levels, device=device, dtype=torch.long).repeat_interleave(num_levels)
+        pair_src = torch.arange(num_levels, device=device, dtype=torch.long).repeat(num_levels)
+        pair_concat = torch.cat([emb.index_select(0, pair_dst), emb.index_select(0, pair_src)], dim=-1)
+        pair_weights = self.level_attn(pair_concat)
+        pair_diff = torch.abs(emb.index_select(0, pair_dst)[:, 0:1] - emb.index_select(0, pair_src)[:, 0:1])
+        pair_bias = pair_weights * (1.0 / (1.0 + pair_diff))  # [num_levels^2, H]
+
+        out = q.new_zeros((B, int(num_nodes), H, v_hd))
+        flat_k = k.reshape(B * int(num_nodes), H, qk_hd)
+        flat_v = v.reshape(B * int(num_nodes), H, v_hd)
+        batch_off = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1) * int(num_nodes)
+        neg = torch.finfo(q.dtype).min
+        scale = 1.0 / math.sqrt(float(qk_hd))
+        for (L, dst_nodes, cand, src_levels) in blocks:
+            QL = int(dst_nodes.numel())
+            Kmax = int(cand.size(1))
+            valid = cand >= 0
+            safe = cand.clamp(min=0)
+            gidx = (safe.unsqueeze(0) + batch_off).reshape(-1)  # [B*QL*Kmax]
+            k_c = flat_k.index_select(0, gidx).view(B, QL, Kmax, H, qk_hd)
+            v_c = flat_v.index_select(0, gidx).view(B, QL, Kmax, H, v_hd)
+            q_c = q.index_select(1, dst_nodes)  # [B, QL, H, D]
+            scores = (q_c.unsqueeze(2) * k_c).sum(-1) * scale  # [B, QL, Kmax, H]
+            pair_id = int(L) * num_levels + src_levels.clamp(min=0)  # [QL, Kmax]
+            lvl_bias = pair_bias.index_select(0, pair_id.reshape(-1)).view(QL, Kmax, H)
+            scores = scores + lvl_bias.unsqueeze(0)
+            scores = scores.masked_fill(~valid.view(1, QL, Kmax, 1), neg)
+            weights = torch.softmax(scores, dim=2)
+            weights = torch.where(valid.view(1, QL, Kmax, 1), weights, torch.zeros_like(weights))
+            weights = self.dropout(weights)  # parity with the scatter path's post-softmax dropout
+            msg = (weights.unsqueeze(-1) * v_c).sum(2)  # [B, QL, H, v_hd]
+            out.index_copy_(1, dst_nodes, msg.to(out.dtype))
+        # Parity with the scatter path's detached witness/trace resets (both no-ops here).
+        self._last_graph_witness_ids = None
+        self._last_graph_witness_scores = None
+        return out
+
     def _chunk_index_flat(self, dst_chunk: torch.Tensor, batch_size: int, num_nodes: int) -> torch.Tensor:
         batch_offsets = (torch.arange(int(batch_size), device=dst_chunk.device, dtype=torch.long) * int(num_nodes)).view(int(batch_size), 1)
         return (dst_chunk.view(1, -1) + batch_offsets).reshape(-1)
@@ -1168,6 +1313,96 @@ class HierarchicalMessagePassing(MessagePassing):
                 proj.weight.copy_(shared.weight)
                 if proj.bias is not None and shared.bias is not None:
                     proj.bias.copy_(shared.bias)
+
+    @torch.no_grad()
+    def _sync_cross_level_qkv_from_shared(self):
+        """Copy the shared backbone Q/K/V into every per-level CROSS-level projection, so an
+        enabled model starts identical to shared-QKV (and a pre-cross-level-QKV checkpoint
+        fans out after its shared weights load). No-op for the 'shared'/'reuse_local' modes."""
+        if getattr(self, "cross_level_qkv", "shared") not in ("per_level_qk", "per_level_qkv"):
+            return
+        pairs = [(self.q_proj, self.q_proj_xlevel), (self.k_proj, self.k_proj_xlevel)]
+        if self.cross_level_qkv == "per_level_qkv":
+            pairs.append((self.v_proj, self.v_proj_xlevel))
+        for shared, level_list in pairs:
+            for proj in level_list:
+                proj.weight.copy_(shared.weight)
+                if proj.bias is not None and shared.bias is not None:
+                    proj.bias.copy_(shared.bias)
+
+    @staticmethod
+    def _xlevel_load_post_hook(module, incompatible_keys):
+        """If a loaded checkpoint omitted the per-level cross-level projections (pre-feature),
+        re-fan them out from the shared q/k/v that DID load, so resume starts == shared."""
+        if getattr(module, "cross_level_qkv", "shared") not in ("per_level_qk", "per_level_qkv"):
+            return
+        missing = list(getattr(incompatible_keys, "missing_keys", []) or [])
+        if any(("q_proj_xlevel" in k or "k_proj_xlevel" in k or "v_proj_xlevel" in k) for k in missing):
+            module._sync_cross_level_qkv_from_shared()
+            for k in [m for m in missing if "_proj_xlevel" in m]:
+                try:
+                    incompatible_keys.missing_keys.remove(k)
+                except (ValueError, AttributeError):
+                    pass
+
+    def _resolve_xlevel_lists(self):
+        """Return (q_list, k_list, v_list) of per-level projection ModuleLists for the active
+        cross_level_qkv mode, or Nones for the shared path. A None v_list => shared V."""
+        mode = getattr(self, "cross_level_qkv", "shared")
+        if mode == "per_level_qk":
+            return self.q_proj_xlevel, self.k_proj_xlevel, None
+        if mode == "per_level_qkv":
+            return self.q_proj_xlevel, self.k_proj_xlevel, self.v_proj_xlevel
+        if mode == "reuse_local" and getattr(self, "per_level_local_qkv", False):
+            return self.q_proj_level, self.k_proj_level, self.v_proj_level
+        return None, None, None
+
+    def _xlevel_active(self):
+        ql, kl, _ = self._resolve_xlevel_lists()
+        return ql is not None and kl is not None
+
+    def _apply_rope_bnhd(self, t_bnhd, rope_pos, B, num_nodes):
+        """Apply the same RoPE the shared q/k path uses to a [B,N,H,head_dim] tensor."""
+        if not (hasattr(self, "rotary_pos_enc") and rope_pos is not None):
+            return t_bnhd
+        flat = t_bnhd.reshape(B * num_nodes, self.num_heads, self.head_dim)
+        if isinstance(rope_pos, torch.Tensor) and rope_pos.dim() == 2:
+            pos_rep = rope_pos.view(1, num_nodes, rope_pos.size(-1)).expand(B, num_nodes, rope_pos.size(-1)).reshape(B * num_nodes, rope_pos.size(-1))
+        else:
+            pos_rep = rope_pos.view(1, num_nodes).expand(B, num_nodes).reshape(-1)
+        flat = self.rotary_pos_enc.apply_rotary_pos_emb(flat, pos_rep)
+        return flat.view(B, num_nodes, self.num_heads, self.head_dim)
+
+    def _cross_level_qkv_route(self, x, B, num_nodes, node_level, rope_pos, q_shared, k_shared, v_shared):
+        """Route each node through its LEVEL's cross-level projection, returning per-level
+        qx/kx/vx [B,N,H,head_dim] (RoPE applied to qx/kx). Falls back to the already-computed
+        shared q/k/v for any level without its own projection. Each node is projected once."""
+        H, D = self.num_heads, self.head_dim
+        nl = node_level.to(device=x.device, dtype=torch.long)
+        qlist, klist, vlist = self._resolve_xlevel_lists()
+
+        def route(level_list, shared_final, shared_proj, is_qk):
+            # None list => the already-correct shared tensor (RoPE'd for q/k, raw for v).
+            if level_list is None:
+                return shared_final
+            # Match the shared path's (autocast) dtype, not x's, so index_put dtypes align.
+            out = torch.empty(B, num_nodes, H, D, dtype=shared_final.dtype, device=x.device)
+            covered = torch.zeros(num_nodes, dtype=torch.bool, device=x.device)
+            for L in range(len(level_list)):
+                idx = (nl == L).nonzero(as_tuple=False).view(-1)
+                if idx.numel() == 0:
+                    continue
+                out[:, idx] = level_list[L](x[:, idx]).view(B, idx.numel(), H, D)
+                covered[idx] = True
+            if not bool(covered.all()):
+                rest = (~covered).nonzero(as_tuple=False).view(-1)
+                out[:, rest] = shared_proj(x[:, rest]).view(B, rest.numel(), H, D)
+            return self._apply_rope_bnhd(out, rope_pos, B, num_nodes) if is_qk else out
+
+        qx = route(qlist, q_shared, self.q_proj, True)
+        kx = route(klist, k_shared, self.k_proj, True)
+        vx = route(vlist, v_shared, self.v_proj, False)  # value carries no RoPE
+        return qx, kx, vx
 
     def forward(self, x, edge_index, node_level, level_offsets=None, positions=None, edge_attr=None, hqd_edges=None, active_levels=None, input_norm=None, edge_type=None):
         self._last_attention_source_gates = None
@@ -1651,10 +1886,21 @@ class HierarchicalMessagePassing(MessagePassing):
         # fat-QKV the cross-level scatter instead consumes separate WIDE q/k/v (computed in
         # the explicit block below); the chunked fast path can't carry decoupled dims, so we
         # bypass it and fall through to the explicit aggregation.
+        #
+        # Per-level cross-level QKV (cross_level_qkv != "shared"): route each node through its
+        # LEVEL's projection so the CROSS-level paths (chunked / packed / scatter) and the HQD
+        # selector see qx/kx/vx, while the local-window path keeps the shared q/k/v above.
+        # Disabled under fat-QKV (the wide path owns the cross-level q/k/v). qx/kx/vx == q/k/v
+        # when the mode is "shared", so this is bit-identical by default.
+        if (getattr(self, "cross_level_qkv", "shared") != "shared"
+                and not getattr(self, "sparse_wide_enable", False) and self._xlevel_active()):
+            qx, kx, vx = self._cross_level_qkv_route(x, B, num_nodes, node_level, rope_pos, q, k, v)
+        else:
+            qx, kx, vx = q, k, v
         out = None if getattr(self, "sparse_wide_enable", False) else self._sparse_graph_attention_chunked_batched(
-            q=q,
-            k=k,
-            v=v,
+            q=qx,
+            k=kx,
+            v=vx,
             src=src,
             dst=dst,
             node_level=node_level,
@@ -1663,6 +1909,15 @@ class HierarchicalMessagePassing(MessagePassing):
             num_edges=int(num_edges),
         )
         new_edge_attr = None
+        # Tier-3 packed cross-level fast lane (additive, opt-in, scatter stays the default
+        # fallback). Eligible only for the basic backbone case (no edge features/conditioning/
+        # learned edges/trace/witness/fat-QKV); consumes the cross-level qx/kx/vx (== q/k/v
+        # for shared QKV, per-level otherwise) and is mathematically identical to scatter.
+        if out is None and not getattr(self, "sparse_wide_enable", False) and self._cross_level_packed_eligible(edge_attr):
+            _packed = self._cross_level_packed_attention(
+                qx, kx, vx, src, dst, node_level, int(num_nodes), B, self.head_dim, self.head_dim)
+            if _packed is not None:
+                out = self.sparse_out_proj(_packed.reshape(B, int(num_nodes), self.num_heads * self.head_dim))
         if out is None:
             # Fat-QKV: the cross-level scatter aggregation uses its own wide q/k/v so the
             # narrow tensors above remain intact for the flash/sdpa local path. qk_hd/v_hd
@@ -1682,7 +1937,7 @@ class HierarchicalMessagePassing(MessagePassing):
                     qg = qg_flat.view(B, num_nodes, self.num_heads, qk_hd)
                     kg = kg_flat.view(B, num_nodes, self.num_heads, qk_hd)
             else:
-                qg, kg, vg = q, k, v
+                qg, kg, vg = qx, kx, vx
             q_i = qg[:, dst]  # [B, E, H, Dqk]
             k_j = kg[:, src]  # [B, E, H, Dqk]
             v_j = vg[:, src]  # [B, E, H, Dv]
@@ -1826,7 +2081,9 @@ class HierarchicalMessagePassing(MessagePassing):
         hqd_packed_l0 = None
         if hqd_edges is None and self.hqd_runtime_selector is not None:
             with torch.no_grad():
-                selected = self.hqd_runtime_selector(q.detach(), k.detach())
+                # HQD selection (L0 query -> coarse keys) reads the cross-level qx/kx so it
+                # inherits the per-level cross-level projections (== q/k for shared QKV).
+                selected = self.hqd_runtime_selector(qx.detach(), kx.detach())
             if selected is not None:
                 if isinstance(selected, dict):
                     edges = selected.get("edges", None)
@@ -3440,6 +3697,8 @@ class HierarchicalTransformerLayer(nn.Module):
         local_attn_level_role_bias_enable: bool = True,
         local_attn_level_role_bias_scale: float = 1.0,
         local_attn_flash_dtype_cast: bool = False,
+        cross_level_packed: bool = False,
+        cross_level_qkv: str = "shared",
         local_attn_sampled_mode: str = "safe_sdpa",
         sparse_attn_mode: str = "off",
         sparse_attn_chunk_size: int = 0,
@@ -3513,6 +3772,8 @@ class HierarchicalTransformerLayer(nn.Module):
             local_attn_level_role_bias_enable=local_attn_level_role_bias_enable,
             local_attn_level_role_bias_scale=local_attn_level_role_bias_scale,
             local_attn_flash_dtype_cast=local_attn_flash_dtype_cast,
+            cross_level_packed=cross_level_packed,
+            cross_level_qkv=cross_level_qkv,
             local_attn_sampled_mode=local_attn_sampled_mode,
             sparse_attn_mode=sparse_attn_mode,
             sparse_attn_chunk_size=sparse_attn_chunk_size,

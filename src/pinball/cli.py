@@ -260,6 +260,8 @@ def main(argv=None) -> None:
         copy_task_src_len_max=int(getattr(cfg, "copy_task_src_len_max", 64)),
         copy_task_min_gap=int(getattr(cfg, "copy_task_min_gap", 64)),
         copy_task_max_gap=int(getattr(cfg, "copy_task_max_gap", 0)),
+        longctx_diag_every=int(getattr(cfg, "longctx_diag_every", 0) or 0),
+        longctx_diag_max_seqs=int(getattr(cfg, "longctx_diag_max_seqs", 64) or 64),
         modality="text",
     )
 

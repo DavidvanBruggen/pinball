@@ -14,6 +14,12 @@ num_epochs: 100
 samples_per_epoch: 25000 #782 #25000
 gradient_accumulation_steps: 2  # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
+# Long-context diagnostic: every N validations, log next-token PPL bucketed by in-context
+# recurrence distance (never / <128 / 128-511 / 512-2k / >2k). Cheap — reuses the val batches,
+# no extra forward. The split that matters: <128 (inside local window) vs >=128 (needs the
+# hierarchy). 0 = off. longctx_diag_max_seqs caps sequences scanned per run (default 64).
+longctx_diag_every: 1
+# longctx_diag_max_seqs: 64
 # Generation prompt/continuation lengths. gen_prompt_tokens defaults to min(64, block_size//2);
 # raise it for long-range PG19 conditioning (must be <= block_size). Leave sample_prompt unset
 # so the prompt is sampled from held-out val text rather than a fixed short string.

@@ -3484,6 +3484,9 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         force_autoregressive: bool = False,
         use_recurrent: bool = False,
         recurrent_l0_window: Optional[int] = None,
+        use_kv_cache: bool = False,
+        kv_frontier_width: Optional[int] = None,
+        verify_incremental: bool = False,
     ) -> torch.Tensor:
         """
         Generate text with support for different strategies including token imputation.
@@ -3595,7 +3598,10 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
             use_level_prediction=use_level_prediction,
             use_direct_prediction=use_direct_prediction,
             rebuild_graph=rebuild_graph,
-            num_cycles=num_cycles
+            num_cycles=num_cycles,
+            use_kv_cache=use_kv_cache,
+            kv_frontier_width=kv_frontier_width,
+            verify_incremental=verify_incremental,
         )
 
     def _generate_with_autoenc_ar(
