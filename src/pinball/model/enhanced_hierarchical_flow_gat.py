@@ -1659,6 +1659,9 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         logits_last_only: bool = False,  # AR generation: project only the final position
                                   # retrieval: build the bundle from THIS forward's base L3
                                   # (no separate no-grad forward, which perturbs training).
+        logits_last_index: Optional[int] = None,  # frontier-consistent AR gen: project only this
+                                  # position (the true frontier when the input is padded past it),
+                                  # so the padded/settled hierarchy matches the training forward.
     ):
         """
         Args:
@@ -2169,11 +2172,14 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                         and not logits_last_only and not return_hierarchical_features
                         and getattr(self, "_force_decode_head", None) != "ae"):
                     return token_features.reshape(batch_size, seq_len_dense, self.hidden_dim)
-                if logits_last_only:
-                    # AR generation reads only logits[:, -1]; projecting the whole sequence each
-                    # step is O(T*vocab) compute + a [B,T,vocab] tensor (~1.5 GiB at T=4608) wasted.
-                    # Project just the final position -> [B,1,vocab].
-                    logits = self.output_projection(token_features[:, -1:, :]).view(batch_size, 1, -1)
+                if logits_last_only or (logits_last_index is not None):
+                    # AR generation reads only one position's logits; projecting the whole sequence
+                    # each step is O(T*vocab) compute + a [B,T,vocab] tensor (~1.5 GiB at T=4608)
+                    # wasted. Project just that position -> [B,1,vocab]. logits_last_index picks the
+                    # true frontier when the input is padded past it (frontier-consistent decode).
+                    _proj_idx = int(seq_len_dense) - 1 if logits_last_index is None else int(logits_last_index)
+                    _proj_idx = max(0, min(_proj_idx, int(seq_len_dense) - 1))
+                    logits = self.output_projection(token_features[:, _proj_idx:_proj_idx + 1, :]).view(batch_size, 1, -1)
                 else:
                     logits = self.output_projection(token_features).view(batch_size, seq_len_dense, -1)
                 if getattr(self, "_force_decode_head", None) == "ae":
@@ -2250,6 +2256,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 class_labels=class_labels,
                 timesteps=timesteps,
                 logits_last_only=logits_last_only,
+                logits_last_index=logits_last_index,
             )
         # ---
 

@@ -2103,6 +2103,7 @@ class HierarchicalFlowGAT(nn.Module):
         max_seq_len: int = 131072,
         input_mode : str = "tokens",
         tie_weights: bool = True,  # Whether to tie weights between token embedding and output projection
+        gen_frontier_consistent: bool = True,  # AR gen: pad prefix so coarse windows match training
         use_final_layer_for_prediction: bool = True,
         norm_type: str = "layer_norm",  # "layer_norm" or "batch_norm"
         norm_eps: float = 1e-6,
@@ -2126,8 +2127,8 @@ class HierarchicalFlowGAT(nn.Module):
         lap_pe_k: int = 10, # Number of Laplacian eigenvectors for positional encoding
         refinement_style: str = "unified", # Default to new style, "unified" , "iterative_level"
         use_gradient_checkpointing: bool = False,
-        local_connectivity_window_size: int = 4,#0#4  # Size of local connectivity window for dense connections
-        l0_windowgraph: int = 1, # 1 , add dense edges in l0 graph it's k either side, making a window k*2+1 total connectivity
+        local_connectivity_window_size: int = 0,#0#4  # Size of local connectivity window for dense connections
+        l0_windowgraph: int = 0, # 1 , add dense edges in l0 graph it's k either side, making a window k*2+1 total connectivity
         rope_mode: str = "auto",  # "auto" | "1d" | "2d_axial"
         lambda_ce_anchor: float = 0,#0.0,
         use_aux_loss: bool = False, # Whether to compute the hierarchy reconstruction auxiliary loss
@@ -2458,6 +2459,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.input_mode = input_mode # Store input mode
         self.overlap_ratios = overlap_ratios
         self.max_seq_len = max_seq_len
+        self.gen_frontier_consistent = bool(gen_frontier_consistent)
         self.use_final_layer_for_prediction = use_final_layer_for_prediction
         self.add_self_loops = add_self_loops
         self.add_long_range_edges = add_long_range_edges
@@ -12460,6 +12462,26 @@ class HierarchicalFlowGAT(nn.Module):
             logger.info("[KV-CACHE] verify_incremental max|logit err| = %.3e (S1: full-forward path)", max_verify_err)
         return current_ids
 
+    def _gen_frontier_lookahead(self) -> int:
+        """L0 span of a top-level coarse node = how many tokens ahead a coarse window that
+        overlaps the frontier needs before it CLOSES. Padding the AR prefix by this much lets
+        the frontier token see exactly the closed-window coarse context it saw in the training
+        forward (open windows get causal-cut instead of truncated-and-read). Cached."""
+        cached = getattr(self, "_gen_frontier_lookahead_cached", None)
+        if cached is not None:
+            return int(cached)
+        comps = list(getattr(self, "compression_ratios", []) or [])
+        ovs = list(getattr(self, "overlap_ratios", []) or [])
+        stride_l0, window_l0 = 1, 1
+        for i, comp in enumerate(comps):
+            ov = float(ovs[i]) if i < len(ovs) else 0.0
+            node_stride = max(1, int(int(comp) * (1.0 - ov)))
+            window_l0 = (int(comp) - 1) * stride_l0 + window_l0
+            stride_l0 = node_stride * stride_l0
+        look = max(0, int(window_l0) - 1)
+        self._gen_frontier_lookahead_cached = look
+        return look
+
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -12533,21 +12555,43 @@ class HierarchicalFlowGAT(nn.Module):
         if rebuild_graph:
             try:
                 # Rebuild graph approach - most similar to training
+                # Frontier-consistent decode: a raw prefix builds TRUNCATED coarse windows, so the
+                # frontier token reads its own open parent — but in training that parent's full
+                # window extends past it and is causal-cut. Padding the prefix forward by the top-
+                # level window span closes those windows (with causally-invisible pad tokens), so
+                # the frontier sees the SAME closed-window context as training. Verified bit-exact.
+                frontier_consistent = bool(getattr(self, "gen_frontier_consistent", True))
+                pad_id = int(getattr(self, "pad_token_id", None) or getattr(self, "mask_token_id", 0) or 0)
+                lookahead = self._gen_frontier_lookahead() if frontier_consistent else 0
                 for _ in range(max_length):
                     # Check if we've reached maximum sequence length
                     if current_ids.size(1) >= self.max_seq_len:
                         break
-                    
+
                     # Get next token logits by calling forward, completely rebuilding the graph
                     with torch.no_grad():
-                        # Use the forward method directly - like in training
-                        logits = self.forward(
-                            current_ids,
-                            num_cycles=cycles,
-                            use_level_prediction=use_level_prediction,
-                            logits_last_only=True,
-                        )
-                        # Get logits for the last token
+                        cur_len = int(current_ids.size(1))
+                        pad_n = min(lookahead, int(self.max_seq_len) - cur_len)
+                        if frontier_consistent and pad_n > 0:
+                            padded = torch.cat(
+                                [current_ids, torch.full((current_ids.size(0), pad_n), pad_id,
+                                                         dtype=current_ids.dtype, device=current_ids.device)],
+                                dim=1)
+                            logits = self.forward(
+                                padded,
+                                num_cycles=cycles,
+                                use_level_prediction=use_level_prediction,
+                                logits_last_index=cur_len - 1,  # the true frontier, not the padding
+                            )
+                        else:
+                            # Use the forward method directly - like in training
+                            logits = self.forward(
+                                current_ids,
+                                num_cycles=cycles,
+                                use_level_prediction=use_level_prediction,
+                                logits_last_only=True,
+                            )
+                        # Get logits for the last token (projection already returned [B,1,vocab])
                         next_token_logits = logits[:, -1, :]
                     
                     # Use safe sampling method

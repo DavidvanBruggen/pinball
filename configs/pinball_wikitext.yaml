@@ -100,7 +100,7 @@ refinement_style: unified
 unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
-local_connectivity_window_size: 4 # set so graph windows are made dense (k=window_size*2+1) for local connectivity. 0 = sparse only.
+local_connectivity_window_size: 0 # set so graph windows are made dense (k=window_size*2+1) for local connectivity. 0 = sparse only.
 compression_ratios: [16, 4, 4]
 overlap_ratios: [0.5, 0.5, 0.5]
 # Coarse-node seeding (the ORIGINAL design, restored). mask = coarse nodes start as mask
@@ -117,9 +117,16 @@ upper_seed_gate_init: 1.0
 norm_type: layernorm
 dropout: 0.1
 
+# Frontier-consistent AR generation: a raw prefix builds TRUNCATED coarse windows, so the token
+# being predicted reads its own OPEN parent — but in training that parent's full window extends
+# past it and is causal-cut. This pads the prefix forward by the top-level coarse window span
+# (causally-invisible pad tokens) so the frontier sees the SAME closed-window context as training.
+# Verified bit-exact; fixes "generate with only the graph" gibberish. Costs ~span extra tokens/step.
+gen_frontier_consistent: true
+
 # Attention / hierarchy toggles
-attn_backend: pyg        # pyg | flash | sdpa
-qkv_sharing: shared      # shared | separate
+attn_backend: flash        # pyg | flash | sdpa
+qkv_sharing: separate      # shared | separate
 # Tier-3 packed cross-level backbone attention: a dense/batched fast lane for the
 # cross-level message passing (groups each destination's parents into a padded fixed-K
 # block per level, runs [B,Q,K,H,D] attention instead of gather/segment-softmax/scatter).
@@ -272,10 +279,10 @@ hqd_window_bag_routing: per_position # per_position (causal) | global (non-causa
 # global: the shared bag size per level (0 -> 16).
 hqd_window_bag_topk: 0
 
-local_attn_levels: [] # [0, 1, 2, 3]
-local_attn_windows: [] #[128, 128, 128, 128]
-local_attn_causal_levels: [] #[0, 1, 2, 3]
-l0_local_window: 0
+local_attn_levels: [0, 1, 2, 3]
+local_attn_windows: [128, 128, 128, 128]
+local_attn_causal_levels: [0, 1, 2, 3]
+l0_local_window: 128
 
 # Attention-derived edge state.
 use_edge_embedding: false
