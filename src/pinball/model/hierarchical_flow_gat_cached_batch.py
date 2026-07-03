@@ -729,10 +729,21 @@ class HyenaOperator(nn.Module):
         max_decay: float = 6.0,
         dropout: float = 0.0,
         gradient_checkpointing: bool = False,
+        length_invariant: bool = False,
     ):
         super().__init__()
         c = int(channels)
         self.channels = c
+        # length_invariant: absolute sinusoidal positions + a per-channel decay in ABSOLUTE
+        # tokens (learnable inverse time-constant), so h[c,t] depends only on absolute t. This
+        # makes the filter (and thus the past outputs) stable as the sequence GROWS -> safe for
+        # incremental / KV-cache generation. Default False keeps the length-normalized behaviour.
+        self.length_invariant = bool(length_invariant)
+        if self.length_invariant:
+            # per-channel decay rate spread geometrically from ~1/8 (local) to ~1/2048 (global).
+            self.log_inv_tau = nn.Parameter(
+                torch.linspace(math.log(1.0 / 8.0), math.log(1.0 / 2048.0), c)
+            )
         # The FFT (fp32, padded to next_pow2(2T)) materializes large complex tensors at the
         # full sequence length; storing them for backward is the dominant memory cost of a
         # full-length stem. Checkpointing recomputes the FFT in backward instead.
@@ -760,14 +771,26 @@ class HyenaOperator(nn.Module):
         if cached is not None:
             return cached
         L = max(1, int(length))
-        t = torch.linspace(0.0, 1.0, steps=L, device=device, dtype=torch.float32).unsqueeze(-1)  # [L,1]
-        feats = [t]
-        n_freqs = (self.pos_emb_dim - 1) // 2
-        for i in range(n_freqs):
-            freq = (2.0 ** i) * math.pi
-            feats.append(torch.sin(freq * t))
-            feats.append(torch.cos(freq * t))
-        f = torch.cat(feats, dim=-1)  # [L, 1 + 2*n_freqs]
+        if self.length_invariant:
+            # ABSOLUTE sinusoidal features (bounded, length-invariant): position t always maps
+            # to the same feature vector regardless of L.
+            t = torch.arange(L, device=device, dtype=torch.float32).unsqueeze(-1)  # [L,1] absolute
+            feats = []
+            n_freqs = max(1, self.pos_emb_dim // 2)
+            for i in range(n_freqs):
+                freq = 1.0 / (10000.0 ** (2.0 * i / self.pos_emb_dim))
+                feats.append(torch.sin(freq * t))
+                feats.append(torch.cos(freq * t))
+            f = torch.cat(feats, dim=-1)  # [L, 2*n_freqs]
+        else:
+            t = torch.linspace(0.0, 1.0, steps=L, device=device, dtype=torch.float32).unsqueeze(-1)  # [L,1]
+            feats = [t]
+            n_freqs = (self.pos_emb_dim - 1) // 2
+            for i in range(n_freqs):
+                freq = (2.0 ** i) * math.pi
+                feats.append(torch.sin(freq * t))
+                feats.append(torch.cos(freq * t))
+            f = torch.cat(feats, dim=-1)  # [L, 1 + 2*n_freqs]
         if f.size(-1) < self.pos_emb_dim:
             f = F.pad(f, (0, self.pos_emb_dim - f.size(-1)))
         else:
@@ -783,9 +806,15 @@ class HyenaOperator(nn.Module):
         L = max(1, int(length))
         pos = self._pos_features(L, device)            # [L, P]
         h = self.filter_mlp(pos)                       # [L, C]
-        t_norm = torch.linspace(0.0, 1.0, steps=L, device=device, dtype=torch.float32).unsqueeze(-1)  # [L,1]
-        alpha = F.softplus(self.decay_raw).clamp(min=1e-4).unsqueeze(0)  # [1, C]
-        window = torch.exp(-alpha * t_norm)            # [L, C], length-invariant shape
+        if self.length_invariant:
+            # Decay in ABSOLUTE tokens: window[t,c] = exp(-inv_tau_c * t), depends only on t.
+            t_abs = torch.arange(L, device=device, dtype=torch.float32).unsqueeze(-1)  # [L,1]
+            inv_tau = torch.exp(self.log_inv_tau).clamp(min=1e-6, max=1.0).unsqueeze(0)  # [1,C]
+            window = torch.exp(-inv_tau * t_abs)       # [L, C]
+        else:
+            t_norm = torch.linspace(0.0, 1.0, steps=L, device=device, dtype=torch.float32).unsqueeze(-1)  # [L,1]
+            alpha = F.softplus(self.decay_raw).clamp(min=1e-4).unsqueeze(0)  # [1, C]
+            window = torch.exp(-alpha * t_norm)        # [L, C], length-relative shape
         h = h * window
         return h.transpose(0, 1).contiguous()          # [C, L]
 
@@ -831,6 +860,7 @@ class HyenaResBlock1d(nn.Module):
         filter_mlp_dim: int = 64,
         pos_emb_dim: int = 33,
         gradient_checkpointing: bool = False,
+        length_invariant: bool = False,
     ):
         super().__init__()
         c = int(channels)
@@ -838,7 +868,7 @@ class HyenaResBlock1d(nn.Module):
         self.norm2 = ChannelLayerNorm1d(c)
         self.hyena = HyenaOperator(
             c, filter_mlp_dim=filter_mlp_dim, pos_emb_dim=pos_emb_dim, dropout=dropout,
-            gradient_checkpointing=gradient_checkpointing,
+            gradient_checkpointing=gradient_checkpointing, length_invariant=length_invariant,
         )
         # Pointwise position-wise FFN (kernel_size=1 stays causal).
         self.ff1 = CausalConv1d(c, 2 * c, kernel_size=1)
@@ -1568,6 +1598,162 @@ class CausalTokenUNet(nn.Module):
         tokens, context = self.encode(x_bth)
         return self.decode(tokens, context, mode="strict")
 
+
+class CausalDynamicTokenUNet(nn.Module):
+    """True dynamic causal 1D U-Net for token features (drop-in for CausalTokenUNet).
+
+    Unlike the constant-width CausalTokenUNet, this is a PROPER U-Net:
+      - channels GROW at coarser scales (widths[i] = hidden_dim + growth*i, capped) so
+        capacity is invested where multi-token structure lives;
+      - skips are CONCATENATED and fused by a conv (classic U-Net), not added;
+      - a channel-change 1x1 projection precedes each res-block so growth is learned.
+    The graph sits in the bottleneck: encode() downsamples L0 tokens to hidden_dim coarse
+    tokens (fed to the graph), decode() upsamples the refined coarse tokens back to full
+    resolution, fusing the encoder skips around the graph. Everything is CAUSAL (AR-safe:
+    strided causal conv down, nearest up, causal convs). Supports cnn (local causal conv) or
+    hyena (global FFT) blocks. Same encode/decode/decode_dual contract as CausalTokenUNet.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        scale: int = 1,
+        kernel_size: int = 5,
+        dropout: float = 0.0,
+        block: str = "cnn",
+        channel_growth: int = 256,
+        max_channels: int = 0,
+        concat_skips: bool = True,
+        lookahead_enable: bool = False,
+        lookahead_kernel_size: int = 5,
+        lookahead_blocks: int = 2,
+        gradient_checkpointing: bool = False,
+        hyena_length_invariant: bool = False,
+    ):
+        super().__init__()
+        if not _is_power_of_two(int(scale)):
+            raise ValueError(f"CausalDynamicTokenUNet requires scale power-of-two, got {scale}")
+        self.hyena_length_invariant = bool(hyena_length_invariant)
+        self.hidden_dim = int(hidden_dim)
+        self.scale = int(scale)
+        self.n_down = int(math.log2(self.scale))
+        self.concat_skips = bool(concat_skips)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+        block_norm = str(block).lower()
+        if block_norm not in {"cnn", "hyena"}:
+            logger.warning("Unknown CausalDynamicTokenUNet block='%s'; falling back to 'cnn'", block)
+            block_norm = "cnn"
+        self.block = block_norm
+        self.lookahead_enable = bool(lookahead_enable)
+
+        g = max(0, int(channel_growth))
+        mx = int(max_channels) if int(max_channels) > 0 else 2 * self.hidden_dim
+        # widths[i] = channels at encoder level i (0=finest==input, n_down=bottleneck), growing.
+        widths = [min(self.hidden_dim + g * i, mx) for i in range(self.n_down + 1)]
+        widths[0] = self.hidden_dim
+        self.widths = widths
+
+        def _block(ch: int) -> nn.Module:
+            if self.block == "hyena":
+                return HyenaResBlock1d(ch, kernel_size=kernel_size, dropout=dropout,
+                                       gradient_checkpointing=self.gradient_checkpointing,
+                                       length_invariant=self.hyena_length_invariant)
+            return CausalResBlock1d(ch, kernel_size=kernel_size, dropout=dropout)
+
+        def _stage(in_ch: int, out_ch: int) -> nn.ModuleList:
+            # channel-change 1x1 causal proj (learned), then a constant-width res-block.
+            proj = CausalConv1d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+            return nn.ModuleList([proj, _block(out_ch)])
+
+        self.enc_stages = nn.ModuleList([_stage(widths[i], widths[i + 1]) for i in range(self.n_down)])
+        self.downsamplers = nn.ModuleList(
+            [CausalConv1d(widths[i + 1], widths[i + 1], kernel_size=2, stride=2) for i in range(self.n_down)]
+        )
+        self.bottleneck = _stage(widths[self.n_down], widths[self.n_down])
+        # graph runs at hidden_dim: project bottleneck -> hidden_dim (tokens), and back on decode.
+        self.to_tokens = CausalConv1d(widths[self.n_down], self.hidden_dim, kernel_size=1)
+        self.from_tokens = CausalConv1d(self.hidden_dim, widths[self.n_down], kernel_size=1)
+        # up stage i fuses (upsampled widths[i+1]) [+ skip widths[i+1] if concat] -> widths[i].
+        self.up_stages = nn.ModuleList(
+            [_stage(widths[i + 1] * (2 if self.concat_skips else 1), widths[i]) for i in range(self.n_down)]
+        )
+        self.out_norm = ChannelLayerNorm1d(self.hidden_dim)
+        self.out_proj = CausalConv1d(self.hidden_dim, self.hidden_dim, kernel_size=1)
+
+        self.lookahead_refine = nn.ModuleList()
+        if self.lookahead_enable and int(lookahead_blocks) > 0:
+            self.lookahead_refine = nn.ModuleList(
+                [NonCausalResBlock1d(self.hidden_dim, kernel_size=int(lookahead_kernel_size), dropout=dropout)
+                 for _ in range(int(lookahead_blocks))]
+            )
+
+    @staticmethod
+    def _run_stage(stage: nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
+        proj, block = stage
+        return block(proj(x))
+
+    def _resize_to_length(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
+        cur_len = int(x.size(-1))
+        if cur_len == int(target_len):
+            return x
+        if cur_len > int(target_len):
+            return x[..., : int(target_len)]
+        return F.pad(x, (0, int(target_len) - cur_len))
+
+    def encode(self, x_bth: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        if x_bth.dim() != 3:
+            raise ValueError(f"CausalDynamicTokenUNet.encode expects [B,T,H], got {tuple(x_bth.shape)}")
+        x = x_bth.transpose(1, 2).contiguous()  # [B,H,T]
+        skips = []
+        for i in range(self.n_down):
+            x = self._run_stage(self.enc_stages[i], x)
+            skips.append(x)
+            x = self.downsamplers[i](x)
+        x = self._run_stage(self.bottleneck, x)
+        tokens = self.to_tokens(x).transpose(1, 2).contiguous()  # [B,Tc,H]
+        return tokens, {"skips": skips, "target_len": int(x_bth.size(1))}
+
+    def _decode_causal(self, h_bth: torch.Tensor, context: Dict[str, Any]) -> torch.Tensor:
+        if h_bth.dim() != 3:
+            raise ValueError(f"CausalDynamicTokenUNet.decode expects [B,T,H], got {tuple(h_bth.shape)}")
+        x = self.from_tokens(h_bth.transpose(1, 2).contiguous())  # [B, widths[n], Tc]
+        skips = list(context.get("skips", []))
+        for i in range(self.n_down - 1, -1, -1):
+            x = F.interpolate(x, scale_factor=2, mode="nearest")
+            if i < len(skips):
+                x = self._resize_to_length(x, int(skips[i].size(-1)))
+                x = torch.cat([x, skips[i]], dim=1) if self.concat_skips else (x + skips[i])
+            x = self._run_stage(self.up_stages[i], x)
+        target_len = int(context.get("target_len", x.size(-1)))
+        x = self._resize_to_length(x, target_len)
+        x = self.out_proj(F.gelu(self.out_norm(x), approximate="tanh"))
+        return x.transpose(1, 2).contiguous()
+
+    def decode(self, h_bth: torch.Tensor, context: Dict[str, Any], mode: str = "strict") -> torch.Tensor:
+        mode_norm = str(mode).lower()
+        strict = self._decode_causal(h_bth, context)
+        if mode_norm in {"strict", "causal"}:
+            return strict
+        if mode_norm in {"lookahead", "future"}:
+            if not self.lookahead_enable or len(self.lookahead_refine) == 0:
+                return strict
+            x = strict.transpose(1, 2).contiguous()
+            for block in self.lookahead_refine:
+                x = block(x)
+            return x.transpose(1, 2).contiguous()
+        raise ValueError(f"Unknown CausalDynamicTokenUNet decode mode: {mode}")
+
+    def decode_dual(self, h_bth: torch.Tensor, context: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        strict = self.decode(h_bth, context, mode="strict")
+        if not self.lookahead_enable or len(self.lookahead_refine) == 0:
+            return strict, None
+        return strict, self.decode(h_bth, context, mode="lookahead")
+
+    def forward(self, x_bth: torch.Tensor) -> torch.Tensor:
+        tokens, context = self.encode(x_bth)
+        return self.decode(tokens, context, mode="strict")
+
+
 class HierarchyReconHead(nn.Module):
     """
     Reconstruct L0 features from L2/L3 ancestors using only H-sized MLPs.
@@ -1775,6 +1961,7 @@ def _compute_pair_aux_loss(
 def compute_hierarchy_aux_loss(
     g,
     detach_target: bool = True,
+    link_low0: bool = False,      # un-detach ONLY the L0 target (link aux grad -> Hyena pool)
     w_l2_from_l3: float = 1.0,
     w_l1_from_l2: float = 1.0,
     w_l0_from_l1: float = 1.0,
@@ -1806,13 +1993,14 @@ def compute_hierarchy_aux_loss(
         loss_total = loss_total + w_l1_from_l2 * l
 
     # L0 <- L1  (short-range reconstruction)
+    _detach_l0 = detach_target and not link_low0
     if w_l0_from_l1 != 0.0:
-        l = _compute_pair_aux_loss(g, low_level=0, high_level=1, detach_target=detach_target)
+        l = _compute_pair_aux_loss(g, low_level=0, high_level=1, detach_target=_detach_l0)
         loss_total = loss_total + w_l0_from_l1 * l
 
     # L0 <- L3  (long-range “closing the loop”; only has effect if 0–3 edges exist)
     if w_l0_from_l3 != 0.0:
-        l = _compute_pair_aux_loss(g, low_level=0, high_level=3, detach_target=detach_target)
+        l = _compute_pair_aux_loss(g, low_level=0, high_level=3, detach_target=_detach_l0)
         loss_total = loss_total + w_l0_from_l3 * l
 
     return loss_total
@@ -1914,7 +2102,7 @@ class HierarchicalFlowGAT(nn.Module):
         overlap_ratios: list = [0.5, 0.5, 0.5],
         max_seq_len: int = 131072,
         input_mode : str = "tokens",
-        tie_weights: bool = True,  # Whether to tie weights between token embedding and output projection                          
+        tie_weights: bool = True,  # Whether to tie weights between token embedding and output projection
         use_final_layer_for_prediction: bool = True,
         norm_type: str = "layer_norm",  # "layer_norm" or "batch_norm"
         norm_eps: float = 1e-6,
@@ -1929,11 +2117,17 @@ class HierarchicalFlowGAT(nn.Module):
         share_transformers: bool = True,  # Option to share transformer layers
         num_refinement_layers: int = 2, # For unified style when share=False
         per_level_local_qkv: bool = False,  # per-level intra-level Q/K/V in refinement layers (backbone QKV stays shared)
+        per_level_ffn_dims: Optional[List[int]] = None,  # per-level FFN processing dim (U-Net-style: L0 small, coarse big)
+        per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
+        local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up-project local attn to this head_dim (narrow residual)
+        upper_init: str = "mask",  # "mask" | "zeros" | "pooled": how coarse (L1+) nodes are seeded at input
+        upper_seed_gate_init: float = 1.0,  # pooled seed blend gate init (0 = exact mask init, warm-start safe)
+        witness_reuse: str = "layer",  # "layer" = rebuild witness table per HQD layer; "step" = build once per forward
         lap_pe_k: int = 10, # Number of Laplacian eigenvectors for positional encoding
         refinement_style: str = "unified", # Default to new style, "unified" , "iterative_level"
         use_gradient_checkpointing: bool = False,
-        local_connectivity_window_size: int = 0,#0#4  # Size of local connectivity window for dense connections
-        l0_windowgraph: int = 0, # 1 , add dense edges in l0 graph it's k either side, making a window k*2+1 total connectivity
+        local_connectivity_window_size: int = 4,#0#4  # Size of local connectivity window for dense connections
+        l0_windowgraph: int = 1, # 1 , add dense edges in l0 graph it's k either side, making a window k*2+1 total connectivity
         rope_mode: str = "auto",  # "auto" | "1d" | "2d_axial"
         lambda_ce_anchor: float = 0,#0.0,
         use_aux_loss: bool = False, # Whether to compute the hierarchy reconstruction auxiliary loss
@@ -1942,6 +2136,7 @@ class HierarchicalFlowGAT(nn.Module):
         hier_aux_predictor_type: str = "mlp",  # "linear" | "mlp"
         hier_aux_loss_mode: str = "mse",  # "mse" | "mse_norm" | "cosine"
         hier_aux_detach_target: bool = True,
+        hier_aux_link_l0_target: bool = False,  # un-detach ONLY the L0 (Hyena-pooled) aux target
         hier_aux_unit_norm: bool = False,
         hier_aux_w_l2_from_l3: float = 1.0,
         hier_aux_w_l1_from_l2: float = 1.0,
@@ -2087,6 +2282,11 @@ class HierarchicalFlowGAT(nn.Module):
         token_unet_lookahead_kernel_size: int = 5,
         token_unet_lookahead_blocks: int = 2,
         token_unet_block: str = "cnn",  # "cnn" (local causal conv) | "hyena" (global FFT long conv)
+        token_unet_dynamic: bool = False,   # true = channel-growing concat-skip causal U-Net
+        token_unet_channel_growth: int = 256,  # +channels per downsample level (dynamic U-Net)
+        token_unet_max_channels: int = 0,   # cap on U-Net channels (0 => 2*hidden_dim)
+        token_unet_concat_skips: bool = True,  # concat (true) vs additive (false) skips
+        token_unet_hyena_length_invariant: bool = False,  # absolute-position Hyena (gen-stable)
         graph_geometry_mode: str = "sequence",  # "sequence" | "grid2d"
         graph_grid_height: int = 0,
         graph_grid_width: int = 0,
@@ -2167,6 +2367,7 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_debug: bool = False,
         hqd_granularity: str = "per_layer",
         hqd_every_n: int = -1,
+        hqd_every_n_offset: int = 0,
         hqd_reuse_previous: bool = False,
         hqd_reuse_max_age: int = 0,
         hqd_query_chunk_size: int = 524288,
@@ -2269,6 +2470,9 @@ class HierarchicalFlowGAT(nn.Module):
         self.share_transformers = share_transformers # Store even if only used by unified
         self.num_refinement_layers = num_refinement_layers # Store even if only used by unified
         self.per_level_local_qkv = bool(per_level_local_qkv)
+        self.per_level_ffn_dims = [int(d) for d in (per_level_ffn_dims or [])]
+        self.per_level_attn_mult = [float(m) for m in (per_level_attn_mult or [])]
+        self.local_attn_head_dim = int(local_attn_head_dim)
         self.lap_pe_k = lap_pe_k
         self.refinement_style = refinement_style
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -2418,6 +2622,7 @@ class HierarchicalFlowGAT(nn.Module):
             hier_aux_loss_mode_norm = "mse"
         self.hier_aux_loss_mode = hier_aux_loss_mode_norm
         self.hier_aux_detach_target = bool(hier_aux_detach_target)
+        self.hier_aux_link_l0_target = bool(hier_aux_link_l0_target)
         self.hier_aux_unit_norm = bool(hier_aux_unit_norm)
         self.hier_aux_w_l2_from_l3 = float(hier_aux_w_l2_from_l3)
         self.hier_aux_w_l1_from_l2 = float(hier_aux_w_l1_from_l2)
@@ -2716,6 +2921,10 @@ class HierarchicalFlowGAT(nn.Module):
         if self.hqd_every_n == 0:
             logger.warning("hqd_every_n=0 is invalid; disabling every-N scheduling (use hqd_granularity instead).")
             self.hqd_every_n = -1
+        # Shift the every-N schedule: HQD runs at layers offset, offset+n, ... With the
+        # backbone witness source, offset >= 1 means every HQD layer already has a packed-
+        # lane capture from an earlier layer this forward — no recompute fallback at layer 0.
+        self.hqd_every_n_offset = max(0, int(hqd_every_n_offset))
         self.hqd_reuse_previous = bool(hqd_reuse_previous)
         self.hqd_reuse_max_age = max(0, int(hqd_reuse_max_age))
         self.hqd_query_chunk_size = max(1, int(hqd_query_chunk_size))
@@ -2742,8 +2951,18 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_graph_witness_topk = max(1, int(hqd_graph_witness_topk))
         self.hqd_packed_witness_read = bool(hqd_packed_witness_read)
         _packed_src = str(hqd_packed_witness_source).strip().lower()
-        self.hqd_packed_witness_source = _packed_src if _packed_src in {"graph", "recompute"} else "graph"
+        self.hqd_packed_witness_source = _packed_src if _packed_src in {"graph", "recompute", "backbone"} else "graph"
         self.hqd_packed_witness_chunk_size = max(1, int(hqd_packed_witness_chunk_size))
+        if (
+            self.hqd_packed_witness_source == "backbone"
+            and getattr(self, "hierarchical_query_descent_enable", False)
+            and not bool(cross_level_packed)
+        ):
+            logger.warning(
+                "hqd_packed_witness_source=backbone harvests witnesses from the packed "
+                "cross-level lane, which needs cross_level_packed=true; witness builds "
+                "will fall back to the recompute path until it is enabled."
+            )
 
         # Witness packets (see _build_witness_l0_ids). Active only when HQD is enabled,
         # query_level == 0, and at least one of summary/rare is on.
@@ -2805,6 +3024,11 @@ class HierarchicalFlowGAT(nn.Module):
         self.token_unet_lookahead_kernel_size = int(token_unet_lookahead_kernel_size)
         self.token_unet_lookahead_blocks = int(token_unet_lookahead_blocks)
         self.token_unet_block = str(token_unet_block).lower()
+        self.token_unet_dynamic = bool(token_unet_dynamic)
+        self.token_unet_channel_growth = int(token_unet_channel_growth)
+        self.token_unet_max_channels = int(token_unet_max_channels)
+        self.token_unet_concat_skips = bool(token_unet_concat_skips)
+        self.token_unet_hyena_length_invariant = bool(token_unet_hyena_length_invariant)
         self.rgb_token_unet_enable = bool(rgb_token_unet_enable)
         self.rgb_token_unet_downsample = max(1, int(rgb_token_unet_downsample))
         self.rgb_token_unet_base_channels = max(16, int(rgb_token_unet_base_channels))
@@ -2891,6 +3115,22 @@ class HierarchicalFlowGAT(nn.Module):
                     lookahead_kernel_size=self.token_unet_lookahead_kernel_size,
                     lookahead_blocks=self.token_unet_lookahead_blocks,
                     causal=self.token_unet_2d_causal,
+                )
+            elif bool(getattr(self, "token_unet_dynamic", False)):
+                self.token_unet = CausalDynamicTokenUNet(
+                    hidden_dim=self.hidden_dim,
+                    scale=self.token_unet_scale,
+                    kernel_size=self.token_unet_kernel_size,
+                    dropout=self.token_unet_dropout,
+                    block=self.token_unet_block,
+                    channel_growth=int(getattr(self, "token_unet_channel_growth", 256)),
+                    max_channels=int(getattr(self, "token_unet_max_channels", 0)),
+                    concat_skips=bool(getattr(self, "token_unet_concat_skips", True)),
+                    lookahead_enable=self.token_unet_lookahead_decode_enable,
+                    lookahead_kernel_size=self.token_unet_lookahead_kernel_size,
+                    lookahead_blocks=self.token_unet_lookahead_blocks,
+                    gradient_checkpointing=bool(getattr(self, "use_gradient_checkpointing", False)),
+                    hyena_length_invariant=bool(getattr(self, "token_unet_hyena_length_invariant", False)),
                 )
             else:
                 self.token_unet = CausalTokenUNet(
@@ -3058,6 +3298,9 @@ class HierarchicalFlowGAT(nn.Module):
                         use_edge_attr=self.use_edge_attr,
                         per_level_local_qkv=self.per_level_local_qkv,
                         num_local_levels=int(getattr(self, "num_hier_levels", 4)),
+                        per_level_ffn_dims=self.per_level_ffn_dims,
+                        per_level_attn_mult=self.per_level_attn_mult,
+                        local_attn_head_dim=int(getattr(self, "local_attn_head_dim", 0)),
                         learn_edge_from_attn=self.learn_edge_from_attn,
                         max_seq_len=self.max_seq_len,
                         l0_local_backend=self.l0_local_backend,
@@ -3249,6 +3492,23 @@ class HierarchicalFlowGAT(nn.Module):
         self.level_projections = nn.ModuleList()
         for _ in range(len(compression_ratios)):
             self.level_projections.append(nn.Linear(hidden_dim, hidden_dim))
+
+        # Pooled coarse seeding: instead of mask-initializing L1+ nodes, seed each coarse node
+        # with the (level-projected) mean of its child window, blended by a learnable per-level
+        # gate: seed = base + gate * (pooled - base). gate=0 reproduces mask init exactly.
+        # Causal: a coarse node's ar_time is its child window's END, so pooling the full window
+        # reveals nothing a reader could not already see through the causal upward edges.
+        self.witness_reuse = str(witness_reuse).lower()
+        if self.witness_reuse not in ("layer", "step"):
+            raise ValueError("witness_reuse must be 'layer' or 'step'")
+        self.upper_init = str(upper_init).lower()
+        if self.upper_init not in ("mask", "zeros", "pooled"):
+            raise ValueError("upper_init must be 'mask', 'zeros' or 'pooled'")
+        if self.upper_init == "pooled":
+            self.upper_seed_gates = nn.Parameter(
+                torch.full((len(compression_ratios),), float(upper_seed_gate_init))
+            )
+        self._pooled_seed_idx_cache: Dict[tuple, list] = {}
         
         # Output projection for token prediction
         #self.output_projection = nn.Linear(hidden_dim, vocab_size)
@@ -4359,6 +4619,69 @@ class HierarchicalFlowGAT(nn.Module):
              logger.warning(f"No transformers defined for level {level_idx} in _process_level.")
         return graph
     
+    def _pooled_seed_indices(self, level_sizes: List[int], device: torch.device) -> list:
+        """Cached (child_idx, parent_idx, counts) per level for the pooled coarse seed.
+
+        Mirrors the 1D window rule of _create_next_level: stride = comp*(1-overlap),
+        parent i covers children [min(i*stride, n_lower-1), min(start+comp, n_lower)).
+        """
+        key = (tuple(int(s) for s in level_sizes), device.type, device.index)
+        hit = self._pooled_seed_idx_cache.get(key)
+        if hit is not None:
+            return hit
+        out = []
+        for lvl in range(1, len(level_sizes)):
+            n_lower = int(level_sizes[lvl - 1])
+            n_higher = int(level_sizes[lvl])
+            comp = int(self.compression_ratios[lvl - 1])
+            stride = max(1, int(comp * (1 - self.overlap_ratios[lvl - 1])))
+            child_list, parent_list = [], []
+            for i in range(n_higher):
+                start = min(i * stride, n_lower - 1)
+                end = max(min(start + comp, n_lower), start + 1)
+                child_list.append(torch.arange(start, end, dtype=torch.long))
+                parent_list.append(torch.full((end - start,), i, dtype=torch.long))
+            child_idx = torch.cat(child_list).to(device)
+            parent_idx = torch.cat(parent_list).to(device)
+            counts = torch.bincount(parent_idx, minlength=n_higher).clamp_min(1).to(device)
+            out.append((child_idx, parent_idx, counts))
+        if len(self._pooled_seed_idx_cache) > 16:
+            self._pooled_seed_idx_cache.clear()
+        self._pooled_seed_idx_cache[key] = out
+        return out
+
+    def _apply_pooled_upper_seed(self, x_cat: torch.Tensor, level_sizes: List[int]) -> torch.Tensor:
+        """Seed coarse levels bottom-up with gated, level-projected child-window means.
+
+        x_cat: [B, N_total, H] with the L0 slice already holding per-sample token embeddings
+        and the coarse slices holding the base init (mask/zeros). Only the main hierarchy
+        slices (first sum(level_sizes) nodes) are touched; appended AE decoder nodes keep
+        their base init. seed = base + gate_l * (pooled - base); gate=0 == old behaviour.
+        """
+        idx_per_level = self._pooled_seed_indices(level_sizes, x_cat.device)
+        offsets = [0]
+        for s in level_sizes:
+            offsets.append(offsets[-1] + int(s))
+        B, _, H = x_cat.shape
+        for lvl in range(1, len(level_sizes)):
+            child_idx, parent_idx, counts = idx_per_level[lvl - 1]
+            lower = x_cat[:, offsets[lvl - 1] : offsets[lvl], :]
+            projected = self.level_projections[lvl - 1](lower.index_select(1, child_idx))
+            pooled = projected.new_zeros(B, int(level_sizes[lvl]), H)
+            pooled.index_add_(1, parent_idx, projected)
+            pooled = pooled / counts.view(1, -1, 1).to(dtype=pooled.dtype)
+            base = x_cat[:, offsets[lvl] : offsets[lvl + 1], :]
+            gate = self.upper_seed_gates[lvl - 1].to(dtype=pooled.dtype)
+            x_cat = torch.cat(
+                [
+                    x_cat[:, : offsets[lvl], :],
+                    base + gate * (pooled - base),
+                    x_cat[:, offsets[lvl + 1] :, :],
+                ],
+                dim=1,
+            )
+        return x_cat
+
     def _create_next_level(self, lower_graph, level_idx, compression_ratio, overlap_ratio):
         """
         Create the next level in the hierarchy based on processed lower level.
@@ -5106,7 +5429,7 @@ class HierarchicalFlowGAT(nn.Module):
                 return torch.empty((0, unified_x.size(1)), device=device, dtype=unified_x.dtype)
             use_mask = (
                 getattr(self, "input_mode", "tokens") == "tokens"
-                and getattr(self, "upper_init", "mask") == "mask"
+                and getattr(self, "upper_init", "mask") in ("mask", "pooled")
                 and getattr(self, "mask_token_id", None) is not None
             )
             if use_mask:
@@ -5752,6 +6075,15 @@ class HierarchicalFlowGAT(nn.Module):
             return ((1.0 - cos) * 0.5).mean()
         return F.mse_loss(pred, target, reduction="mean")
 
+    def _hier_aux_should_detach(self, low_level: int) -> bool:
+        """Whether the aux reconstruction TARGET for this level is stop-grad. Default True
+        (JEPA anti-collapse). `hier_aux_link_l0_target` un-detaches ONLY the L0 target so the
+        aux gradient flows into the L0 (Hyena-pooled) features — a direct link of the aux
+        objective to the Hyena pooling, while L1/L2/L3 stay detached to limit collapse risk."""
+        if int(low_level) == 0 and bool(getattr(self, "hier_aux_link_l0_target", False)):
+            return False
+        return bool(getattr(self, "hier_aux_detach_target", True))
+
     def _compute_hier_aux_pair_loss_jepa(
         self,
         g,
@@ -5806,7 +6138,7 @@ class HierarchicalFlowGAT(nn.Module):
         predictor = predictors[predictor_key]
         pred = predictor(pred_context)
         target = x[low_mask]
-        if bool(getattr(self, "hier_aux_detach_target", True)):
+        if self._hier_aux_should_detach(low_level):
             target = target.detach()
 
         return self._compute_hier_aux_pair_loss(pred, target)
@@ -5858,7 +6190,7 @@ class HierarchicalFlowGAT(nn.Module):
 
         pred = agg[low_mask] / cnt[low_mask].clamp_min(1.0)
         target = x[low_mask]
-        if bool(getattr(self, "hier_aux_detach_target", True)):
+        if self._hier_aux_should_detach(low_level):
             target = target.detach()
 
         return self._compute_hier_aux_pair_loss(pred, target)
@@ -5871,6 +6203,7 @@ class HierarchicalFlowGAT(nn.Module):
                 return compute_hierarchy_aux_loss(
                     g,
                     detach_target=bool(getattr(self, "hier_aux_detach_target", True)),
+                    link_low0=bool(getattr(self, "hier_aux_link_l0_target", False)),
                     w_l2_from_l3=float(getattr(self, "hier_aux_w_l2_from_l3", 1.0)),
                     w_l1_from_l2=float(getattr(self, "hier_aux_w_l1_from_l2", 1.0)),
                     w_l0_from_l1=float(getattr(self, "hier_aux_w_l0_from_l1", 1.0)),
@@ -8002,11 +8335,24 @@ class HierarchicalFlowGAT(nn.Module):
         N = int(key_bank.size(1))
         head_dim = max(1, int(query_vec.size(-1)))
         num_heads = max(1, int(query_vec.size(-2)))
-        flat_key_bank = key_bank.reshape(B * N, num_heads, head_dim)
-        batch_offsets = (torch.arange(B, device=safe_nodes.device, dtype=torch.long).view(B, 1, 1) * N)
-        gather_idx = (safe_nodes + batch_offsets).reshape(-1)
-        cand_keys = flat_key_bank.index_select(0, gather_idx).view(*safe_nodes.shape, num_heads, head_dim)
-        scores = torch.einsum("bqhd,bqnhd->bqn", query_vec, cand_keys)
+        Q = int(safe_nodes.size(1))
+        n_cand = int(safe_nodes.size(-1))
+        # The head-summed score is one full-width dot product per (query, candidate). Gathering
+        # per-candidate KEY VECTORS ([B,Q,n,H,D] — gigabytes of traffic) to einsum them is far
+        # slower than one dense GEMM over the whole bank ([B,Q,N] scores) + a score gather,
+        # whenever the dense score matrix is affordable and the vector gather would move more.
+        use_dense = (B * Q * N) <= 128_000_000 and (n_cand * num_heads * head_dim) > (2 * N)
+        if use_dense:
+            q_flat = query_vec.reshape(B, Q, num_heads * head_dim)
+            k_flat = key_bank.reshape(B, N, num_heads * head_dim)
+            dense = torch.bmm(q_flat, k_flat.transpose(1, 2))  # [B, Q, N]
+            scores = dense.gather(-1, safe_nodes)
+        else:
+            flat_key_bank = key_bank.reshape(B * N, num_heads, head_dim)
+            batch_offsets = (torch.arange(B, device=safe_nodes.device, dtype=torch.long).view(B, 1, 1) * N)
+            gather_idx = (safe_nodes + batch_offsets).reshape(-1)
+            cand_keys = flat_key_bank.index_select(0, gather_idx).view(*safe_nodes.shape, num_heads, head_dim)
+            scores = torch.einsum("bqhd,bqnhd->bqn", query_vec, cand_keys)
         scores = scores / float(num_heads * math.sqrt(float(head_dim)))
         scores = scores.masked_fill(~candidate_mask, float("-inf"))
 
@@ -8106,11 +8452,25 @@ class HierarchicalFlowGAT(nn.Module):
         surprise = torch.zeros(B, N, device=device, dtype=x_bnh.dtype)
         if edge_index is None or edge_index.numel() == 0:
             return surprise
-        src, dst = edge_index
-        mask_lh = (node_level[src] == 0) & (node_level[dst] == 1)
-        mask_hl = (node_level[src] == 1) & (node_level[dst] == 0)
-        child_idx = torch.cat([src[mask_lh], dst[mask_hl]], dim=0)   # L0 nodes
-        parent_idx = torch.cat([dst[mask_lh], src[mask_hl]], dim=0)  # L1 nodes
+        # The L0<->L1 edge extraction is pure topology — cache it per edge tensor (static
+        # skeleton) instead of re-scanning every HQD layer.
+        cache_key = (edge_index.data_ptr(), int(edge_index.size(1)), int(N), str(device))
+        cache = getattr(self, "_witness_surprise_idx_cache", None)
+        if cache is None:
+            cache = {}
+            self._witness_surprise_idx_cache = cache
+        hit = cache.get(cache_key)
+        if hit is None:
+            src, dst = edge_index
+            mask_lh = (node_level[src] == 0) & (node_level[dst] == 1)
+            mask_hl = (node_level[src] == 1) & (node_level[dst] == 0)
+            child_idx = torch.cat([src[mask_lh], dst[mask_hl]], dim=0)   # L0 nodes
+            parent_idx = torch.cat([dst[mask_lh], src[mask_hl]], dim=0)  # L1 nodes
+            if len(cache) > 8:
+                cache.clear()
+            cache[cache_key] = (child_idx, parent_idx)
+        else:
+            child_idx, parent_idx = hit
         if child_idx.numel() == 0:
             return surprise
         agg = torch.zeros(B, N, H, device=device, dtype=x_bnh.dtype)
@@ -8157,9 +8517,55 @@ class HierarchicalFlowGAT(nn.Module):
     ) -> Optional[torch.Tensor]:
         """Build a [B, N, slots] L0-id bag table (-1 padded), populating the rows of each
         parent level in self.witness_levels. L1 uses its direct L0 children; L2/L3 compose
-        their full L0 descendant set (cross-level bags). None if nothing to build."""
+        their full L0 descendant set (cross-level bags). None if nothing to build.
+
+        witness_reuse == "step": build once per forward (first HQD layer) and reuse across
+        the step's remaining HQD layers — q/k drift slowly layer-to-layer and witness
+        selection is a coarse top-k, so the table is stable; this cuts the per-layer rebuild
+        to one. Ids are Long (no autograd); under gradient checkpointing the recompute hits
+        the same epoch -> identical table -> consistent recomputed activations.
+
+        hqd_packed_witness_source == "backbone": compose the table from the packed
+        cross-level lane's captured direct-child attention top-k (near-free — the scores
+        were already computed by the backbone) instead of re-scoring descendants with the
+        current q/k. Requires cross_level_packed; falls back to the recompute build until
+        the first capture of the forward lands (e.g. the layer-0 HQD build). Backbone
+        tables are ALWAYS step-cached (keyed on the forward epoch): the capture comes from
+        one specific earlier layer anyway, and under gradient checkpointing the epoch-keyed
+        cache keeps recomputed activations identical."""
         B, N = int(q_all.size(0)), int(q_all.size(1))
         device = q_all.device
+        epoch = int(getattr(self, "_witness_build_epoch", -1))
+        latest = getattr(self, "_backbone_witness_latest", None)
+        use_backbone = (
+            str(getattr(self, "hqd_packed_witness_source", "graph")).lower() == "backbone"
+            and not bool(self.summary_witness_per_head)  # capture is head-averaged
+            and latest is not None
+            and int(latest[0]) == epoch
+            and isinstance(latest[1], dict)
+            and isinstance(latest[2], dict)
+        )
+        mode = "backbone" if use_backbone else "recompute"
+        if use_backbone or str(getattr(self, "witness_reuse", "layer")).lower() == "step":
+            key = (mode, epoch, B, N, str(device))
+            cached = getattr(self, "_witness_table_step_cache", None)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+        else:
+            key = None
+        if use_backbone:
+            out = self._build_witness_l0_ids_backbone(
+                cap_ids=latest[1], cap_scores=latest[2],
+                level_indices=level_indices, node_ar_time=node_ar_time,
+                x_bnh=x_bnh, node_level=node_level, edge_index=edge_index,
+                allow_same_time=allow_same_time, causal=causal,
+            )
+            if out is not None:
+                if key is not None:
+                    self._witness_table_step_cache = (key, out)
+                return out
+            # Composition failed (e.g. a witness level missing from the capture) ->
+            # fall through to the recompute build for this call.
         out: Optional[torch.Tensor] = None
         for level in self.witness_levels:
             if int(level) == 1:
@@ -8192,6 +8598,130 @@ class HierarchicalFlowGAT(nn.Module):
                     out = torch.cat([out, torch.full((B, N, w - out.size(-1)), -1, dtype=torch.long, device=device)], dim=-1)
                 if slots < w:
                     packed = torch.cat([packed, torch.full((B, int(parent_ids.numel()), w - slots), -1, dtype=torch.long, device=device)], dim=-1)
+            out.index_copy_(1, parent_ids, packed)
+        if key is not None:
+            self._witness_table_step_cache = (key, out)
+        return out
+
+    def _build_witness_l0_ids_backbone(
+        self,
+        cap_ids: Dict[int, torch.Tensor],
+        cap_scores: Dict[int, torch.Tensor],
+        level_indices: Dict[int, torch.Tensor],
+        node_ar_time: Optional[torch.Tensor],
+        x_bnh: torch.Tensor,
+        node_level: torch.Tensor,
+        edge_index: torch.Tensor,
+        allow_same_time: bool,
+        causal: bool,
+    ) -> Optional[torch.Tensor]:
+        """Witness table from the packed backbone's captured attention (see
+        _build_witness_l0_ids). A parent's L0 bag is a beam over the captured
+        per-level direct-child top-k: an L3 row's top L2 children -> their top L1
+        children -> their top L0 children, ranked by the summed attention logits
+        along the path. Summary slots take the beam top-k; rare slots re-rank with
+        the detached surprise term (parity with the recompute build). Returns
+        [B, N, slots] (-1 padded) or None if a needed capture level is missing."""
+        B, N, _ = x_bnh.shape
+        device = x_bnh.device
+        k_sum = int(self.witness_k_summary) if self.use_summary_witnesses else 0
+        k_rare = int(self.witness_k_rare) if self.use_rare_witnesses else 0
+        slots = k_sum + k_rare
+        if slots == 0:
+            return None
+        neg = torch.finfo(torch.float32).min
+
+        def _hop(ids: torch.Tensor, sc: torch.Tensor, tbl_ids: torch.Tensor, tbl_sc: torch.Tensor):
+            # Expand each candidate by its captured children: [B,P,W] -> [B,P,W*k].
+            Kb = int(tbl_ids.size(-1))
+            P, W = int(ids.size(1)), int(ids.size(2))
+            off = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1) * N
+            gi = (ids.clamp(min=0) + off).reshape(-1)
+            nxt = tbl_ids.reshape(B * N, Kb).index_select(0, gi).view(B, P, W, Kb)
+            nsc = tbl_sc.reshape(B * N, Kb).index_select(0, gi).view(B, P, W, Kb).float()
+            ok = (ids >= 0).unsqueeze(-1) & (nxt >= 0)
+            nsc = torch.where(ok, sc.unsqueeze(-1) + nsc, torch.full_like(nsc, neg))
+            nxt = torch.where(ok, nxt, torch.full_like(nxt, -1))
+            return nxt.reshape(B, P, W * Kb), nsc.reshape(B, P, W * Kb)
+
+        out: Optional[torch.Tensor] = None
+        surprise: Optional[torch.Tensor] = None
+        t_all = None
+        if causal and node_ar_time is not None and node_ar_time.numel() >= N:
+            t_all = node_ar_time.to(device=device, dtype=torch.long)
+        for level in self.witness_levels:
+            L = int(level)
+            if any(l not in cap_ids or l not in cap_scores for l in range(1, L + 1)):
+                return None
+            parent_ids = level_indices.get(L) if isinstance(level_indices, dict) else None
+            if parent_ids is None or parent_ids.numel() == 0:
+                parent_ids = torch.nonzero(node_level == L, as_tuple=False).view(-1)
+            if parent_ids.numel() == 0:
+                continue
+            parent_ids = parent_ids.to(device=device, dtype=torch.long)
+            P = int(parent_ids.numel())
+            ids = cap_ids[L].index_select(1, parent_ids)            # [B, P, k]
+            sc = cap_scores[L].index_select(1, parent_ids).float()
+            sc = torch.where(ids >= 0, sc, torch.full_like(sc, neg))
+            for lvl in range(L - 1, 0, -1):                          # chain down to L0
+                ids, sc = _hop(ids, sc, cap_ids[lvl], cap_scores[lvl])
+            W = int(ids.size(-1))
+            valid = ids >= 0
+            if t_all is not None:
+                pt = t_all.index_select(0, parent_ids).view(1, P, 1)
+                ct = t_all[ids.clamp(min=0)]
+                valid = valid & ((ct <= pt) if allow_same_time else (ct < pt))
+            sc = torch.where(valid, sc, torch.full_like(sc, neg))
+            # Beam paths overlap (a node can be reached via several parents at a
+            # hop) — suppress all but the best-scoring occurrence of each id so the
+            # top-k budget goes to unique witnesses (same trick as the per_head cap).
+            eq = ids.unsqueeze(-1) == ids.unsqueeze(-2)              # [B, P, W, W]
+            ar = torch.arange(W, device=device)
+            k_lt_j = ar.unsqueeze(0) < ar.unsqueeze(1)
+            beaten = eq & ((sc.unsqueeze(-2) > sc.unsqueeze(-1)) |
+                           ((sc.unsqueeze(-2) == sc.unsqueeze(-1)) & k_lt_j))
+            sc = torch.where(beaten.any(dim=-1), torch.full_like(sc, neg), sc)
+            valid = valid & (sc > (neg * 0.5))
+
+            id_parts: List[torch.Tensor] = []
+            score_parts: List[torch.Tensor] = []
+            if k_sum > 0:
+                vals, idx = torch.topk(sc, k=min(k_sum, W), dim=-1)
+                picked = ids.gather(-1, idx)
+                id_parts.append(torch.where(vals > (neg * 0.5), picked, torch.full_like(picked, -1)))
+                score_parts.append(vals)
+            if k_rare > 0:
+                if surprise is None:
+                    surprise = self._witness_l0_surprise(x_bnh, node_level, edge_index)  # [B, N]
+                s_c = surprise.gather(1, ids.clamp(min=0).reshape(B, -1)).view(B, P, W).float()
+                vf = valid.float()
+                denom = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                mean_s = (s_c * vf).sum(dim=-1, keepdim=True) / denom
+                var_s = (((s_c - mean_s) ** 2) * vf).sum(dim=-1, keepdim=True) / denom
+                norm_s = (s_c - mean_s) / (var_s.sqrt() + 1e-5)
+                rare = torch.where(valid, sc + float(self.witness_lambda_rare) * norm_s,
+                                   torch.full_like(sc, neg))
+                vals, idx = torch.topk(rare, k=min(k_rare, W), dim=-1)
+                picked = ids.gather(-1, idx)
+                id_parts.append(torch.where(vals > (neg * 0.5), picked, torch.full_like(picked, -1)))
+                score_parts.append(vals)
+            packed = torch.cat(id_parts, dim=-1)
+            cap = int(getattr(self, "witness_max_per_parent", 0))
+            if cap > 0 and cap < packed.size(-1):
+                sp = torch.cat(score_parts, dim=-1)
+                sp = torch.where(packed >= 0, sp, torch.full_like(sp, neg))
+                top_v, top_i = torch.topk(sp, k=cap, dim=-1)
+                packed = packed.gather(-1, top_i)
+                packed = torch.where(top_v > (neg * 0.5), packed, torch.full_like(packed, -1))
+            width = int(packed.size(-1))
+            if out is None:
+                out = torch.full((B, N, width), -1, dtype=torch.long, device=device)
+            elif width != out.size(-1):
+                w = max(width, out.size(-1))
+                if out.size(-1) < w:
+                    out = torch.cat([out, torch.full((B, N, w - out.size(-1)), -1, dtype=torch.long, device=device)], dim=-1)
+                if width < w:
+                    packed = torch.cat([packed, torch.full((B, P, w - width), -1, dtype=torch.long, device=device)], dim=-1)
             out.index_copy_(1, parent_ids, packed)
         return out
 
@@ -8233,8 +8763,17 @@ class HierarchicalFlowGAT(nn.Module):
         child_safe = children.clamp(min=0)                     # [P, C]
         child_valid = children >= 0                            # [P, C]
         q_p = q_all.index_select(1, parent_ids)                # [B, P, Hh, Dh]
-        k_c = k_all.index_select(1, child_safe.reshape(-1)).view(B, P, C, Hh, Dh)
-        score_heads = torch.einsum("bphd,bpchd->bpch", q_p, k_c) / math.sqrt(float(Dh))
+        # Same dense-GEMM-then-gather trick as _hqd_score_candidates_batched: scoring every
+        # parent against the whole key bank ([B,P,N,Hh] scores) beats gathering per-child key
+        # VECTORS ([B,P,C,Hh,Dh]) whenever the descendant table C is wide (L2/L3 bags).
+        use_dense = (B * P * N * Hh) <= 128_000_000 and (C * Dh) > (2 * N)
+        if use_dense:
+            dense = torch.einsum("bphd,bnhd->bpnh", q_p, k_all) / math.sqrt(float(Dh))  # [B,P,N,Hh]
+            gidx = child_safe.view(1, P, C, 1).expand(B, P, C, Hh)
+            score_heads = dense.gather(2, gidx)                # [B, P, C, Hh]
+        else:
+            k_c = k_all.index_select(1, child_safe.reshape(-1)).view(B, P, C, Hh, Dh)
+            score_heads = torch.einsum("bphd,bpchd->bpch", q_p, k_c) / math.sqrt(float(Dh))
 
         valid = child_valid.view(1, P, C).expand(B, P, C).clone()  # [B, P, C]
         if causal and node_ar_time is not None and node_ar_time.numel() >= N:
@@ -8343,7 +8882,14 @@ class HierarchicalFlowGAT(nn.Module):
         if int(getattr(self, "hqd_query_level", 0)) != 0 or int(getattr(self, "hqd_shallow_read_level", 0)) != 3:
             return None
         mp = getattr(transformer, "message_passing", None)
-        direct = getattr(mp, "_last_graph_witness_ids", None) if mp is not None else None
+        if str(getattr(self, "hqd_packed_witness_source", "graph")).lower() == "backbone":
+            # Same table format as the scatter-path capture, but harvested (for free)
+            # from the packed cross-level lane of an earlier layer this forward.
+            latest = getattr(self, "_backbone_witness_latest", None)
+            fresh = latest is not None and int(latest[0]) == int(getattr(self, "_witness_build_epoch", -1))
+            direct = latest[1] if fresh else None
+        else:
+            direct = getattr(mp, "_last_graph_witness_ids", None) if mp is not None else None
         if not isinstance(direct, dict) or not all(level in direct for level in (1, 2, 3)):
             return None
 
@@ -9947,6 +10493,11 @@ class HierarchicalFlowGAT(nn.Module):
         # the same [B, N, H] layout. None = no-op (legacy).
         from torch_geometric.data import Data
 
+        # New forward pass => new witness-table epoch (witness_reuse == "step" caches the
+        # table under this epoch so all HQD layers of THIS pass share one build; checkpoint
+        # recomputes keep the epoch and therefore the identical table).
+        self._witness_build_epoch = int(getattr(self, "_witness_build_epoch", 0)) + 1
+
         x = unified_graph.x
         if x.dim() == 2:
             x = x.unsqueeze(0)
@@ -10115,6 +10666,14 @@ class HierarchicalFlowGAT(nn.Module):
                 mp.hqd_graph_witness_enable = bool(getattr(self, "hqd_graph_witness_enable", False))
                 mp.hqd_graph_witness_topk = int(getattr(self, "hqd_graph_witness_topk", 4))
                 mp.hqd_packed_witness_chunk_size = int(getattr(self, "hqd_packed_witness_chunk_size", 2048))
+                # Backbone witness harvest: only worth capturing when HQD will consume it,
+                # and only possible when the packed cross-level lane is the one running.
+                mp.hqd_backbone_witness_capture = bool(
+                    getattr(self, "hierarchical_query_descent_enable", False)
+                    and str(getattr(self, "hqd_packed_witness_source", "graph")).lower() == "backbone"
+                    and getattr(self, "cross_level_packed", False)
+                )
+                mp.hqd_backbone_witness_topk = int(getattr(self, "hqd_graph_witness_topk", 4))
 
         if use_multi_local and not bool(getattr(self, "_l0_local_runtime_logged", False)):
             for lvl in sorted(active_local_levels):
@@ -10353,8 +10912,9 @@ class HierarchicalFlowGAT(nn.Module):
                     self.zip_granularity == "per_layer"
                     or (self.zip_granularity == "per_cycle" and layer_idx == 0)
                 )
+                _hqd_off = int(getattr(self, "hqd_every_n_offset", 0))
                 run_hqd_step = hqd_enable and (
-                    (self.hqd_every_n > 0 and layer_idx % self.hqd_every_n == 0)
+                    (self.hqd_every_n > 0 and layer_idx >= _hqd_off and (layer_idx - _hqd_off) % self.hqd_every_n == 0)
                     or (self.hqd_every_n <= 0 and self.hqd_granularity == "per_layer")
                     or (self.hqd_every_n <= 0 and self.hqd_granularity == "per_cycle" and layer_idx == 0)
                 )
@@ -10504,6 +11064,18 @@ class HierarchicalFlowGAT(nn.Module):
                         and self.training
                         and torch.is_grad_enabled()
                     )
+                    if _use_ckpt and not getattr(self, "_flash_backend_warmed", False):
+                        # Warm the flash-backend lru_cache HERE (grad-enabled, outside the
+                        # checkpoint). The picker's one-time smoke test does a .backward(); if its
+                        # first call instead lands inside the checkpoint's recompute (run under
+                        # no_grad), that nested backward fails and the cache is poisoned to a
+                        # non-flash backend permanently -> "flash unavailable" for level 0.
+                        try:
+                            from .layers.hierarchical_message_passing import pick_attention_backend
+                            pick_attention_backend(getattr(x, "device", None))
+                        except Exception:
+                            pass
+                        self._flash_backend_warmed = True
                     if _use_ckpt:
                         # Checkpoint the per-layer refinement step: free its internal
                         # activations (attention/FFN) and recompute them in backward.
@@ -10547,6 +11119,20 @@ class HierarchicalFlowGAT(nn.Module):
 
                 if pinball_cycle_active:
                     x = _copy_active_nodes(x_before_layer, x, active_node_idx)
+                # Harvest the packed lane's backbone witness capture (detached ids/logits),
+                # stamped with this forward's witness epoch so later HQD layers can build
+                # their table from it and a stale capture (previous step) is never used.
+                # Levels 1..3 must all be present (a partial-active-levels layer may not
+                # produce every level's block).
+                mp_h = getattr(transformer, "message_passing", None)
+                if mp_h is not None and bool(getattr(mp_h, "hqd_backbone_witness_capture", False)):
+                    _cap_ids = getattr(mp_h, "_last_backbone_witness_ids", None)
+                    if isinstance(_cap_ids, dict) and all(l in _cap_ids for l in (1, 2, 3)):
+                        self._backbone_witness_latest = (
+                            int(getattr(self, "_witness_build_epoch", 0)),
+                            _cap_ids,
+                            getattr(mp_h, "_last_backbone_witness_scores", None),
+                        )
                 if bool(getattr(self, "hqd_debug", False)) and hqd_b_idx is not None and hasattr(transformer, "message_passing"):
                     apply_ms = getattr(transformer.message_passing, "_last_hqd_apply_ms", None)
                     if apply_ms is not None:

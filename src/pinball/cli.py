@@ -262,6 +262,9 @@ def main(argv=None) -> None:
         copy_task_max_gap=int(getattr(cfg, "copy_task_max_gap", 0)),
         longctx_diag_every=int(getattr(cfg, "longctx_diag_every", 0) or 0),
         longctx_diag_max_seqs=int(getattr(cfg, "longctx_diag_max_seqs", 64) or 64),
+        train_feature_chunked_ce_enable=bool(getattr(cfg, "train_feature_chunked_ce_enable", False)),
+        chunked_ce_seq_chunk=int(getattr(cfg, "chunked_ce_seq_chunk", 0) or 0),
+        chunked_ce_enable=bool(getattr(cfg, "chunked_ce_enable", False)),
         modality="text",
     )
 

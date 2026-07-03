@@ -674,6 +674,13 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
             zero = torch.zeros((), device=features_bth.device, dtype=features_bth.dtype)
             return zero, 0
         chunk = int(chunked_ce_seq_chunk) if int(chunked_ce_seq_chunk) > 0 else T
+        # Auto-scale the position-chunk UP for small batch: memory per chunk ~ B*chunk*vocab,
+        # so a fixed position count fragments a long sequence at batch 1 into hundreds of tiny
+        # launch-bound GEMMs. Keep >= ~token_floor tokens (B*chunk) per chunk -> chunk count
+        # stays small and memory stays bounded. B>=token_floor/chunk is unchanged.
+        _token_floor = 2048
+        if chunk > 0:
+            chunk = max(chunk, (_token_floor + B - 1) // max(1, B))
         numer = torch.zeros((), device=features_bth.device, dtype=features_bth.dtype)
         denom = 0
         for s in range(0, T, chunk):
@@ -6324,9 +6331,13 @@ class EnhancedHierarchicalTrainer:
         lambda_ce_anchor_val = getattr(model_for_mode, "lambda_ce_anchor", None)
         if lambda_ce_anchor_val is None and model_for_mode_mod is not None:
             lambda_ce_anchor_val = getattr(model_for_mode_mod, "lambda_ce_anchor", None)
-        use_flash_val_autocast = (
-            bool(l0_local_mode.get("active", False))
-            and str(l0_local_mode.get("backend", "pyg")) == "flash"
+        # Validation must run under the SAME mixed-precision autocast as training. This was
+        # previously gated on the L0 local backend being flash, so non-flash configs (e.g.
+        # attn_backend: pyg) validated in fp32 while training ran in bf16 — a train/val
+        # precision mismatch that also fed fp32 into the flash-only packed multirate refiners
+        # and crashed them. Mirror the training amp gate (self.mixed_precision) instead.
+        use_val_autocast = (
+            bool(getattr(self, "mixed_precision", False))
             and self.device.type == "cuda"
             and torch.cuda.is_available()
         )
@@ -6446,7 +6457,7 @@ class EnhancedHierarchicalTrainer:
                 def _val_amp_ctx():
                     return (
                         torch.autocast(device_type="cuda", dtype=amp_dtype("cuda"))
-                        if use_flash_val_autocast
+                        if use_val_autocast
                         else nullcontext()
                     )
 

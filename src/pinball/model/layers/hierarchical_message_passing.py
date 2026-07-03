@@ -402,6 +402,8 @@ class HierarchicalMessagePassing(MessagePassing):
         per_level_local_qkv: bool = False,   # per-level Q/K/V for intra-level (local-window) attention;
                                              # the cross-level graph/edge path keeps the shared backbone QKV
         num_local_levels: int = 4,
+        per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
+        local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
         rope_level_axis_enable: bool = False,
         rope_level_axis_scale: float = 32.0,
         norm_type: str = "rmsnorm",
@@ -466,6 +468,20 @@ class HierarchicalMessagePassing(MessagePassing):
             max_seq_len=max_seq_len,
             rope_mode=self.rope_mode,
         )
+        # Local-attention head_dim override: decouples the per-level LOCAL attention head_dim
+        # from hidden//num_heads. Lets a NARROW residual (small hidden_dim) still run full-
+        # resolution attention by UP-projecting q/k/v to num_heads*local_attn_head_dim (e.g.
+        # hidden 192 -> attn head_dim 64), attend, project back to hidden. Needs its own RoPE at
+        # the wide head_dim (RoPE rotates pairs within head_dim). 0 => use head_dim (no change).
+        self.local_attn_head_dim = int(local_attn_head_dim) if int(local_attn_head_dim) > 0 else self.head_dim
+        if self.local_attn_head_dim != self.head_dim:
+            self.rotary_pos_enc_attn = RotaryPositionalEncoding(
+                dim=self.local_attn_head_dim,
+                max_seq_len=max_seq_len,
+                rope_mode=self.rope_mode,
+            )
+        else:
+            self.rotary_pos_enc_attn = self.rotary_pos_enc
         self.l0_local_backend = str(l0_local_backend).lower()
         if self.l0_local_backend not in {"pyg", "flash", "xformers", "sdpa"}:
             self.l0_local_backend = "pyg"
@@ -521,6 +537,14 @@ class HierarchicalMessagePassing(MessagePassing):
         self.hqd_packed_witness_chunk_size = 2048
         self._last_graph_witness_ids: Optional[Dict[int, torch.Tensor]] = None
         self._last_graph_witness_scores: Optional[Dict[int, torch.Tensor]] = None
+        # Backbone witness capture: the packed cross-level lane stashes each parent's
+        # top-k direct children by its OWN (already computed) attention logits — the
+        # near-free witness source (vs the scatter-path capture, which needs ragged
+        # per-edge sorting, or the recompute build, which re-scores all descendants).
+        self.hqd_backbone_witness_capture = False
+        self.hqd_backbone_witness_topk = 4
+        self._last_backbone_witness_ids: Optional[Dict[int, torch.Tensor]] = None
+        self._last_backbone_witness_scores: Optional[Dict[int, torch.Tensor]] = None
         self._last_hqd_apply_ms: Optional[float] = None
         self.hqd_runtime_selector: Optional[Callable[[torch.Tensor, torch.Tensor], Any]] = None
         self._last_hqd_runtime_added_total: Optional[int] = None
@@ -617,6 +641,29 @@ class HierarchicalMessagePassing(MessagePassing):
             self.v_proj_level = nn.ModuleList(
                 [nn.Linear(hidden_dim, hidden_dim) for _ in range(self.num_local_levels)])
             self._sync_per_level_qkv_from_shared()
+
+        # Per-level LOCAL-attention dimension: each level's intra-level window attention runs at
+        # num_heads_L = round(mult_L * num_heads) heads with head_dim FIXED (full per-head
+        # resolution). L0 (most nodes) -> fewer heads = cheap; coarse levels -> more heads =
+        # capacity (U-Net schedule inside the hierarchy). hidden->d_L q/k/v + d_L->hidden out
+        # proj per level; cross-level backbone stays at hidden. Reuses the Fat-QKV decoupled-dim
+        # pattern, per level, on the local path.
+        self.per_level_attn_mult = [float(m) for m in (per_level_attn_mult or [])]
+        self.per_level_attn_active = len(self.per_level_attn_mult) > 0
+        if self.per_level_attn_active:
+            self.per_level_attn_heads = []
+            self.q_proj_attn_level = nn.ModuleList()
+            self.k_proj_attn_level = nn.ModuleList()
+            self.v_proj_attn_level = nn.ModuleList()
+            self.out_proj_attn_level = nn.ModuleList()
+            for m in self.per_level_attn_mult:
+                h = max(1, int(round(m * self.num_heads)))
+                d = h * self.local_attn_head_dim
+                self.per_level_attn_heads.append(h)
+                self.q_proj_attn_level.append(nn.Linear(hidden_dim, d))
+                self.k_proj_attn_level.append(nn.Linear(hidden_dim, d))
+                self.v_proj_attn_level.append(nn.Linear(hidden_dim, d))
+                self.out_proj_attn_level.append(nn.Linear(d, hidden_dim))
 
         # Level embedding
         self.level_embedding = nn.Embedding(4, level_dim)  # 4 levels: L0, L1, L2, L3
@@ -1026,6 +1073,10 @@ class HierarchicalMessagePassing(MessagePassing):
         batch_off = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1) * int(num_nodes)
         neg = torch.finfo(q.dtype).min
         scale = 1.0 / math.sqrt(float(qk_hd))
+        capture_witness = bool(getattr(self, "hqd_backbone_witness_capture", False))
+        cap_k = max(1, int(getattr(self, "hqd_backbone_witness_topk", 4)))
+        cap_ids: Dict[int, torch.Tensor] = {}
+        cap_scores: Dict[int, torch.Tensor] = {}
         for (L, dst_nodes, cand, src_levels) in blocks:
             QL = int(dst_nodes.numel())
             Kmax = int(cand.size(1))
@@ -1040,6 +1091,24 @@ class HierarchicalMessagePassing(MessagePassing):
             lvl_bias = pair_bias.index_select(0, pair_id.reshape(-1)).view(QL, Kmax, H)
             scores = scores + lvl_bias.unsqueeze(0)
             scores = scores.masked_fill(~valid.view(1, QL, Kmax, 1), neg)
+            if capture_witness and 1 <= int(L) <= 3:
+                # Free witness harvest: each parent's top-k DIRECT children by the
+                # attention logits just computed (detached metadata, no extra GEMM).
+                with torch.no_grad():
+                    child_mask = src_levels == (int(L) - 1)          # [QL, Kmax]
+                    s = scores.detach().float().mean(dim=-1)         # [B, QL, Kmax]
+                    fneg = torch.finfo(s.dtype).min
+                    s = s.masked_fill(~(child_mask & valid).view(1, QL, Kmax), fneg)
+                    kk = min(cap_k, Kmax)
+                    vals, idx = torch.topk(s, k=kk, dim=-1)          # [B, QL, kk]
+                    ids = cand.clamp(min=0).view(1, QL, Kmax).expand(B, QL, Kmax).gather(-1, idx)
+                    ids = torch.where(vals > (fneg * 0.5), ids, torch.full_like(ids, -1))
+                    full_ids = torch.full((B, int(num_nodes), cap_k), -1, dtype=torch.long, device=device)
+                    full_sc = torch.full((B, int(num_nodes), cap_k), fneg, dtype=s.dtype, device=device)
+                    full_ids[:, :, :kk].index_copy_(1, dst_nodes, ids)
+                    full_sc[:, :, :kk].index_copy_(1, dst_nodes, vals)
+                    cap_ids[int(L)] = full_ids
+                    cap_scores[int(L)] = full_sc
             weights = torch.softmax(scores, dim=2)
             weights = torch.where(valid.view(1, QL, Kmax, 1), weights, torch.zeros_like(weights))
             weights = self.dropout(weights)  # parity with the scatter path's post-softmax dropout
@@ -1048,6 +1117,8 @@ class HierarchicalMessagePassing(MessagePassing):
         # Parity with the scatter path's detached witness/trace resets (both no-ops here).
         self._last_graph_witness_ids = None
         self._last_graph_witness_scores = None
+        self._last_backbone_witness_ids = cap_ids or None
+        self._last_backbone_witness_scores = cap_scores or None
         return out
 
     def _chunk_index_flat(self, dst_chunk: torch.Tensor, batch_size: int, num_nodes: int) -> torch.Tensor:
@@ -1373,30 +1444,66 @@ class HierarchicalMessagePassing(MessagePassing):
         flat = self.rotary_pos_enc.apply_rotary_pos_emb(flat, pos_rep)
         return flat.view(B, num_nodes, self.num_heads, self.head_dim)
 
-    def _cross_level_qkv_route(self, x, B, num_nodes, node_level, rope_pos, q_shared, k_shared, v_shared):
+    def _cross_level_qkv_route(self, x, B, num_nodes, node_level, level_offsets, rope_pos, q_shared, k_shared, v_shared):
         """Route each node through its LEVEL's cross-level projection, returning per-level
-        qx/kx/vx [B,N,H,head_dim] (RoPE applied to qx/kx). Falls back to the already-computed
-        shared q/k/v for any level without its own projection. Each node is projected once."""
+        qx/kx/vx [B,N,H,head_dim] (RoPE applied to qx/kx). Each node is projected once.
+
+        Levels are CONTIGUOUS blocks in the node ordering, so we slice by level_offsets (one
+        host sync for the offsets, then sync-free contiguous GEMMs). This avoids the per-level
+        nonzero()+advanced-index gather/scatter, whose host syncs + non-contiguous copies
+        otherwise dominate (turning a ~1-3% FLOP cost into a ~40% wall-clock hit)."""
         H, D = self.num_heads, self.head_dim
-        nl = node_level.to(device=x.device, dtype=torch.long)
         qlist, klist, vlist = self._resolve_xlevel_lists()
+        # Contiguous per-level [start, end) bounds (one sync); None => fall back to masked path.
+        bounds = None
+        if isinstance(level_offsets, torch.Tensor) and level_offsets.numel() >= 2:
+            lo = level_offsets.detach().to("cpu").tolist()
+            bounds = [(int(lo[i]), int(lo[i + 1])) for i in range(len(lo) - 1)]
 
         def route(level_list, shared_final, shared_proj, is_qk):
-            # None list => the already-correct shared tensor (RoPE'd for q/k, raw for v).
-            if level_list is None:
+            if level_list is None:                 # shared tensor (RoPE'd for q/k, raw for v)
                 return shared_final
-            # Match the shared path's (autocast) dtype, not x's, so index_put dtypes align.
-            out = torch.empty(B, num_nodes, H, D, dtype=shared_final.dtype, device=x.device)
-            covered = torch.zeros(num_nodes, dtype=torch.bool, device=x.device)
-            for L in range(len(level_list)):
-                idx = (nl == L).nonzero(as_tuple=False).view(-1)
-                if idx.numel() == 0:
-                    continue
-                out[:, idx] = level_list[L](x[:, idx]).view(B, idx.numel(), H, D)
-                covered[idx] = True
-            if not bool(covered.all()):
-                rest = (~covered).nonzero(as_tuple=False).view(-1)
-                out[:, rest] = shared_proj(x[:, rest]).view(B, rest.numel(), H, D)
+            # Lazily allocate `out` with the projection-output dtype (autocast bf16) on first
+            # write -- the shared tensor may have been skipped (None) so we can't read its dtype.
+            out = None
+            def _put(sl_lo, sl_hi, t):
+                nonlocal out
+                if out is None:
+                    out = torch.empty(B, num_nodes, H, D, dtype=t.dtype, device=x.device)
+                out[:, sl_lo:sl_hi] = t
+            if bounds is not None:
+                end = 0
+                for L in range(len(level_list)):
+                    if L >= len(bounds):
+                        break
+                    s, e = bounds[L]
+                    if e > s:
+                        _put(s, e, level_list[L](x[:, s:e]).view(B, e - s, H, D))
+                    end = max(end, e)
+                if end < num_nodes:                # levels beyond the per-level list => shared
+                    _put(end, num_nodes, shared_proj(x[:, end:]).view(B, num_nodes - end, H, D))
+            else:
+                nl = node_level.to(device=x.device, dtype=torch.long)
+                covered = torch.zeros(num_nodes, dtype=torch.bool, device=x.device)
+                for L in range(len(level_list)):
+                    idx = (nl == L).nonzero(as_tuple=False).view(-1)
+                    if idx.numel() == 0:
+                        continue
+                    pj = level_list[L](x[:, idx]).view(B, idx.numel(), H, D)
+                    if out is None:
+                        out = torch.empty(B, num_nodes, H, D, dtype=pj.dtype, device=x.device)
+                    out[:, idx] = pj
+                    covered[idx] = True
+                if not bool(covered.all()):
+                    rest = (~covered).nonzero(as_tuple=False).view(-1)
+                    pj = shared_proj(x[:, rest]).view(B, rest.numel(), H, D)
+                    if out is None:
+                        out = torch.empty(B, num_nodes, H, D, dtype=pj.dtype, device=x.device)
+                    out[:, rest] = pj
+            if out is None:
+                out = torch.empty(B, num_nodes, H, D,
+                                  dtype=(shared_final.dtype if shared_final is not None else x.dtype),
+                                  device=x.device)
             return self._apply_rope_bnhd(out, rope_pos, B, num_nodes) if is_qk else out
 
         qx = route(qlist, q_shared, self.q_proj, True)
@@ -1864,22 +1971,23 @@ class HierarchicalMessagePassing(MessagePassing):
 
         if input_norm is not None:
             x = input_norm(x)
+        # Shared q/k/v feed the local-window path, HQD (sparse + packed-witness), fat-V, and the
+        # shared-mode cross path / per-level route fallback. HQD edge decisions happen later in
+        # this forward, so we cannot safely predict at this point whether they're needed -> always
+        # compute them. (Per-level cross_level_qkv adds qx/kx/vx on top; that extra is inherent.)
         q = self.q_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
 
+        pos_rep = None
         if hasattr(self, 'rotary_pos_enc') and rope_pos is not None:
-            q_flat = q.reshape(B * num_nodes, self.num_heads, self.head_dim)
-            k_flat = k.reshape(B * num_nodes, self.num_heads, self.head_dim)
             self.rotary_pos_enc.local_attn_runtime_level_grid_shapes = dict(getattr(self, "local_attn_runtime_level_grid_shapes", {}))
             if isinstance(rope_pos, torch.Tensor) and rope_pos.dim() == 2:
                 pos_rep = rope_pos.view(1, num_nodes, rope_pos.size(-1)).expand(B, num_nodes, rope_pos.size(-1)).reshape(B * num_nodes, rope_pos.size(-1))
             else:
                 pos_rep = rope_pos.view(1, num_nodes).expand(B, num_nodes).reshape(-1)
-            q_flat = self.rotary_pos_enc.apply_rotary_pos_emb(q_flat, pos_rep)
-            k_flat = self.rotary_pos_enc.apply_rotary_pos_emb(k_flat, pos_rep)
-            q = q_flat.view(B, num_nodes, self.num_heads, self.head_dim)
-            k = k_flat.view(B, num_nodes, self.num_heads, self.head_dim)
+            q = self.rotary_pos_enc.apply_rotary_pos_emb(q.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep).view(B, num_nodes, self.num_heads, self.head_dim)
+            k = self.rotary_pos_enc.apply_rotary_pos_emb(k.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep).view(B, num_nodes, self.num_heads, self.head_dim)
 
         # The above narrow (head_dim) q/k/v feed BOTH the cross-level scatter aggregation
         # and the flash/sdpa local-window path below, which require qk==v==head_dim. Under
@@ -1894,7 +2002,7 @@ class HierarchicalMessagePassing(MessagePassing):
         # when the mode is "shared", so this is bit-identical by default.
         if (getattr(self, "cross_level_qkv", "shared") != "shared"
                 and not getattr(self, "sparse_wide_enable", False) and self._xlevel_active()):
-            qx, kx, vx = self._cross_level_qkv_route(x, B, num_nodes, node_level, rope_pos, q, k, v)
+            qx, kx, vx = self._cross_level_qkv_route(x, B, num_nodes, node_level, level_offsets, rope_pos, q, k, v)
         else:
             qx, kx, vx = q, k, v
         out = None if getattr(self, "sparse_wide_enable", False) else self._sparse_graph_attention_chunked_batched(
@@ -2048,16 +2156,25 @@ class HierarchicalMessagePassing(MessagePassing):
                     effective_causal = effective_causal and bool(
                         getattr(self, "l0_local_runtime_causal", self.l0_local_causal_default)
                     )
-                lvl_result = self._compute_level_local_out_batched(
-                    q=q, k=k, v=v, node_level=node_level,
-                    level=lvl_int,
-                    window=int(cfg.get("window", 0)),
-                    causal=effective_causal,
-                    backend=str(cfg.get("backend", "sdpa")),
-                    node_group=runtime_group,
-                    positions=pos_to_use,
-                    level_offsets=level_offsets,
-                )
+                if self.per_level_attn_active and lvl_int < len(self.per_level_attn_heads):
+                    # per-level LOCAL attention dim: project x -> d_L, flash-windowed, out d_L->hidden
+                    lvl_result = self._compute_level_local_out_perdim(
+                        x_normed=x, node_level=node_level, level=lvl_int,
+                        window=int(cfg.get("window", 0)), causal=effective_causal,
+                        backend=str(cfg.get("backend", "sdpa")),
+                        level_offsets=level_offsets, rope_pos=rope_pos,
+                    )
+                else:
+                    lvl_result = self._compute_level_local_out_batched(
+                        q=q, k=k, v=v, node_level=node_level,
+                        level=lvl_int,
+                        window=int(cfg.get("window", 0)),
+                        causal=effective_causal,
+                        backend=str(cfg.get("backend", "sdpa")),
+                        node_group=runtime_group,
+                        positions=pos_to_use,
+                        level_offsets=level_offsets,
+                    )
                 if lvl_result is not None:
                     lvl_idx, lvl_proj = lvl_result
                     if source_gates is not None:
@@ -3121,6 +3238,59 @@ class HierarchicalMessagePassing(MessagePassing):
         out_lvl = self.out_proj(out_lvl)
         return out_lvl
 
+    def _compute_level_local_out_perdim(self, x_normed, node_level, level, window, causal, backend, level_offsets, rope_pos):
+        """Per-level LOCAL window attention at the level's own dim (num_heads_L, head_dim fixed).
+        Projects x -> d_L q/k/v, flash-windowed attention, out_proj d_L -> hidden. Returns
+        (slice_or_idx, out_L[B,n_L,hidden]) to match _compute_level_local_out_batched's contract.
+        Flash-only (raises otherwise, like the shared local path)."""
+        L = int(level)
+        if not self.per_level_attn_active or L >= len(self.per_level_attn_heads):
+            return None
+        if int(window) <= 0:
+            return None
+        level_slice = self._level_slice_from_offsets(level_offsets, L, int(node_level.numel()))
+        if level_slice is not None:
+            s, e = level_slice
+            idx = None
+            n_L = int(e - s)
+        else:
+            idx = (node_level.to(device=x_normed.device, dtype=torch.long) == L).nonzero(as_tuple=False).view(-1)
+            n_L = int(idx.numel())
+            s = e = None
+        if n_L <= 1:
+            return None
+        B = int(x_normed.size(0))
+        Dh = int(self.local_attn_head_dim)   # attention head_dim (may be up-projected from hidden//num_heads)
+        h_L = int(self.per_level_attn_heads[L])
+        x_L = x_normed[:, s:e, :] if idx is None else x_normed.index_select(1, idx)  # [B, n_L, hidden]
+        q_L = self.q_proj_attn_level[L](x_L).view(B, n_L, h_L, Dh)
+        k_L = self.k_proj_attn_level[L](x_L).view(B, n_L, h_L, Dh)
+        v_L = self.v_proj_attn_level[L](x_L).view(B, n_L, h_L, Dh)
+        if hasattr(self, "rotary_pos_enc_attn") and rope_pos is not None:
+            if isinstance(rope_pos, torch.Tensor) and rope_pos.dim() == 2:
+                base = rope_pos[s:e] if idx is None else rope_pos.index_select(0, idx)
+                pos_L = base.view(1, n_L, base.size(-1)).expand(B, n_L, base.size(-1)).reshape(B * n_L, base.size(-1))
+            else:
+                base = rope_pos[s:e] if idx is None else rope_pos.index_select(0, idx)
+                pos_L = base.view(1, n_L).expand(B, n_L).reshape(-1)
+            q_L = self.rotary_pos_enc_attn.apply_rotary_pos_emb(q_L.reshape(B * n_L, h_L, Dh), pos_L).view(B, n_L, h_L, Dh)
+            k_L = self.rotary_pos_enc_attn.apply_rotary_pos_emb(k_L.reshape(B * n_L, h_L, Dh), pos_L).view(B, n_L, h_L, Dh)
+        resolved_backend, flash_func = pick_attention_backend(x_normed.device)
+        if str(backend) != "flash" or resolved_backend not in {"fa2", "fa3"} or flash_func is None:
+            raise RuntimeError(
+                f"per-level attention dim requires the flash backend for level {L} "
+                f"(got backend={backend}, resolved={resolved_backend}). Use attn_backend: flash."
+            )
+        dropout_p = float(self.dropout.p) if self.training else 0.0
+        win = (int(window), 0) if bool(causal) else (int(window), int(window))
+        o_L = attention_forward(
+            q_L, k_L, v_L, causal=bool(causal), dropout_p=dropout_p, backend=resolved_backend,
+            flash_func=flash_func, window_size=win,
+            flash_dtype_cast=bool(getattr(self, "local_attn_flash_dtype_cast", False)),
+        )
+        o_L = self.out_proj_attn_level[L](o_L.reshape(B, n_L, h_L * Dh))  # d_L -> hidden
+        return (slice(s, e) if idx is None else idx), o_L
+
     def _compute_level_local_out_batched(
         self,
         q: torch.Tensor,
@@ -3704,6 +3874,9 @@ class HierarchicalTransformerLayer(nn.Module):
         sparse_attn_chunk_size: int = 0,
         per_level_local_qkv: bool = False,
         num_local_levels: int = 4,
+        per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
+        local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
+        per_level_ffn_dims: Optional[List[int]] = None,  # per-level FFN "processing dim" (inner ~ mult*dim); [] => uniform
         norm_type: str = "layernorm",
         norm_eps: float = 1e-6,
         rope_level_axis_enable: bool = False,
@@ -3779,6 +3952,8 @@ class HierarchicalTransformerLayer(nn.Module):
             sparse_attn_chunk_size=sparse_attn_chunk_size,
             per_level_local_qkv=per_level_local_qkv,
             num_local_levels=num_local_levels,
+            per_level_attn_mult=per_level_attn_mult,
+            local_attn_head_dim=local_attn_head_dim,
             norm_type=norm_type,
             norm_eps=norm_eps,
             rope_level_axis_enable=rope_level_axis_enable,
@@ -3845,9 +4020,17 @@ class HierarchicalTransformerLayer(nn.Module):
                         ffn_mult: float = 4.0,#4.0,2.0,   # base expansion factor before applying swiglu_factor
                         swiglu_factor: float = 2/3,   # LLaMA-style
                         multiple_of: int = 256,
-                        bias: bool = False):
+                        bias: bool = False,
+                        inner_dim: Optional[int] = None):  # per-level override of the SwiGLU inner dim
                 super().__init__()
-                inner = int(ffn_mult * swiglu_factor * hidden_dim)
+                # inner_dim override lets each hierarchy level pick its own FFN capacity (small
+                # for L0 = cheap over many nodes; large for coarse levels = capacity over few).
+                # The input/output stay hidden_dim so the residual stream + cross-level attention
+                # are unaffected; only the expansion width is per-level.
+                if inner_dim is not None and int(inner_dim) > 0:
+                    inner = int(inner_dim)
+                else:
+                    inner = int(ffn_mult * swiglu_factor * hidden_dim)
                 if multiple_of is not None and multiple_of > 0:
                     inner = (inner + multiple_of - 1) // multiple_of * multiple_of  # round up
                 
@@ -3871,6 +4054,17 @@ class HierarchicalTransformerLayer(nn.Module):
         # )
 
         self.ffn = SwiGLUFFN(hidden_dim, dropout=0.0, ffn_mult=4.0, swiglu_factor=2/3, multiple_of=256, bias=False)
+
+        # Per-level FFN: one SwiGLU per hierarchy level with a per-level expansion width
+        # (inner ~ 4*2/3*dim_L). L0 (most nodes) gets a small dim -> cheap; coarse levels (few
+        # nodes) get a large dim -> capacity, mimicking a U-Net's channel growth at the
+        # bottleneck. Input/output stay hidden_dim so the residual + cross-level path are intact.
+        self.per_level_ffn_dims = [int(d) for d in (per_level_ffn_dims or [])]
+        self.ffn_level = nn.ModuleList()
+        if self.per_level_ffn_dims:
+            for d in self.per_level_ffn_dims:
+                inner = int(4.0 * (2.0 / 3.0) * int(d))
+                self.ffn_level.append(SwiGLUFFN(hidden_dim, dropout=0.0, multiple_of=256, bias=False, inner_dim=inner))
 
         # Layer normalization
         self.norm1 = make_norm(hidden_dim, norm_type=self.norm_type, eps=self.norm_eps)
@@ -3916,6 +4110,58 @@ class HierarchicalTransformerLayer(nn.Module):
         if hasattr(self.message_passing, "reset_lateral_edge_traces"):
             self.message_passing.reset_lateral_edge_traces()
     
+    def _apply_ffn(self, x_normed, node_level, level_offsets=None):
+        """Per-level FFN dispatch: each hierarchy level's nodes go through their own SwiGLU
+        (per-level expansion width). Falls back to the shared FFN when per_level_ffn_dims is
+        unset. Uses contiguous level_offsets slices when available (one host sync), else a
+        masked path (for the active-level subset, which isn't level-contiguous)."""
+        if not self.per_level_ffn_dims:
+            return self.ffn(x_normed)
+        nlv = len(self.per_level_ffn_dims)
+        is3d = x_normed.dim() == 3
+        N = int(x_normed.size(-2))
+        out = torch.empty_like(x_normed)
+
+        def _put(lo, hi, sl):
+            res = sl
+            if is3d:
+                out[:, lo:hi, :] = res
+            else:
+                out[lo:hi, :] = res
+
+        bounds = None
+        if isinstance(level_offsets, torch.Tensor) and level_offsets.numel() >= 2:
+            loff = level_offsets.detach().to("cpu").tolist()
+            bounds = [(int(loff[i]), int(loff[i + 1])) for i in range(len(loff) - 1)]
+        if bounds is not None:
+            end = 0
+            for L in range(min(nlv, len(bounds))):
+                s, e = bounds[L]
+                if e > s:
+                    sl = x_normed[:, s:e, :] if is3d else x_normed[s:e, :]
+                    _put(s, e, self.ffn_level[L](sl))
+                end = max(end, e)
+            if end < N:  # coarse levels beyond the per-level list -> shared FFN
+                sl = x_normed[:, end:, :] if is3d else x_normed[end:, :]
+                _put(end, N, self.ffn(sl))
+            return out
+        # masked fallback (non-contiguous node ordering, e.g. active-level subset)
+        nl = node_level.to(device=x_normed.device, dtype=torch.long)
+        covered = torch.zeros(N, dtype=torch.bool, device=x_normed.device)
+        for L in range(nlv):
+            idx = (nl == L).nonzero(as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                continue
+            sl = x_normed.index_select(1 if is3d else 0, idx)
+            res = self.ffn_level[L](sl)
+            out.index_copy_(1 if is3d else 0, idx, res)
+            covered[idx] = True
+        if not bool(covered.all()):
+            rest = (~covered).nonzero(as_tuple=False).view(-1)
+            res = self.ffn(x_normed.index_select(1 if is3d else 0, rest))
+            out.index_copy_(1 if is3d else 0, rest, res)
+        return out
+
     def forward(self, x, edge_index, node_level, level_offsets=None, positions=None, edge_attr=None, hqd_edges=None, active_levels=None, edge_type=None):
         """
         Forward pass through the hierarchical transformer layer.
@@ -3977,7 +4223,7 @@ class HierarchicalTransformerLayer(nn.Module):
             else:
                 x_active = x_active + self.dropout(attn_active)
 
-            ffn_out_active = self.ffn(self.norm2(x_active))
+            ffn_out_active = self._apply_ffn(self.norm2(x_active), node_level.index_select(0, active_idx), None)
             x_active = x_active + self.dropout(ffn_out_active)
 
             x_next = x.clone()
@@ -4026,12 +4272,12 @@ class HierarchicalTransformerLayer(nn.Module):
 
         #x_identity_ffn = x # Store input for second residual
         if active_idx is None:
-            ffn_out = self.ffn(self.norm2(x))
+            ffn_out = self._apply_ffn(self.norm2(x), node_level, level_offsets)
         elif x.dim() == 3:
-            ffn_out_active = self.ffn(self.norm2(x[:, active_idx, :]))
+            ffn_out_active = self._apply_ffn(self.norm2(x[:, active_idx, :]), node_level.index_select(0, active_idx), None)
             ffn_out = None
         else:
-            ffn_out_active = self.ffn(self.norm2(x[active_idx, :]))
+            ffn_out_active = self._apply_ffn(self.norm2(x[active_idx, :]), node_level.index_select(0, active_idx), None)
             ffn_out = None
         if self.use_beta_gating:
             if active_idx is None:

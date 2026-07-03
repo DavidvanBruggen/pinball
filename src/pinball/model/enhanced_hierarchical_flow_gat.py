@@ -846,7 +846,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
             xs = [tok_emb]
             for lvl in range(1, len(level_sizes)):
                 n = level_sizes[lvl]
-                if self.input_mode == "tokens" and getattr(self, "upper_init", "mask") == "mask":
+                if self.input_mode == "tokens" and getattr(self, "upper_init", "mask") in ("mask", "pooled"):
                     mask_vec = self.token_embedding(torch.tensor([self.mask_token_id], device=tok_emb.device))
                     xs.append(mask_vec.repeat(n, 1))
                 else:
@@ -1971,7 +1971,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 x_cat = [token_embeddings_bt[0, :seq_len_graph, :]]
                 for lvl in range(1, len(level_sizes)):
                     n = level_sizes[lvl]
-                    if self.input_mode == "tokens" and self.upper_init == "mask":
+                    if self.input_mode == "tokens" and self.upper_init in ("mask", "pooled"):
                         mask_vec = self.token_embedding(torch.tensor([self.mask_token_id], device=device))
                         x_cat.append(mask_vec.repeat(n, 1))
                     else:
@@ -1980,7 +1980,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 ae_slice = sk.get("ae_decoder_l0_slice", (0, 0)) if isinstance(sk, dict) else (0, 0)
                 if ae_slice != (0, 0) and len(level_sizes) >= 3:
                     for n in (level_sizes[0], level_sizes[1], level_sizes[2]):
-                        if self.input_mode == "tokens" and self.upper_init == "mask":
+                        if self.input_mode == "tokens" and self.upper_init in ("mask", "pooled"):
                             mask_vec = self.token_embedding(torch.tensor([self.mask_token_id], device=device))
                             x_cat.append(mask_vec.repeat(int(n), 1))
                         else:
@@ -2022,6 +2022,11 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 # Expand per-batch graph features and inject per-sample L0 tokens.
                 x_cat = x_cat.unsqueeze(0).repeat(batch_size, 1, 1)
                 x_cat[:, :seq_len_graph, :] = token_embeddings_bt[:, :seq_len_graph, :]
+                if self.upper_init == "pooled":
+                    # Seed coarse levels bottom-up from the per-sample tokens (gated; causal:
+                    # a coarse node's ar_time is its window END). Gives every refinement layer
+                    # informative coarse nodes instead of filling the pyramid layer-by-layer.
+                    x_cat = self._apply_pooled_upper_seed(x_cat, level_sizes)
                 #print(f"x_init reshaped to: {x_init.shape}")
                 # Now add token_embeddings_full to the L0 slice, by taking the token_embeddings_full seq_len and replacing x_init[:,:seq_len,:]
                 # Use view to expand token_embeddings to match batch size
@@ -2153,6 +2158,17 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                     #print("Returning token features from EHFGAT fast path.")
                     #return feats
                 #print(batch_size, seq_len, self.hidden_dim)
+                # Chunked-CE loss head: when the trainer flags return_token_features (set only
+                # for the chunked-CE training forward, reset right after — so validation and
+                # generation are unaffected) hand back the [B,T,hidden] features instead of
+                # projecting the full [B,T,vocab] logits here. The trainer then projects +
+                # cross-entropies in seq-chunks, never materializing the full logits (+ its
+                # softmax/CE backward) -> ~3.3GB saved at B8/T1024/V50257. Not for generation
+                # (logits_last_only), hierarchical-feature returns, or the AE decode head.
+                if (bool(getattr(self, "return_token_features", False))
+                        and not logits_last_only and not return_hierarchical_features
+                        and getattr(self, "_force_decode_head", None) != "ae"):
+                    return token_features.reshape(batch_size, seq_len_dense, self.hidden_dim)
                 if logits_last_only:
                     # AR generation reads only logits[:, -1]; projecting the whole sequence each
                     # step is O(T*vocab) compute + a [B,T,vocab] tensor (~1.5 GiB at T=4608) wasted.
@@ -3089,7 +3105,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         x = pad_vec.view(1, 1, -1).repeat(batch_size, num_nodes, 1)
 
         # Match the normal full-context path for initial higher-level slots when configured.
-        if self.input_mode == "tokens" and getattr(self, "upper_init", "mask") == "mask" and level_offsets.numel() > 2:
+        if self.input_mode == "tokens" and getattr(self, "upper_init", "mask") in ("mask", "pooled") and level_offsets.numel() > 2:
             mask_vec = self.token_embedding(torch.tensor([self.mask_token_id], device=device)).to(dtype=dtype)
             upper_start = int(level_offsets[1].item())
             if upper_start < num_nodes:

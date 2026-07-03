@@ -105,6 +105,12 @@ def build_pinball_model(
         sparse_attn_chunk_size=int(getattr(args, "sparse_attn_chunk_size", 0)),
         share_transformers=bool(getattr(args, "share_transformers", False)),
         per_level_local_qkv=bool(getattr(args, "per_level_local_qkv", False)),
+        per_level_ffn_dims=list(getattr(args, "per_level_ffn_dims", None) or []),
+        per_level_attn_mult=list(getattr(args, "per_level_attn_mult", None) or []),
+        local_attn_head_dim=int(getattr(args, "local_attn_head_dim", 0) or 0),
+        upper_init=str(getattr(args, "upper_init", "mask")),
+        upper_seed_gate_init=float(getattr(args, "upper_seed_gate_init", 1.0)),
+        witness_reuse=str(getattr(args, "witness_reuse", "layer")),
         norm_type=str(getattr(args, "norm_type", "rmsnorm")),
         norm_eps=float(getattr(args, "norm_eps", 1e-6)),
         add_self_loops=bool(getattr(args, "add_self_loops", True)),
@@ -185,6 +191,11 @@ def build_pinball_model(
         token_unet_lookahead_kernel_size=int(getattr(args, "token_unet_lookahead_kernel_size", 5)),
         token_unet_lookahead_blocks=int(getattr(args, "token_unet_lookahead_blocks", 2)),
         token_unet_block=str(getattr(args, "token_unet_block", "cnn")),
+        token_unet_dynamic=bool(getattr(args, "token_unet_dynamic", False)),
+        token_unet_channel_growth=int(getattr(args, "token_unet_channel_growth", 256)),
+        token_unet_max_channels=int(getattr(args, "token_unet_max_channels", 0)),
+        token_unet_concat_skips=bool(getattr(args, "token_unet_concat_skips", True)),
+        token_unet_hyena_length_invariant=bool(getattr(args, "token_unet_hyena_length_invariant", False)),
         rgb_token_unet_enable=bool(
             str(getattr(args, "modality", "text")).lower() == "image"
             and str(getattr(args, "image_token_mode", "latent")).lower() == "rgb_unet"
@@ -212,6 +223,7 @@ def build_pinball_model(
         local_connectivity_window_size=int(getattr(args, "local_connectivity_window_size", 4)),
         # --- Hierarchy auxiliary (reconstruction) loss ---
         use_aux_loss=bool(getattr(args, "use_aux_loss", False)),
+        hier_aux_link_l0_target=bool(getattr(args, "hier_aux_link_l0_target", False)),
         # --- AR graph connectivity (causal edge construction for autoregressive training) ---
         hier_ar_enable=bool(getattr(args, "hier_ar_enable", False)),
         hier_ar_allow_same_time=bool(getattr(args, "hier_ar_allow_same_time", True)),
@@ -234,6 +246,7 @@ def build_pinball_model(
         hqd_debug=bool(getattr(args, "hqd_debug", False)),
         hqd_granularity=str(getattr(args, "hqd_granularity", "per_layer")),
         hqd_every_n=int(getattr(args, "hqd_every_n", -1)),
+        hqd_every_n_offset=int(getattr(args, "hqd_every_n_offset", 0)),
         hqd_reuse_previous=bool(getattr(args, "hqd_reuse_previous", False)),
         hqd_reuse_max_age=int(getattr(args, "hqd_reuse_max_age", 0)),
         hqd_query_chunk_size=int(getattr(args, "hqd_query_chunk_size", 512)),
