@@ -2150,9 +2150,9 @@ class HierarchicalFlowGAT(nn.Module):
         hier_ar_filter_zip: bool = False,  # Apply AR filter to dynamic zipper edges
         l0_ar_enable: bool = False,  # Make L0 intra-level edges causal (time-forward only)
         enable_l0_parent_edges: bool = False,
-        l0_parent_edges_bidirectional: bool = False,
+        l0_parent_edges_bidirectional: bool = True,
         l0_parent_edge_min_level: int = 1,  # Minimum ancestor level to connect to L0 (e.g., 2 means L0 connects to L2 and L3, but not L1)
-        l0_parent_edge_max_level: Optional[int] = 2,
+        l0_parent_edge_max_level: Optional[int] = None,  # Maximum ancestor level to connect to L0 (None = top level)
         ensure_l0_past_l1_edges: bool = False,  # Ensure that L0 nodes have edges from past L1 nodes (if l0_ar_enable)   
         ensure_past_hier_edges_all_levels: bool = False,  # Extend past bridge edges to L1toL0, L2→L1 and L3→L2 (and L2→L0, L3→L0 if enable_l0_parent_edges)
         ensure_l0_past_parent_edges: bool = False,  # STAGGERED uncut L0->past-parent context: L0->past-L1, then past-L2-of-that-L1, then

@@ -58,7 +58,7 @@ gen_max_new_tokens: 512
 save_every: 0
 #checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_hqd/checkpoints
 #checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_hqd/checkpoints
-checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_cnn_crossthinking/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_test_crossthinking_crosslvledges/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -67,6 +67,16 @@ checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_cnn_crossthinking/checkpoint
 # ar_graph_causal sets hier_ar_enable + l0_ar_enable together; the individual dials below
 # (any of them) can be set directly for fine-grained control.
 ar_graph_causal: true
+# Which strictly-past (leak-free) coarse->L0 scheme AR turns on by default so the hierarchy
+# feeds L0 (the AR filter otherwise cuts every downward coarse->L0 edge, going inert):
+#   staggered : DIRECT one-hop edges into L0 from each level -> L0<-L1, L0<-L2, L0<-L3 (the
+#               ancestor NODE per level is picked by a staggered past-walk, but every edge lands
+#               on L0, so L3 reaches L0 in ONE hop). ensure_l0_past_parent_edges. DEFAULT.
+#   bridges   : ADJACENT-RUNG chain -> L0<-L1, L1<-L2, L2<-L3 (L3 reaches L0 only MULTI-hop, via
+#               the intermediate levels; a direct L0<-L2 / L0<-L3 is added ONLY if you also set
+#               enable_l0_parent_edges). ensure_past_hier_edges_all_levels.
+#   both | none. Explicit ensure_* flags still override this.
+ar_hier_edge_mode: bridges
 # hier_ar_enable: true            # level-wise edges are time-forward only
 # l0_ar_enable: true              # L0 intra-level edges are causal (time-forward only)
 # hier_ar_allow_same_time: true   # allow src_time == dst_time edges
@@ -300,7 +310,7 @@ lateral_edge_trace_mode: true_lateral   # windowed_approx | true_scatter | true_
 #         coarse_tokenize = encode dense -> coarse L0, decode back (MODE 1: global-aware pooling,
 #                           fewer L0 nodes -> cheaper cycles).   Use token_unet_scale: >1 (pow2).
 token_unet_enable: false
-token_unet_block: hyena          # cnn | hyena
+token_unet_block: cnn          # cnn | hyena
 token_unet_mode: stem            # stem (mode 2) | coarse_tokenize (mode 1)
 token_unet_dim: 1d               # auto | 1d | 2d  (text is 1d)
 token_unet_scale: 1              # power-of-two. 1 for stem; e.g. 4 for coarse_tokenize pooling

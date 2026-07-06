@@ -17,10 +17,14 @@ you do not set, so configs stay small.
 
 Friendly toggle expansions
 --------------------------
-  attn_backend = pyg | flash | sdpa      -> l0_local_backend
-  qkv_sharing  = shared | separate       -> share_transformers / per_level_local_qkv
-  use_hqd      = bool                     -> hierarchical_query_descent_enable
-  train_mode   = ar | masked_diffusion    -> train_objective_mode (+ use_hybrid_masking)
+  attn_backend      = pyg | flash | sdpa          -> l0_local_backend
+  qkv_sharing       = shared | separate           -> share_transformers / per_level_local_qkv
+  use_hqd           = bool                          -> hierarchical_query_descent_enable
+  train_mode        = ar | masked_diffusion         -> train_objective_mode (+ use_hybrid_masking)
+  ar_graph_causal   = bool                          -> hier_ar_enable / l0_ar_enable (+ ar_hier_edge_mode)
+  ar_hier_edge_mode = staggered | bridges | both | none
+                        -> which strictly-past coarse->L0 scheme AR enables by default
+                           (ensure_l0_past_parent_edges and/or ensure_past_hier_edges_all_levels)
 """
 from __future__ import annotations
 
@@ -65,16 +69,47 @@ def _apply_friendly_aliases(d: dict) -> dict:
     # hier_ar_allow_same_time, enable_l0_parent_edges, l0_parent_edges_bidirectional,
     # ensure_l0_past_l1_edges, ensure_past_hier_edges_all_levels, long_range_distance)
     # can still be set directly for fine-grained control and override this default.
+    #
+    # ar_hier_edge_mode picks WHICH strictly-past (leak-free) scheme AR turns on by default
+    # to reconnect the coarse hierarchy to L0 — otherwise the AR causal filter cuts every
+    # downward coarse->L0 edge and the coarse levels go inert. Both schemes are cut-safe by
+    # construction; explicit ensure_* flags still override whatever the mode selects.
+    #   staggered : DIRECT one-hop edges into L0 from every level -> L0<-L1, L0<-L2, L0<-L3.
+    #               The ancestor NODE per level is chosen by a staggered past-walk (past-L1 of
+    #               the token, past-L2 of that L1, past-L3 of that L2), but every edge lands on
+    #               L0, so L3 reaches L0 in ONE hop. ensure_l0_past_parent_edges. DEFAULT —
+    #               reproduces prior AR behavior.
+    #   bridges   : ADJACENT-RUNG chain -> L0<-L1, L1<-L2, L2<-L3 (L3 reaches L0 only MULTI-hop,
+    #               through the intermediate levels; a direct L0<-L2 / L0<-L3 is added ONLY when
+    #               enable_l0_parent_edges is also on). ensure_past_hier_edges_all_levels.
+    #   both      : enable both schemes.
+    #   none/off  : enable neither (legacy bit-identical — hierarchy stays detached under AR).
+    _AR_EDGE_MODES = {
+        "staggered": ("ensure_l0_past_parent_edges",),
+        "stagger": ("ensure_l0_past_parent_edges",),
+        "l0_past_parent": ("ensure_l0_past_parent_edges",),
+        "bridges": ("ensure_past_hier_edges_all_levels",),
+        "bridge": ("ensure_past_hier_edges_all_levels",),
+        "all_levels": ("ensure_past_hier_edges_all_levels",),
+        "both": ("ensure_l0_past_parent_edges", "ensure_past_hier_edges_all_levels"),
+        "all": ("ensure_l0_past_parent_edges", "ensure_past_hier_edges_all_levels"),
+        "none": (),
+        "off": (),
+        "legacy": (),
+    }
+    ar_edge_mode = str(out.pop("ar_hier_edge_mode", "staggered")).lower()
+    if ar_edge_mode not in _AR_EDGE_MODES:
+        raise ValueError(
+            "ar_hier_edge_mode must be one of "
+            "{'staggered', 'bridges', 'both', 'none'}, got %r" % ar_edge_mode
+        )
     if "ar_graph_causal" in out:
         causal = bool(out.pop("ar_graph_causal"))
         out.setdefault("hier_ar_enable", causal)
         out.setdefault("l0_ar_enable", causal)
-        # Without downward edges the AR causal filter detaches every coarse level from L0
-        # (they become inert). Enable the staggered uncut L0->past-parent context edges so
-        # the hierarchy actually informs the prediction. They are strictly-past by
-        # construction, so they survive the AR filter without leaking. Explicit override wins.
         if causal:
-            out.setdefault("ensure_l0_past_parent_edges", True)
+            for _flag in _AR_EDGE_MODES[ar_edge_mode]:
+                out.setdefault(_flag, True)
 
     # Friendly alias for the model's gradient-checkpointing flag.
     if "gradient_checkpointing" in out:
