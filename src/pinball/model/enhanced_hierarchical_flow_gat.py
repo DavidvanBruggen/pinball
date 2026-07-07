@@ -2104,6 +2104,17 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 #print(seq_len, " seq_len value")
                 token_features_graph = x_final[:, :seq_len_graph, :]
                 token_features = token_features_graph.to(self.output_projection.weight.device, non_blocking=True)
+                # Coarse co-prediction: fold the strictly-past L1/L2/L3 summaries into L0's
+                # pre-head features (causal, gate-init 0 = identity). At graph resolution so the
+                # gather aligns with node_ar_time (before any token-unet decode to dense).
+                if getattr(self, "hier_copredict_l0", False):
+                    token_features = self._copredict_inject(
+                        token_features,
+                        x_final,
+                        getattr(refined_graph, "level_offsets", None),
+                        getattr(refined_graph, "node_ar_time", None),
+                        int(seq_len_graph),
+                    )
                 token_unet_lookahead_features = None
                 need_token_unet_lookahead_logits = bool(getattr(self, "_token_unet_emit_lookahead_logits", False))
                 if token_unet_decode_context is not None:
@@ -2186,6 +2197,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                     ae_logits = getattr(self, "_last_autoenc_logits", None)
                     if ae_logits is not None and tuple(ae_logits.shape[:2]) == tuple(logits.shape[:2]):
                         logits = ae_logits.to(device=logits.device, dtype=logits.dtype)
+                self._maybe_log_gate_monitor()
                 #print(logits.shape, " logits shape after projection")
                 if not getattr(self, "_fp_log_once", False):
                     logger.info(

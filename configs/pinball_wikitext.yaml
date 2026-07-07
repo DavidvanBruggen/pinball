@@ -58,7 +58,8 @@ gen_max_new_tokens: 512
 save_every: 0
 #checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_hqd/checkpoints
 #checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_hqd/checkpoints
-checkpoint_dir: ./pinball/pooled_proj_test_crossthinking_crosslvledges/checkpoints
+#checkpoint_dir: ./pinball/pooled_proj_test_crossthinking_crosslvledges/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_test_crossthinking_copredict_l3q/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -67,6 +68,11 @@ checkpoint_dir: ./pinball/pooled_proj_test_crossthinking_crosslvledges/checkpoin
 # ar_graph_causal sets hier_ar_enable + l0_ar_enable together; the individual dials below
 # (any of them) can be set directly for fine-grained control.
 ar_graph_causal: true
+# Debug: periodically log the essential learnable gates/scales (copredict head gates, cross-query
+# write scales, upper/top refiner level scales) so you can watch which pathways open or collapse.
+# Also callable directly: model.gate_monitor() -> {name: value}.
+pinball_monitor_gates: true
+pinball_monitor_gates_every: 100    # forward calls between logs
 # Which strictly-past (leak-free) coarse->L0 scheme AR turns on by default so the hierarchy
 # feeds L0 (the AR filter otherwise cuts every downward coarse->L0 edge, going inert):
 #   staggered : DIRECT one-hop edges into L0 from each level -> L0<-L1, L0<-L2, L0<-L3 (the
@@ -370,20 +376,33 @@ pinball_upper_update_l2_scale_init: 0.01
 pinball_upper_cross_write_scale_init: 0.01 # L3 residual write scale (starts ~identity)
 #
 # (2) Generic cross-query pairs — arbitrary "query:memory" level pairs, one refiner each.
-# Example: L3 pulls detail from L1. Add more like ["3:2", "3:1", "2:1"]. For a level-0
-# (token) memory pair, ALSO set pinball_cross_query_l0_window to bound the memory.
-pinball_cross_query_pairs: ["3:1"]         # list of "upper:lower"; [] / null = off
+# Each pair is "query:memory": the QUERY level is refined by reading the MEMORY level, and the
+# gated residual is written into the QUERY (memory stays read-only unless update_memory_enable).
+# DOWNWARD DISTRIBUTION (below): the lower levels QUERY L3, so L3's abstraction reaches L2/L1/L0
+# in ONE hop (fast, vs the bridges' multi-hop L3->L2->L1->L0). Because L3 is read-only memory, its
+# forward features are NOT pulled toward token specifics (no abstraction drift) — gradient only
+# shapes L3 to be a readable summary, which the aux loss reinforces. Causal: each L0/L1/L2 query
+# reads only L3 nodes whose window ends at/before it (leak-free). memory=L3 is few nodes -> cheap.
+pinball_cross_query_pairs: ["2:3", "1:3", "0:3"]  # L2<-L3, L1<-L3, L0<-L3 (downward broadcast)
 pinball_cross_query_steps: 2               # master switch; passes per pair (0 = off)
-pinball_cross_query_topk: 8                # top-k memory nodes per selection; 0 = all
+# 0 = attend ALL memory (no top-k selection). Memory here is L3 (few nodes) so this is cheap AND
+# avoids the global_mean selection's causality subtlety (its shared top-k is picked from a query
+# averaged over ALL positions incl. future). With 0 only the per-position causal mask applies.
+pinball_cross_query_topk: 0                # top-k memory nodes per selection; 0 = all
 pinball_cross_query_l0_window: 0           # only used when a pair's memory level is 0 (±ar_time window)
 pinball_cross_query_backend: auto
 pinball_cross_query_causal: true
 pinball_cross_query_shared_weights: true
-pinball_cross_query_update_memory_enable: false  # write back into memory nodes (ignored if memory=L0)
+pinball_cross_query_update_memory_enable: false  # keep L3 read-only in the forward (no abstraction drift)
 pinball_cross_query_selection: global_mean # global_mean (shared top-k) | per_query (per-query top-k, heavier)
-pinball_cross_query_write_scale_init: 0.01
+# Residual write scale into the query level. Last run this COLLAPSED 0.01 -> 1e-4 (model gated the
+# upward "3:1" read off). Start higher to force the downward path open; if it re-collapses, the
+# fix is a hard floor in the refiner (currently soft, can still learn down).
+pinball_cross_query_write_scale_init: 0.1
 
-# Hierarchy auxiliary (reconstruction) loss
+# Hierarchy auxiliary (reconstruction) loss. ON: trains L1/L2/L3 to reconstruct (detached) L0
+# features -> shapes L3 into a good L0-abstraction, which is exactly what the downward cross-query
+# (L0/L1/L2 <- L3) needs to be worth reading. Synergises with the copredict head.
 use_aux_loss: true
 # By default the aux loss uses each level's features as a STOP-GRAD (detached) target (JEPA
 # anti-collapse): the coarse levels are trained to predict L0, but no aux gradient flows back
@@ -392,3 +411,14 @@ use_aux_loss: true
 # toward being reconstructable from the hierarchy. L1/L2/L3 stay detached to limit collapse
 # risk. Off by default (experimental).
 hier_aux_link_l0_target: false
+
+# Coarse co-prediction into L0 (deep supervision at the head). Each configured coarse level
+# (L1/L2/L3) projects its most-recent STRICTLY-PAST closed node (window_end <= token time —
+# the same node the staggered edges pick, so leak-free) into L0's pre-head features, scaled by
+# a learnable per-level gate. This gives the coarse compute a DIRECT next-token gradient and a
+# read-back path at the head, bypassing the late-ascent problem (L3 otherwise only fills at
+# layer ~11 and is never read). Reuses the tied vocab head (cheap). Improves inference too, not
+# just the loss. gate init 0.0 = warm-start bit-identical to a checkpoint without it.
+hier_copredict_l0: true
+hier_copredict_levels: [1, 2, 3]   # coarse levels that co-predict L0 (clipped to available levels)
+hier_copredict_gate_init: 0.0      # per-level gate init; 0.0 = identity warm start, e.g. 0.1 for fresh runs

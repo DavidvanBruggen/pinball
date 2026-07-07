@@ -127,6 +127,12 @@ def build_pinball_model(
             None if getattr(args, "l0_past_parent_max_level", None) in (None, -1)
             else int(getattr(args, "l0_past_parent_max_level", None))
         ),
+        hier_copredict_l0=bool(getattr(args, "hier_copredict_l0", False)),
+        hier_copredict_levels=(list(getattr(args, "hier_copredict_levels", None))
+                               if getattr(args, "hier_copredict_levels", None) else None),
+        hier_copredict_gate_init=float(getattr(args, "hier_copredict_gate_init", 0.0)),
+        pinball_monitor_gates=bool(getattr(args, "pinball_monitor_gates", False)),
+        pinball_monitor_gates_every=int(getattr(args, "pinball_monitor_gates_every", 100)),
         l0_cycles=int(getattr(args, "l0_cycles", 8)),
         l0_local_backend=str(getattr(args, "l0_local_backend", "pyg")),
         l0_local_window=int(getattr(args, "l0_local_window", 0)),

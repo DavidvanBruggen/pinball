@@ -518,6 +518,7 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
             kh = k.reshape(bsz * q_len, k_len, self.num_heads, self.head_dim).transpose(1, 2)
             vh = v.reshape(bsz * q_len, k_len, self.num_heads, self.head_dim).transpose(1, 2)
             mask = None
+            valid_q = None  # [bsz, q_len] False where a query has NO causal memory (all-masked row)
             if self.causal and query_time is not None and memory_time is not None:
                 qt = query_time.to(device=h3.device, dtype=torch.long)
                 mt = memory_time.to(device=h3.device, dtype=torch.long)
@@ -534,8 +535,11 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
                     neg = torch.finfo(qh.dtype).min
                     mask = torch.full((bsz * q_len, 1, 1, k_len), neg, device=h3.device, dtype=qh.dtype)
                     mask = mask.masked_fill(allow.reshape(bsz * q_len, 1, 1, k_len), 0.0)
+                    valid_q = allow.any(dim=-1)  # a finite-min row would else softmax to uniform over FUTURE memory
             y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask, dropout_p=dropout_p, is_causal=False)
             y = y.transpose(1, 2).contiguous().reshape(bsz, q_len, self.work_dim)
+            if valid_q is not None:
+                y = y * valid_q.unsqueeze(-1).to(dtype=y.dtype)
             return self.out_projs[block_idx](y)
         q = self.q_projs[block_idx](self.q_norms[block_idx](h3)).view(bsz, q_len, self.num_heads, self.head_dim)
         k_in, v_in = self.kv_projs[block_idx](self.kv_norms[block_idx](h2)).chunk(2, dim=-1)
@@ -578,6 +582,11 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
             mask = attn_bias.view(attn_bias.size(0), 1, q_len, k_len)
         y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask, dropout_p=dropout_p, is_causal=False)
         y = y.transpose(1, 2).contiguous().reshape(bsz, q_len, self.work_dim)
+        if mask is not None:
+            # Zero any query row with NO causal memory: its bias row is all finite-min, so softmax
+            # would spread uniformly over FUTURE memory (leak). all-masked -> zero contribution.
+            valid_q = (mask > (torch.finfo(mask.dtype).min * 0.5)).any(dim=-1).view(mask.size(0), q_len)
+            y = y * valid_q.reshape(-1, q_len, 1).to(dtype=y.dtype)
         return self.out_projs[block_idx](y)
 
     def forward(
@@ -2161,6 +2170,18 @@ class HierarchicalFlowGAT(nn.Module):
         l0_past_parent_min_level: int = 1,          # lowest parent level to emit a staggered L0 edge for (1 = include the past-L1 edge)
         l0_past_parent_max_level: Optional[int] = None,  # highest parent level (None = top level)
         l0_past_l1_edge_type_id: Optional[int] = None,#5,
+        # Coarse co-prediction: L1/L2/L3 project (causal, strictly-past) into L0's pre-head
+        # features so the coarse compute gets a DIRECT next-token gradient + read-back path at
+        # the head (fixes the late-ascent underuse). Per L0 position t, each level contributes
+        # its most-recent CLOSED node (window_end <= t) -> leak-free. gate init 0 = warm-start
+        # bit-identical (contribution is exactly zero regardless of proj init).
+        hier_copredict_l0: bool = False,
+        hier_copredict_levels: Optional[List[int]] = None,  # default [1,2,3]; clipped to available coarse levels
+        hier_copredict_gate_init: float = 0.0,
+        # Debug monitor: periodically log the essential learnable gates/scales (copredict, cross-query
+        # write scales, upper/top refiner level scales) so you can watch which pathways open/collapse.
+        pinball_monitor_gates: bool = False,
+        pinball_monitor_gates_every: int = 100,   # log cadence in forward calls
         l0_alpha_enable: bool = False, # Whether to apply a learnable alpha to L0 features in the recon head
         l0_local_backend: str = "flash",  # pyg | flash | xformers | sdpa
         l0_local_window: int = 128,
@@ -3529,6 +3550,27 @@ class HierarchicalFlowGAT(nn.Module):
             logger.info("Applied weight tying between token embedding and output projection.")
         elif tie_weights:
             logger.warning("Weight tying ignored because input comes from features.")
+
+        # --- Coarse co-prediction into L0 pre-head features (see _copredict_inject) ---
+        self.hier_copredict_l0 = bool(hier_copredict_l0)
+        num_levels = len(compression_ratios) + 1
+        _copred_levels = [1, 2, 3] if hier_copredict_levels is None else list(hier_copredict_levels)
+        self.hier_copredict_levels = [int(l) for l in _copred_levels if 1 <= int(l) <= num_levels - 1]
+        if self.hier_copredict_l0 and self.hier_copredict_levels:
+            self.copredict_proj = nn.ModuleDict({
+                str(l): nn.Linear(self.hidden_dim, self.hidden_dim) for l in self.hier_copredict_levels
+            })
+            self.copredict_gate = nn.ParameterDict({
+                str(l): nn.Parameter(torch.tensor(float(hier_copredict_gate_init)))
+                for l in self.hier_copredict_levels
+            })
+            logger.info("Coarse co-prediction enabled for levels %s (gate init %.3g).",
+                        self.hier_copredict_levels, float(hier_copredict_gate_init))
+
+        # Debug gate/scale monitor (see gate_monitor()).
+        self.pinball_monitor_gates = bool(pinball_monitor_gates)
+        self.pinball_monitor_gates_every = max(1, int(pinball_monitor_gates_every))
+        self._gate_monitor_calls = 0
 
 
         # --- Edge Feature Generator (Instantiation with correct size) ---
@@ -5324,6 +5366,84 @@ class HierarchicalFlowGAT(nn.Module):
             level_desc[lvl] = desc
 
         return ar_time
+
+    def _copredict_inject(
+        self,
+        token_features: torch.Tensor,      # [B, T_graph, H] L0 pre-head features
+        x_final: torch.Tensor,             # [B, N, H] all-level refined features (per-sample node dim)
+        level_offsets: Optional[List[int]],
+        node_ar_time: Optional[torch.Tensor],  # [N] per-sample window-end times (shared across batch)
+        seq_len_graph: int,
+    ) -> torch.Tensor:
+        """Add each configured coarse level's causal, strictly-past summary into L0's pre-head
+        features. For L0 position t, level L contributes its most-recent CLOSED node
+        (window_end <= t, i.e. the same node the staggered edges pick), projected per level and
+        scaled by a learnable gate (init 0 => identity). Leak-free: window_end <= t never reveals
+        a token after t. node_ar_time is content-independent, so the gather indices are computed
+        once and shared across the batch."""
+        if not getattr(self, "hier_copredict_l0", False) or not getattr(self, "hier_copredict_levels", None):
+            return token_features
+        if node_ar_time is None or level_offsets is None or node_ar_time.numel() < int(level_offsets[-1]):
+            return token_features
+        if x_final.dim() != 3:
+            return token_features
+
+        dev = token_features.device
+        allow_same = bool(getattr(self, "hier_ar_allow_same_time", True))
+        q_time = node_ar_time[:seq_len_graph].to(torch.long)   # L0 window-end == token time
+        out = token_features
+        for lvl in self.hier_copredict_levels:
+            s, e = int(level_offsets[lvl]), int(level_offsets[lvl + 1])
+            if e <= s:
+                continue
+            ptime = node_ar_time[s:e].to(torch.long)
+            sorted_t, sidx = torch.sort(ptime)
+            # most-recent coarse node with window_end <= t (allow_same) or < t (strict AR)
+            pos = torch.searchsorted(sorted_t, q_time, right=allow_same) - 1
+            valid = (pos >= 0)
+            chosen = sidx[pos.clamp(min=0)]                    # [T_graph]
+            coarse = x_final[:, s:e, :]                        # [B, n_lvl, H]
+            gathered = coarse.index_select(1, chosen.to(coarse.device)).to(dev)
+            gathered = gathered * valid.to(dev, gathered.dtype).view(1, -1, 1)
+            proj = self.copredict_proj[str(lvl)](gathered)
+            out = out + self.copredict_gate[str(lvl)] * proj
+        return out
+
+    def gate_monitor(self) -> Dict[str, float]:
+        """Flat dict of the essential learnable gates/scales, so you can watch which pathways
+        open up or collapse during training. Call it anywhere (eval loop, debugger), or flip
+        pinball_monitor_gates to have the forward log it every pinball_monitor_gates_every calls.
+        All near-0 = pathway unused; growing magnitude = the model is leaning on it."""
+        d: Dict[str, float] = {}
+        # Coarse co-prediction into L0 (per-level head gate).
+        if getattr(self, "hier_copredict_l0", False) and hasattr(self, "copredict_gate"):
+            for k, g in self.copredict_gate.items():
+                d[f"copred.L{k}->L0.gate"] = float(g.detach())
+        # Cross-query refiners (downward L0/L1/L2<-L3 or any query<-memory) residual write scale.
+        for r in getattr(self, "pinball_cross_query_refiners", []) or []:
+            d[f"crossq.L{r.query_level}<-L{r.memory_level}.write"] = float(r.write_scale.detach())
+        # Upper cross refiner (L3<-L2).
+        uc = getattr(self, "pinball_upper_cross_refiner", None)
+        if uc is not None:
+            d["uppercross.L3<-L2.write"] = float(uc.write_scale.detach())
+        # Self-refiners: per-level residual scales.
+        for name, mod in (("upperrefine", getattr(self, "pinball_upper_refiner", None)),
+                          ("toprefine", getattr(self, "pinball_top_refiner", None))):
+            if mod is not None and hasattr(mod, "level_scales"):
+                for k, s in mod.level_scales.items():
+                    d[f"{name}.L{k}.scale"] = float(s.detach())
+        return d
+
+    def _maybe_log_gate_monitor(self) -> None:
+        if not bool(getattr(self, "pinball_monitor_gates", False)):
+            return
+        self._gate_monitor_calls = int(getattr(self, "_gate_monitor_calls", 0)) + 1
+        every = int(getattr(self, "pinball_monitor_gates_every", 100))
+        if self._gate_monitor_calls == 1 or (self._gate_monitor_calls % every) == 0:
+            mon = self.gate_monitor()
+            if mon:
+                logger.info("[gate-monitor #%d] %s", self._gate_monitor_calls,
+                            "  ".join(f"{k}={v:+.4f}" for k, v in mon.items()))
 
     def _filter_edges_by_ar_time(
         self,
