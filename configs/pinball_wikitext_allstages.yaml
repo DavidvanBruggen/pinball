@@ -60,7 +60,10 @@ save_every: 0
 #checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_hqd/checkpoints
 #checkpoint_dir: ./pinball/pooled_proj_test_crossthinking_crosslvledges/checkpoints
 #checkpoint_dir: ./pinball/pooled_proj_test_crossthinking_copredict_l3q/checkpoints
-checkpoint_dir: ./pinball/pooled_proj_upref_consolidated/checkpoints
+# ALL-STAGES test config (Stages 1-4): everything in pinball_wikitext.yaml (pooled seed +
+# per-layer upward refresh + consolidated multirate) PLUS Stage 3 (predictive coarse aux ON)
+# and Stage 4 (capacity rebalance: finer L1 via [8,8,4], U-Net FFN widths favouring L1/L2/L3).
+checkpoint_dir: ./pinball/pooled_proj_allstages/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -118,7 +121,10 @@ unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0 # set so graph windows are made dense (k=window_size*2+1) for local connectivity. 0 = sparse only.
-compression_ratios: [16, 4, 4]
+# Stage 4a: [16,4,4] -> [8,8,4]. Doubles L1 granularity (8-token windows, 4-token stride —
+# gate evidence says L1 is the load-bearing coarse level) while keeping L2/L3 token strides
+# IDENTICAL (16/32 tokens) and L3's span unchanged. Only L1 node count doubles (~cheap).
+compression_ratios: [8, 8, 4]
 overlap_ratios: [0.5, 0.5, 0.5]
 # Coarse-node seeding (the ORIGINAL design, restored). mask = coarse nodes start as mask
 # embeddings and content must climb the hierarchy through the refinement layers (measured:
@@ -140,7 +146,7 @@ upper_seed_gate_init: 1.0
 # gate init 0.0 = exact no-op (warm-start bit-identical); 0.1 forces it open on fresh runs
 # (the 0.01-init write scales collapsed last run; 0.1 held).
 hier_upward_refresh: true
-hier_upward_refresh_every: 1        # apply after every layer
+hier_upward_refresh_every: 2        # apply after every layer
 hier_upward_refresh_gate_init: 0.1
 norm_type: layernorm
 dropout: 0.1
@@ -182,7 +188,14 @@ cross_level_qkv: shared
 # LARGE dim = capacity at the "bottleneck", like a U-Net's channel growth. Input/output stay
 # hidden_dim (residual + cross-level attention unaffected). Compute drops (L0 shrunk); params
 # grow (big coarse FFNs, few nodes). [] = uniform (default). e.g. [384, 768, 1152, 1536] for L0..L3.
-per_level_ffn_dims: [] #[192, 384, 1152, 1536]
+# Stage 4b: U-Net FFN widths (dim units; 768 = uniform default). L0 halved (local patterns,
+# cheapest place to save), L1/L2 1.5x, L3 2x — capacity where abstraction lives, on levels
+# with few nodes. MoE-style trade: 2.5x params (210M -> 522M; big coarse FFNs x 12 unshared
+# layers) but measured on 4090 seq-4096 fwd+bwd only +3.5% wallclock (177->183ms) and +1.5GB
+# peak (FFN FLOPs are actually -23% vs uniform; params are cheap, FLOPs are not). Judge this
+# run at matched WALLCLOCK, not matched params. NOT the old [192,384,1152,1536] draft — that
+# halved L1, against the gate evidence (L1 is the load-bearing level).
+per_level_ffn_dims: [] #[384, 1152, 1152, 1536]
 # Per-level LOCAL-attention dim (the big lever — attention is ~84% of graph compute). Each level's
 # window attention runs at num_heads_L = round(mult_L * num_heads) heads, head_dim FIXED at 64
 # (full per-head resolution). L0 (most nodes) fewer heads = cheaper; coarse levels more heads =
@@ -430,9 +443,8 @@ use_aux_loss: true
 # so copying the current window scores NOTHING; only forecasting does. Complements (does not
 # replace) the reconstruction aux above: reconstruction rewards summarizing the past, this rewards
 # abstraction that carries forward. Training-only (forward untouched, no leak surface); targets
-# detached (JEPA-style). OFF here so the current upref_consolidated run is unaffected — flip on
-# for the next run (safe mid-warm-start too: it only adds small per-level predictor MLPs).
-hier_predaux_enable: false
+# detached (JEPA-style).
+hier_predaux_enable: true   # Stage 3 ON in the all-stages test
 lambda_hier_predaux: 0.05
 hier_predaux_levels: [1, 2, 3]
 hier_predaux_horizon: 0        # windows ahead; 0 = auto (first non-overlapping window)

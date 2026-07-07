@@ -2182,6 +2182,32 @@ class HierarchicalFlowGAT(nn.Module):
         # write scales, upper/top refiner level scales) so you can watch which pathways open/collapse.
         pinball_monitor_gates: bool = False,
         pinball_monitor_gates_every: int = 100,   # log cadence in forward calls
+        # Per-layer upward refresh: after every k-th refinement layer, re-pool each level's
+        # child-window mean into its parent via a gated residual, bottom-up (L1 from the
+        # current L0, then L2 from the UPDATED L1, ...). Abstraction then ascends every layer
+        # instead of accumulating until the last layers (the late-ascent fix). Causal for the
+        # same reason as the pooled seed: a parent's ar_time is its child window's END, so the
+        # pooled window reveals nothing a reader could not already reach through causal upward
+        # edges. gate init 0 = exact no-op (warm-start bit-identical).
+        hier_upward_refresh: bool = False,
+        hier_upward_refresh_every: int = 1,       # apply after every k-th layer call
+        hier_upward_refresh_gate_init: float = 0.0,
+        # Predictive coarse aux ("next-concept" prediction): each coarse node predicts the
+        # DETACHED pooled child summary of a strictly-future window at its own level — the LM
+        # objective one timescale up. Unlike the reconstruction aux (which rewards summarizing
+        # the PAST, i.e. copying scores), a summary only scores here by being PREDICTIVE.
+        # Training-only loss; the forward pass is untouched (no leak surface).
+        hier_predaux_enable: bool = False,
+        lambda_hier_predaux: float = 0.05,
+        hier_predaux_levels: Optional[List[int]] = None,  # default [1,2,3]; clipped to coarse levels
+        hier_predaux_horizon: int = 0,            # windows ahead; 0 = auto (first NON-overlapping window)
+        hier_predaux_loss_mode: str = "cosine",   # cosine | mse_norm | mse
+        hier_predaux_predictor: str = "mlp",      # mlp | linear
+        # "next" is the AR form (forecast only). In MASKED/bidirectional training the future is
+        # partially visible, so "next" degrades toward copying — use "both" there: a second
+        # per-level head also predicts the PREVIOUS non-overlapping window, turning the loss
+        # into masked-window summary prediction (the meaningful bidirectional analogue).
+        hier_predaux_directions: str = "next",    # next | both
         l0_alpha_enable: bool = False, # Whether to apply a learnable alpha to L0 features in the recon head
         l0_local_backend: str = "flash",  # pyg | flash | xformers | sdpa
         l0_local_window: int = 128,
@@ -3567,6 +3593,50 @@ class HierarchicalFlowGAT(nn.Module):
             logger.info("Coarse co-prediction enabled for levels %s (gate init %.3g).",
                         self.hier_copredict_levels, float(hier_copredict_gate_init))
 
+        # --- Per-layer upward refresh (see _apply_upward_refresh) ---
+        self.hier_upward_refresh = bool(hier_upward_refresh)
+        self.hier_upward_refresh_every = max(1, int(hier_upward_refresh_every))
+        if self.hier_upward_refresh:
+            self.upward_refresh_proj = nn.ModuleList(
+                nn.Linear(self.hidden_dim, self.hidden_dim) for _ in compression_ratios
+            )
+            self.upward_refresh_gates = nn.Parameter(
+                torch.full((len(compression_ratios),), float(hier_upward_refresh_gate_init))
+            )
+            logger.info("Per-layer upward refresh enabled (every %d layer(s), gate init %.3g).",
+                        self.hier_upward_refresh_every, float(hier_upward_refresh_gate_init))
+
+        # --- Predictive coarse aux (see _compute_predictive_aux_loss) ---
+        self.hier_predaux_enable = bool(hier_predaux_enable)
+        self.lambda_hier_predaux = float(lambda_hier_predaux)
+        _pa_levels = [1, 2, 3] if hier_predaux_levels is None else list(hier_predaux_levels)
+        self.hier_predaux_levels = [int(l) for l in _pa_levels if 1 <= int(l) <= num_levels - 1]
+        self.hier_predaux_horizon = int(hier_predaux_horizon)
+        self.hier_predaux_loss_mode = str(hier_predaux_loss_mode).lower()
+        self._last_hier_predaux_loss: Optional[torch.Tensor] = None
+        if self.hier_predaux_enable and self.hier_predaux_levels:
+            def _predaux_head() -> nn.Module:
+                if str(hier_predaux_predictor).lower() == "linear":
+                    return nn.Linear(self.hidden_dim, self.hidden_dim)
+                return nn.Sequential(
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                )
+            self.predaux_predictor = nn.ModuleDict(
+                {str(l): _predaux_head() for l in self.hier_predaux_levels}
+            )
+            self.hier_predaux_directions = str(hier_predaux_directions).lower()
+            if self.hier_predaux_directions not in ("next", "both"):
+                raise ValueError("hier_predaux_directions must be 'next' or 'both'")
+            if self.hier_predaux_directions == "both":
+                self.predaux_predictor_prev = nn.ModuleDict(
+                    {str(l): _predaux_head() for l in self.hier_predaux_levels}
+                )
+            logger.info("Predictive coarse aux enabled for levels %s (lambda %.3g, loss %s, dir %s).",
+                        self.hier_predaux_levels, self.lambda_hier_predaux,
+                        self.hier_predaux_loss_mode, self.hier_predaux_directions)
+
         # Debug gate/scale monitor (see gate_monitor()).
         self.pinball_monitor_gates = bool(pinball_monitor_gates)
         self.pinball_monitor_gates_every = max(1, int(pinball_monitor_gates_every))
@@ -4694,37 +4764,87 @@ class HierarchicalFlowGAT(nn.Module):
         self._pooled_seed_idx_cache[key] = out
         return out
 
+    def _pooled_child_window_means(self, lower: torch.Tensor, lvl: int, n_parent: int) -> torch.Tensor:
+        """Per-parent-window child means -> [B, n_parent, H] for level lvl pooling level lvl-1.
+
+        Same window rule as _pooled_seed_indices / _create_next_level, but the regular bulk
+        windows go through a ZERO-COPY unfold view (no 2x child materialization, no scatter);
+        only the few clamped tail windows are sliced explicitly. All bounds are python ints —
+        no GPU sync, no data-dependent shapes.
+        """
+        B, n_lower, H = lower.shape
+        comp = int(self.compression_ratios[lvl - 1])
+        stride = max(1, int(comp * (1 - self.overlap_ratios[lvl - 1])))
+        n_bulk = min(n_parent, (n_lower - comp) // stride + 1) if n_lower >= comp else 0
+        parts = []
+        if n_bulk > 0:
+            parts.append(lower.unfold(1, comp, stride)[:, :n_bulk].mean(dim=-1))
+        for i in range(n_bulk, n_parent):
+            start = min(i * stride, n_lower - 1)
+            end = max(min(start + comp, n_lower), start + 1)
+            parts.append(lower[:, start:end].mean(dim=1, keepdim=True))
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+
+    def _level_offsets_list(self, level_offsets: torch.Tensor) -> List[int]:
+        """level_offsets as python ints without a per-call GPU sync: the skeleton cache keeps
+        the same offsets tensor alive across forwards, so key on its identity and .tolist()
+        only when it actually changes (seq-len/graph change)."""
+        key = (int(level_offsets.data_ptr()), int(level_offsets.numel()), str(level_offsets.device))
+        cached = getattr(self, "_level_offsets_list_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        vals = [int(o) for o in level_offsets.tolist()]
+        self._level_offsets_list_cache = (key, vals)
+        return vals
+
     def _apply_pooled_upper_seed(self, x_cat: torch.Tensor, level_sizes: List[int]) -> torch.Tensor:
         """Seed coarse levels bottom-up with gated, level-projected child-window means.
 
         x_cat: [B, N_total, H] with the L0 slice already holding per-sample token embeddings
         and the coarse slices holding the base init (mask/zeros). Only the main hierarchy
         slices (first sum(level_sizes) nodes) are touched; appended AE decoder nodes keep
-        their base init. seed = base + gate_l * (pooled - base); gate=0 == old behaviour.
+        their base init. seed = base + gate_l * (proj(pooled) - base); gate=0 == old behaviour.
+        (proj(mean(children)) == mean(proj(children)) for a Linear, so pooling FIRST projects
+        n_parent nodes instead of ~2x n_child — same output, ~1/3 the projection FLOPs.)
         """
-        idx_per_level = self._pooled_seed_indices(level_sizes, x_cat.device)
         offsets = [0]
         for s in level_sizes:
             offsets.append(offsets[-1] + int(s))
-        B, _, H = x_cat.shape
+        pieces = [x_cat[:, : offsets[1], :]]
+        lower = x_cat[:, offsets[0] : offsets[1], :]
         for lvl in range(1, len(level_sizes)):
-            child_idx, parent_idx, counts = idx_per_level[lvl - 1]
-            lower = x_cat[:, offsets[lvl - 1] : offsets[lvl], :]
-            projected = self.level_projections[lvl - 1](lower.index_select(1, child_idx))
-            pooled = projected.new_zeros(B, int(level_sizes[lvl]), H)
-            pooled.index_add_(1, parent_idx, projected)
-            pooled = pooled / counts.view(1, -1, 1).to(dtype=pooled.dtype)
+            pooled = self.level_projections[lvl - 1](
+                self._pooled_child_window_means(lower, lvl, int(level_sizes[lvl]))
+            )
             base = x_cat[:, offsets[lvl] : offsets[lvl + 1], :]
             gate = self.upper_seed_gates[lvl - 1].to(dtype=pooled.dtype)
-            x_cat = torch.cat(
-                [
-                    x_cat[:, : offsets[lvl], :],
-                    base + gate * (pooled - base),
-                    x_cat[:, offsets[lvl + 1] :, :],
-                ],
-                dim=1,
-            )
-        return x_cat
+            cur = base + gate * (pooled - base)
+            pieces.append(cur)
+            lower = cur
+        pieces.append(x_cat[:, offsets[-1] :, :])
+        return torch.cat(pieces, dim=1)
+
+    def _apply_upward_refresh(self, x: torch.Tensor, level_offsets: torch.Tensor) -> torch.Tensor:
+        """Gated per-layer upward re-pool: parent = parent + gate_l * proj_l(mean of child window).
+
+        x: [B, N, H]. Runs bottom-up on the UPDATED lower slice, so one call carries L0's
+        current state all the way to the top. Window rule and causality are those of
+        _apply_pooled_upper_seed (parent ar_time = child window END); nodes past the main
+        hierarchy slices (level_offsets[-1]:) are untouched. gate=0 is an exact no-op.
+        One full-tensor rebuild per call (single cat), sync-free.
+        """
+        offsets = self._level_offsets_list(level_offsets)
+        level_sizes = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
+        pieces = [x[:, : offsets[1], :]]
+        lower = x[:, offsets[0] : offsets[1], :]
+        for lvl in range(1, len(level_sizes)):
+            pooled = self._pooled_child_window_means(lower, lvl, int(level_sizes[lvl]))
+            gate = self.upward_refresh_gates[lvl - 1].to(dtype=pooled.dtype)
+            cur = x[:, offsets[lvl] : offsets[lvl + 1], :] + gate * self.upward_refresh_proj[lvl - 1](pooled)
+            pieces.append(cur)
+            lower = cur
+        pieces.append(x[:, offsets[-1] :, :])
+        return torch.cat(pieces, dim=1)
 
     def _create_next_level(self, lower_graph, level_idx, compression_ratio, overlap_ratio):
         """
@@ -5409,6 +5529,58 @@ class HierarchicalFlowGAT(nn.Module):
             out = out + self.copredict_gate[str(lvl)] * proj
         return out
 
+    def _compute_predictive_aux_loss(
+        self,
+        x_bnh: torch.Tensor,                      # [B, N, H] refined all-level features
+        level_offsets: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Next-concept prediction at the coarse timescale: the level-k node at window i
+        predicts the DETACHED pooled child summary of window i+h at its own level. h (auto)
+        is the first horizon whose window starts at/after this window's END (ceil(comp/stride);
+        h=2 at 50% overlap), so the target holds strictly-future content and copying the
+        current window scores nothing. Targets are detached (JEPA-style): gradient flows only
+        into the predicting node, training the hierarchy to FORECAST — the same pressure CE
+        puts on L0, one timescale up. Returns None when disabled/not training."""
+        if not (self.training and getattr(self, "hier_predaux_enable", False)):
+            return None
+        if level_offsets is None or not getattr(self, "hier_predaux_levels", None):
+            return None
+        offsets = [int(o) for o in level_offsets.tolist()]
+        level_sizes = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
+        idx_per_level = self._pooled_seed_indices(level_sizes, x_bnh.device)
+        B = x_bnh.size(0)
+        losses = []
+        for lvl in self.hier_predaux_levels:
+            if lvl >= len(level_sizes):
+                continue
+            n = int(level_sizes[lvl])
+            comp = int(self.compression_ratios[lvl - 1])
+            stride = max(1, int(comp * (1 - self.overlap_ratios[lvl - 1])))
+            h = self.hier_predaux_horizon if self.hier_predaux_horizon > 0 else -(-comp // stride)
+            if n <= h:
+                continue
+            child_idx, parent_idx, counts = idx_per_level[lvl - 1]
+            children = x_bnh[:, offsets[lvl - 1] : offsets[lvl], :].index_select(1, child_idx)
+            pooled = children.new_zeros(B, n, children.size(-1))
+            pooled.index_add_(1, parent_idx, children)
+            target = (pooled / counts.view(1, -1, 1).to(dtype=pooled.dtype)).detach()
+            feats = x_bnh[:, offsets[lvl] : offsets[lvl + 1], :]
+            pairs = [(self.predaux_predictor[str(lvl)](feats)[:, : n - h], target[:, h:])]
+            if getattr(self, "hier_predaux_directions", "next") == "both":
+                pairs.append((self.predaux_predictor_prev[str(lvl)](feats)[:, h:], target[:, : n - h]))
+            mode = self.hier_predaux_loss_mode
+            for p, t in pairs:
+                p, t = p.float(), t.float()
+                if mode == "cosine":
+                    losses.append((1.0 - F.cosine_similarity(p, t, dim=-1)).mean())
+                elif mode in ("mse_norm", "nmse"):
+                    losses.append(F.mse_loss(F.normalize(p, dim=-1), F.normalize(t, dim=-1)))
+                else:
+                    losses.append(F.mse_loss(p, t))
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
     def gate_monitor(self) -> Dict[str, float]:
         """Flat dict of the essential learnable gates/scales, so you can watch which pathways
         open up or collapse during training. Call it anywhere (eval loop, debugger), or flip
@@ -5419,6 +5591,10 @@ class HierarchicalFlowGAT(nn.Module):
         if getattr(self, "hier_copredict_l0", False) and hasattr(self, "copredict_gate"):
             for k, g in self.copredict_gate.items():
                 d[f"copred.L{k}->L0.gate"] = float(g.detach())
+        # Per-layer upward refresh (child-window re-pool into parent) gates.
+        if getattr(self, "hier_upward_refresh", False) and hasattr(self, "upward_refresh_gates"):
+            for i in range(self.upward_refresh_gates.numel()):
+                d[f"upref.L{i}->L{i + 1}.gate"] = float(self.upward_refresh_gates[i].detach())
         # Cross-query refiners (downward L0/L1/L2<-L3 or any query<-memory) residual write scale.
         for r in getattr(self, "pinball_cross_query_refiners", []) or []:
             d[f"crossq.L{r.query_level}<-L{r.memory_level}.write"] = float(r.write_scale.detach())
@@ -11311,6 +11487,15 @@ class HierarchicalFlowGAT(nn.Module):
                     x = self.pinball_refinement_norm(x)
                 layer_step += 1
 
+                # Per-layer upward refresh: ascend this layer's L0 state into the coarse levels
+                # NOW, so the next layer's downward reads see a current abstraction.
+                if (
+                    getattr(self, "hier_upward_refresh", False)
+                    and base_lo is not None
+                    and (layer_step % self.hier_upward_refresh_every) == 0
+                ):
+                    x = self._apply_upward_refresh(x, base_lo)
+
                 # Per-layer co-evolution hook: run one memory round in lockstep with this
                 # native layer (memory graph evolves at the same depth as the native graph).
                 if per_layer_hook is not None:
@@ -11687,6 +11872,7 @@ class HierarchicalFlowGAT(nn.Module):
                     base_lo=tb_lo,
                     base_ar_time=getattr(tb_graph, "node_ar_time", None),
                 )
+                self._last_hier_predaux_loss = self._compute_predictive_aux_loss(x_tb, tb_lo)
                 self._set_true_batch_nozip_tail_metrics(
                     cycles_used=num_cycles,
                     zip_added_total=getattr(tb_graph, "zip_added_total", None),
@@ -12118,6 +12304,7 @@ class HierarchicalFlowGAT(nn.Module):
                     aux_loss = None
 
             self._last_hier_aux_loss = aux_loss
+            self._last_hier_predaux_loss = None  # predictive aux runs on the fast path only
 
             # 7. Reshape and Restore
             unified_graph.x = g_work.x.view(B, N, H)# if B > 1 else g_work.x.view(N, H)

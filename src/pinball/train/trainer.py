@@ -1132,6 +1132,10 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
             if aux is not None:
                 loss = loss + model.lambda_hier_aux * aux.mean()
 
+            predaux = getattr(model, "_last_hier_predaux_loss", None)
+            if predaux is not None:
+                loss = loss + model.lambda_hier_predaux * predaux.mean()
+
             # torch.cuda.reset_peak_memory_stats(device)
             # torch.cuda.synchronize(device)
             # torch.cuda.empty_cache()
