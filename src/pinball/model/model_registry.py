@@ -136,6 +136,12 @@ def build_pinball_model(
         hier_upward_refresh=bool(getattr(args, "hier_upward_refresh", False)),
         hier_upward_refresh_every=int(getattr(args, "hier_upward_refresh_every", 1)),
         hier_upward_refresh_gate_init=float(getattr(args, "hier_upward_refresh_gate_init", 0.0)),
+        hier_downward_refresh=bool(getattr(args, "hier_downward_refresh", False)),
+        hier_downward_refresh_pairs=(list(getattr(args, "hier_downward_refresh_pairs", None))
+                                     if getattr(args, "hier_downward_refresh_pairs", None) else None),
+        hier_downward_refresh_every=int(getattr(args, "hier_downward_refresh_every", 1)),
+        hier_downward_refresh_gate_init=float(getattr(args, "hier_downward_refresh_gate_init", 0.0)),
+        drop_static_cross_level_edges=bool(getattr(args, "drop_static_cross_level_edges", False)),
         hier_predaux_enable=bool(getattr(args, "hier_predaux_enable", False)),
         lambda_hier_predaux=float(getattr(args, "lambda_hier_predaux", 0.05)),
         hier_predaux_levels=(list(getattr(args, "hier_predaux_levels", None))

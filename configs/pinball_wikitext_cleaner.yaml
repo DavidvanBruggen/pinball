@@ -1,0 +1,483 @@
+# Pinball hierarchical graph transformer — autoregressive LM on WikiText-103.
+# Friendly toggles (attn_backend / qkv_sharing / train_mode / use_hqd) expand to the
+# underlying flags in pinball.config.PinballConfig. See README for the full toggle table.
+
+model_type: pinball
+modality: text
+tokenizer_name: gpt2
+
+# Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
+text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
+block_size: 8196 #16384 #32768 #1024
+batch_size: 4
+val_split: 0.01
+
+# Training
+train_mode: ar            # ar | masked_diffusion
+learning_rate: 0.0001
+weight_decay: 0.1
+warmup_steps: 1000
+#max_steps: 20000
+# Optimizer: adamw | muon_hybrid. muon_hybrid trains 2D+ weight matrices with Muon at
+# learning_rate * muon_lr_mult (RMS-matched to AdamW), and 1D params (embeddings, norms,
+# biases) with AdamW at the base LR — usually learns markedly faster than plain AdamW.
+optimizer: muon_hybrid
+muon_lr_mult: 6.0                 # Muon LR multiplier on the matrix param group
+muon_betas: [0.9, 0.95]          # AdamW betas for the 1D param group
+muon_adjust_lr_fn: match_rms_adamw
+# Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
+# Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
+# epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
+num_epochs: 100
+samples_per_epoch: 3125 #25000 #782 #25000
+gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
+gradient_checkpointing: false    # trade compute for memory in the refinement stack
+# Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
+# in seq-chunks of `chunked_ce_seq_chunk`, never materializing the full [B,T,vocab] logits (+ its
+# softmax/CE backward). At B=8,T=1024,V=50257 that head is ~3.3GB -> chunking it is the main
+# memory lever AFTER gradient_checkpointing (which only frees refinement-layer activations, not
+# weights/grads/optimizer/loss-head). Loss-equivalent. chunk e.g. 256 (=4 chunks over T=1024).
+# The position-chunk auto-scales UP for small batch (>= ~2048 tokens/chunk = B*chunk), so a long
+# sequence at batch 1 stays a few big chunks instead of hundreds of tiny launch-bound ones.
+train_feature_chunked_ce_enable: false
+chunked_ce_seq_chunk: 64
+# Long-context diagnostic: every N validations, log next-token PPL bucketed by in-context
+# recurrence distance (never / <128 / 128-511 / 512-2k / >2k). Cheap — reuses the val batches,
+# no extra forward. The split that matters: <128 (inside local window) vs >=128 (needs the
+# hierarchy). 0 = off. longctx_diag_max_seqs caps sequences scanned per run (default 64).
+longctx_diag_every: 1
+# longctx_diag_max_seqs: 64
+# Periodic generation / checkpointing (in training batches; 0 = per-epoch / end only).
+# (CLI: --generate-every / --save-every / --checkpoint-dir.)
+generate_every: 0
+# Generation prompt/continuation lengths. gen_prompt_tokens defaults to min(64, block_size//2);
+# raise it for long-range PG19 conditioning (must be <= block_size). Leave sample_prompt unset
+# so the prompt is sampled from held-out val text rather than a fixed short string.
+gen_prompt_tokens: 512
+gen_max_new_tokens: 512
+save_every: 0
+#checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_hqd/checkpoints
+#checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_hqd/checkpoints
+#checkpoint_dir: ./pinball/pooled_proj_test_crossthinking_crosslvledges/checkpoints
+#checkpoint_dir: ./pinball/pooled_proj_test_crossthinking_copredict_l3q/checkpoints
+# CLEANER-PINBALL test config: the vertical STATIC scatter backbone is retired entirely and
+# replaced by dense linear-cost ops — per layer: local flash attention + upward refresh (pool)
+# + downward refresh (most-recent-closed gather from every coarser level); content-addressed
+# far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
+# Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
+# they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
+checkpoint_dir: ./pinball/pooled_proj_cleaner/checkpoints
+#log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
+# Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
+# resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
+
+# AR graph connectivity — make the hierarchy graph causal for autoregressive training.
+# ar_graph_causal sets hier_ar_enable + l0_ar_enable together; the individual dials below
+# (any of them) can be set directly for fine-grained control.
+ar_graph_causal: true
+# Debug: periodically log the essential learnable gates/scales (copredict head gates, cross-query
+# write scales, upper/top refiner level scales) so you can watch which pathways open or collapse.
+# Also callable directly: model.gate_monitor() -> {name: value}.
+pinball_monitor_gates: true
+pinball_monitor_gates_every: 100    # forward calls between logs
+# Which strictly-past (leak-free) coarse->L0 scheme AR turns on by default so the hierarchy
+# feeds L0 (the AR filter otherwise cuts every downward coarse->L0 edge, going inert):
+#   staggered : DIRECT one-hop edges into L0 from each level -> L0<-L1, L0<-L2, L0<-L3 (the
+#               ancestor NODE per level is picked by a staggered past-walk, but every edge lands
+#               on L0, so L3 reaches L0 in ONE hop). ensure_l0_past_parent_edges. DEFAULT.
+#   bridges   : ADJACENT-RUNG chain -> L0<-L1, L1<-L2, L2<-L3 (L3 reaches L0 only MULTI-hop, via
+#               the intermediate levels; a direct L0<-L2 / L0<-L3 is added ONLY if you also set
+#               enable_l0_parent_edges). ensure_past_hier_edges_all_levels.
+#   both | none. Explicit ensure_* flags still override this.
+# cleaner-pinball: no AR bridge/staggered edges — the downward refresh below carries the
+# recency-based vertical flow as a dense gather, and the static cross-level scatter edges are
+# dropped from the refinement edge set entirely (dynamic HQD/zipper edges unaffected).
+ar_hier_edge_mode: none
+drop_static_cross_level_edges: true
+# hier_ar_enable: true            # level-wise edges are time-forward only
+# l0_ar_enable: true              # L0 intra-level edges are causal (time-forward only)
+# hier_ar_allow_same_time: true   # allow src_time == dst_time edges
+# enable_l0_parent_edges: false   # add L0->parent edges across levels
+# l0_parent_edges_bidirectional: false
+# ensure_l0_past_l1_edges: false  # guarantee each L0 node sees past L1 nodes
+# ensure_past_hier_edges_all_levels: false
+# long_range_distance: 3      # max graph hops for long-range edges
+
+# Core shape
+hidden_dim: 768 #768
+num_heads: 12 #12
+# Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
+# on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
+# qk==v head_dim). Both default 1.0 = off (bit-identical).
+#   attn_sparse_v_mult : widen v_head_dim — a richer value payload carried THROUGH the sparse
+#     aggregation (the capacity a dense model can't afford), down-projected on output. Applies
+#     to BOTH sparse paths: the cross-level (vertical) message passing AND the HQD read.
+#   attn_sparse_qk_mult: widen qk_head_dim. Your head_dim is 64 < model_dim 128, so the per-head
+#     routing form is rank-capped at 64; mult 2.0 -> head_dim 128 = full rank. Helps up to ==128.
+#     Applies to the cross-level message passing; the HQD descent SELECTION stays at head_dim
+#     (its q/k entangle with the shared zipper-qk cache + witness scoring — widening there is a
+#     separate follow-up). HQD still gets the fat-V payload above.
+# (To add more independent routing patterns instead, raise num_heads above — uncapped, compounding.)
+attn_sparse_qk_mult: 1.0    # try 2.0 to lift cross-level routing rank 64 -> 128
+attn_sparse_v_mult: 1.0     # try 2.0 / 4.0 for fat-V (both sparse paths)
+num_refinement_layers: 12 #12
+num_layers: [0, 0, 0, 0]
+internal_cycles: [0, 0, 0, 0]
+refinement_style: unified
+unified_refinement_cycles: 1
+l0_cycles: 0
+iterative_refinement_cycles: 0
+local_connectivity_window_size: 0 # set so graph windows are made dense (k=window_size*2+1) for local connectivity. 0 = sparse only.
+compression_ratios: [16, 4, 4]
+overlap_ratios: [0.5, 0.5, 0.5]
+# Coarse-node seeding (the ORIGINAL design, restored). mask = coarse nodes start as mask
+# embeddings and content must climb the hierarchy through the refinement layers (measured:
+# L3 only fills at layer 11 of 12 — the summary forms too late to be read back). pooled =
+# seed each coarse node bottom-up with the level-projected mean of its child window
+# (reuses level_projections), blended by a learnable per-level gate:
+#   seed = mask + gate * (pooled - mask);  gate init upper_seed_gate_init.
+# Causal: a coarse node's AR time is its window END, so pooling the full window reveals
+# nothing beyond what the causal upward edges already deliver. Warm start: set gate 0.0
+# (exactly reproduces mask init) and let it learn; fresh runs use 1.0.
+upper_init: pooled            # mask | zeros | pooled
+upper_seed_gate_init: 1.0
+# Per-layer UPWARD REFRESH (late-ascent fix, part 2 — the seed above is part 1). After every
+# k-th refinement layer, re-pool each level's child-window mean into its parent with a gated
+# residual, bottom-up (L1 from the current L0, then L2 from the UPDATED L1, ...): abstraction
+# ascends EVERY layer instead of accumulating until layer ~11, so the downward reads (bridges +
+# cross-query below) see a current summary at every depth. Same window rule + causality as the
+# pooled seed (parent ar_time = window end). Cost is one mean+Linear on the coarse slices, O(N).
+# gate init 0.0 = exact no-op (warm-start bit-identical); 0.1 forces it open on fresh runs
+# (the 0.01-init write scales collapsed last run; 0.1 held).
+hier_upward_refresh: true
+hier_upward_refresh_every: 1        # apply after every layer
+hier_upward_refresh_gate_init: 0.1
+# Per-layer DOWNWARD REFRESH — the dense replacement for the bridges scatter: each fine node
+# gathers the most-recent CLOSED node of each coarser level (the exact node a bridge edge
+# points at), projected per pair + gated residual. Project-then-gather => O(N), no attention,
+# no scatter. Chained top-down, so L3 reaches L0 within one layer. The cross-query below stays
+# as the content-addressed read (recency vs relevance are different queries).
+hier_downward_refresh: true
+# hier_downward_refresh_pairs: ["0:1","0:2","0:3","1:2","1:3","2:3"]   # default: all downward
+hier_downward_refresh_every: 1
+hier_downward_refresh_gate_init: 0.1
+norm_type: layernorm
+dropout: 0.1
+
+# Frontier-consistent AR generation: a raw prefix builds TRUNCATED coarse windows, so the token
+# being predicted reads its own OPEN parent — but in training that parent's full window extends
+# past it and is causal-cut. This pads the prefix forward by the top-level coarse window span
+# (causally-invisible pad tokens) so the frontier sees the SAME closed-window context as training.
+# Verified bit-exact; fixes "generate with only the graph" gibberish. Costs ~span extra tokens/step.
+gen_frontier_consistent: true
+
+# Attention / hierarchy toggles
+attn_backend: flash        # pyg | flash | sdpa
+qkv_sharing: separate      # shared | separate
+# Tier-3 packed cross-level backbone attention: a dense/batched fast lane for the
+# cross-level message passing (groups each destination's parents into a padded fixed-K
+# block per level, runs [B,Q,K,H,D] attention instead of gather/segment-softmax/scatter).
+# Mathematically identical to the scatter default (validated 2.1e-6); scatter stays the
+# default + the fallback for every graph feature it can't pack (edge feats/conditioning,
+# learned edges, trace, witnesses, fat-QKV). ~1.2-1.3x on uniform cross-level degree;
+# pays off on large/dense graphs, negligible at this config's sparse cross-level edges.
+# ALSO the (free) capture point for hqd_packed_witness_source: backbone — flip to true
+# when running HQD with the backbone witness source.
+cross_level_packed: false
+# Per-level cross-level (backbone + HQD) QKV. With qkv_sharing:separate the WINDOWS already
+# have per-level QKV; this gives the VERTICAL (cross-level) path the same, so an L0 query
+# attends to an L3 key in a level-specific subspace (vs today's single shared projection +
+# additive level-pair bias). Feeds packed/scatter cross-level AND the HQD selector; the local
+# window path keeps its own QKV. Copy-initialized from shared (starts bit-identical, fp32
+# parity 0.0). ~1-3% slower (same FLOPs, each node projected once by its level). Modes:
+#   shared        : single q/k/v_proj for all levels (default, current behaviour)
+#   per_level_qk  : per-level Q and K, shared V  (~+57M params; routing lives in q.k)
+#   per_level_qkv : per-level Q, K and V         (~+85M params; max expressiveness)
+#   reuse_local   : reuse the per-level LOCAL window projections (no new params)
+cross_level_qkv: shared
+# Per-level FFN dims (U-Net-style capacity schedule in the HIERARCHY, no separate U-Net needed).
+# Each level's FFN gets its own SwiGLU expansion width (inner ~ 4*2/3*dim_L): L0 has ~all the
+# nodes so a SMALL dim makes the FFN CHEAPER where it dominates; coarse levels (few nodes) get a
+# LARGE dim = capacity at the "bottleneck", like a U-Net's channel growth. Input/output stay
+# hidden_dim (residual + cross-level attention unaffected). Compute drops (L0 shrunk); params
+# grow (big coarse FFNs, few nodes). [] = uniform (default). e.g. [384, 768, 1152, 1536] for L0..L3.
+per_level_ffn_dims: [] #[192, 384, 1152, 1536]
+# Per-level LOCAL-attention dim (the big lever — attention is ~84% of graph compute). Each level's
+# window attention runs at num_heads_L = round(mult_L * num_heads) heads, head_dim FIXED at 64
+# (full per-head resolution). L0 (most nodes) fewer heads = cheaper; coarse levels more heads =
+# capacity (U-Net schedule). q/k/v scale together (shared num_heads). hidden->d_L q/k/v + d_L->
+# hidden out proj per level (Fat-QKV pattern); cross-level stays hidden. Flash-only. [] = uniform.
+# e.g. [0.5, 1.0, 1.5, 2.0] -> heads [6,12,18,24].
+per_level_attn_mult: [] #[1, 1, 1, 1]
+# Local-attention head_dim override (NARROW residual, WIDE attention). 0 = hidden//num_heads.
+# With a small hidden_dim (e.g. 192, head_dim 16), set this to 64 to UP-PROJECT the local
+# attention q/k/v to num_heads*64 (full-resolution heads) and project back to hidden. Everything
+# else (FFN, cross-level, output head, embeddings) stays at the cheap small hidden; only the
+# attention is widened -> ~4x cheaper than a full hidden-768 model at comparable attention res.
+# Requires per_level_attn_mult set (even [1,1,1,1] for a uniform up-projection). Its own RoPE
+# is built at this head_dim. Flash-friendly at 64/128.
+local_attn_head_dim: 0
+use_hqd: false              # enables packed witness runtime hook
+hqd_query_chunk_size: 1024000000 # 4096
+hqd_include_local_window: False
+hqd_every_n: 3                 # packed witness read every refinement layer
+# Shift the every-N schedule: HQD runs at layers offset, offset+n, ... (default 0 =
+# layers 0,3,6,9). With hqd_packed_witness_source: backbone set offset >= 1 so every HQD
+# layer already has a packed-lane capture from an earlier layer — otherwise the layer-0
+# build falls back to a recompute (pays both builds).
+hqd_every_n_offset: 1
+hqd_reuse_previous: false
+hqd_reuse_max_age: 0
+hqd_topk_l3: 4 #8 #4 #16 #16 # 4
+hqd_topk_l2: 4 #8 #4 #16 #8 #32 # 4
+hqd_topk_l1: 4 #16 #4 #128 #32 #64 # 16
+hqd_topk_l0: 8 #64 #64 #256 #64 #128 # 128
+hqd_l0_topk_enable: True
+hqd_query_level: 0       # query at L0 (token level); query_level>=1 breaks AR causality
+hqd_stop_level: 0
+hqd_handoff_to_l0: false
+hqd_global_topk: 0 #65536
+hqd_use_existing_zipper_projections: true   # reuse the zipper q/k projections
+# HQD final-read attention implementation. Same edge set + same causality either way.
+#   scatter : per-edge gather + segment-softmax + scatter_add (PyG). Default, robust.
+#   dense   : group each destination's edges into a block + fused attention. Only wins
+#             when the HQD apply is a bottleneck AND degrees are ~uniform (bounded K).
+#             PROFILED: with witnesses + bag + read_levels the apply is only ~3-6ms of a
+#             ~164ms step and degrees are ragged (L0 ~28 vs coarse ~128), so dense gives
+#             ~no speedup. dense/sdpa pads to max degree => wasteful on ragged sets (auto
+#             falls back to scatter past hqd_dense_max_pad_ratio); dense/flash (ragged)
+#             ties scatter. Keep scatter unless you have a bounded uniform edge set.
+hqd_attn_impl: scatter        # scatter | dense; inert when hqd_packed_witness_read=true succeeds
+hqd_dense_backend: flash       # sdpa | flash (flash-varlen if installed, else sdpa)
+# Recompute the existing parent->L0 witness table, but consume selected rows as packed
+# fixed-K reads inside message passing. This avoids materializing a flattened L0 witness
+# edge list while preserving the old summary/rare witness selection behavior.
+hqd_select_inside_message_passing: false
+hqd_graph_witness_enable: false
+hqd_graph_witness_topk: 4      # per-level direct-child beam width (graph AND backbone sources)
+hqd_packed_witness_read: true
+# Witness selection source:
+#   recompute : re-score every L0 descendant against the current layer's q/k (exact, costs
+#               a table build; witness_reuse: step amortizes it to 1x/forward).
+#   graph     : harvest from the SCATTER path's per-edge weights (slow: ragged segment
+#               sort per level; forces the non-flash/scatter path — the original design).
+#   backbone  : harvest from the PACKED cross-level lane's dense attention logits — the
+#               "reuse the attention already computed" design, near-free (one detached
+#               topk per level). L3->L0 bags are a beam over per-level direct-child top-k
+#               (width hqd_graph_witness_topk) scored by summed logits (+ surprise for the
+#               rare slots). REQUIRES cross_level_packed: true; until the first capture of
+#               a forward lands (the layer-0 HQD build) it falls back to recompute.
+hqd_packed_witness_source: backbone # recompute | graph | backbone
+hqd_packed_witness_chunk_size: 2048
+# Descent shortcut ("bag instead of descend"). 0 = full scored descent (L3,L2,L1,L0).
+#   2 = score L3,L2 then take ALL L1 children of the selected L2 nodes unscored (skip the
+#       L1 scoring stage); the final L0 stage still scores + prunes to topk_l0. Saves one
+#       scoring pass. BEHAVIOUR-CHANGING (alters selection) — validate quality with a run.
+hqd_descent_stop_at: 0       # 0 | 2
+# Shallow bag read ("L0 queries L3, bags down"): stop the SCORED descent at this level and
+# reach L0 only through the selected coarse nodes' precomputed bags, skipping the L2/L1/L0
+# scoring stages (the ~18ms cost). 0 = off. 3 = score L3 only. 2 = score L3,L2. REQUIRES the
+# stop level in witness_levels (the bag is the only path to L0) and use_witness_packets: true.
+# Causal for AR (bag = causal key + src<=dst). Behaviour-changing — validate quality.
+hqd_shallow_read_level: 3     # 0 | 2 | 3
+# Bidirectional coarse routing (option 2): coarse nodes attend among themselves (few nodes =
+# cheap) and matched pairs surface bag<->bag L0 edges — long-range mixing without every token
+# descending. NOT AR-causal (coarse-as-query leaks); auto-disabled under AR with a warning.
+# Use only for masked-diffusion / bidirectional (e.g. masked image, DNA). [] = off. Requires the
+# routed levels in witness_levels.
+hqd_coarse_route_levels: []   # e.g. [3] or [2,3]
+hqd_coarse_route_topk: 8      # neighbours each coarse node routes to
+# Original HQD edge-read settings are kept inert by hqd_packed_witness_read=true:
+# the runtime selector returns only packed L0 witness ids and never materializes the
+# old flattened HQD L0/coarse edge list. Keep these minimal as a safety/default.
+hqd_read_levels: [0]
+
+# Recomputed witness packets are the selection source for packed reads; they are not
+# materialized as old sparse HQD edges when hqd_packed_witness_read=true succeeds.
+use_witness_packets: true        # build parent->L0 witness table
+# Witness-table build frequency. layer = rebuild inside every HQD layer (selection follows
+# each layer's q/k exactly). step = build ONCE per forward (first HQD layer) and reuse for
+# the rest of the step — q/k drift slowly and the witness top-k is coarse, so selection is
+# ~unchanged while the rebuild (the main witness-side cost) drops to 1x per step.
+witness_reuse: layer              # layer | step, layer to prevent multirate to reuse a pre upper cycling witness table, but use a fresh one, slower but more accurate
+use_summary_witnesses: true      # top-k children by graph responsibility (q_parent . k_child)
+use_rare_witnesses: true         # top-k by responsibility + lambda * detached surprise
+summary_witness_per_head: false  # true = top-k per attention head (diversity, ~num_heads x slots)
+witness_k_summary: 4             # summary witnesses per parent (per head if per_head)
+witness_k_rare: 4               # rare/surprise witnesses per parent
+witness_max_per_parent: 8      # cap on total witness slots/parent (0 = uncapped). Bounds the
+                                # candidate width so per_head*num_heads can't blow up cost: the
+                                # build is ~0.6% of a step, the inflated candidate set is what scales.
+witness_levels: [1,2,3]             # packed shallow L3 read looks up selected L3 rows only.
+                                # [1,2,3] also builds cross-level L2->L0 / L3->L0 bags so a coarse
+                                # selection reaches its important L0 descendants without descending.
+                                # Causal-verified for AR; enables the shallow-read / coarse-route paths.
+witness_lambda_rare: 0.3        # weight on normalized aux-reconstruction surprise
+witness_score_bias: 5.0         # logit bonus that force-includes witnesses past final top-k
+
+# Per-level window bag: scatter the L0 routing's per-level selections back UP so coarse nodes
+# (L1/L2/L3) also gain lateral reach. [] = off. Requires use_hqd: true.
+#   per_position : each coarse node's bag = its own descendants' selections. STRICTLY CAUSAL.
+#   global       : one shared top-k bag/level. NOT AR-causal (bidi / masked-diffusion only).
+hqd_window_bag_levels: []       # old HQD edge-bag path disabled; packed witnesses carry long reads
+hqd_window_bag_routing: per_position # per_position (causal) | global (non-causal, bidi only)
+# per_position: 0 = natural bound (every descendant selection, ~descendants x topk_lX per node);
+#               >0 = hard fixed budget (top-N descendant selections per coarse node by score).
+# global: the shared bag size per level (0 -> 16).
+hqd_window_bag_topk: 0
+
+local_attn_levels: [0, 1, 2, 3]
+local_attn_windows: [128, 128, 128, 128]
+local_attn_causal_levels: [0, 1, 2, 3]
+l0_local_window: 128
+
+# Attention-derived edge state.
+use_edge_embedding: false
+learn_edge_from_attention: false
+
+# Runtime trace bias from recent attention weights.
+lateral_edge_trace_enable: false
+lateral_edge_trace_mode: true_lateral   # windowed_approx | true_scatter | true_lateral
+
+# Token U-Net — a causal token mixer applied ONCE, outside the refinement-cycle loop.
+# block:  cnn   = local causal conv (CausalResBlock1d; uses token_unet_kernel_size)
+#         hyena = global FFT long conv (HyenaResBlock1d; O(T log T), one shot, kernel ignored)
+# mode:   stem            = mix at token level, L0 stays dense  (MODE 2: cheap global conditioning,
+#                           pinball runs at full token resolution). Use token_unet_scale: 1.
+#         coarse_tokenize = encode dense -> coarse L0, decode back (MODE 1: global-aware pooling,
+#                           fewer L0 nodes -> cheaper cycles).   Use token_unet_scale: >1 (pow2).
+token_unet_enable: false
+token_unet_block: cnn          # cnn | hyena
+token_unet_mode: stem            # stem (mode 2) | coarse_tokenize (mode 1)
+token_unet_dim: 1d               # auto | 1d | 2d  (text is 1d)
+token_unet_scale: 1              # power-of-two. 1 for stem; e.g. 4 for coarse_tokenize pooling
+token_unet_kernel_size: 9        # local conv width (cnn block only; ignored by hyena)
+token_unet_dropout: 0.1
+# Dynamic U-Net: a PROPER causal U-Net (vs the constant-width default). Channels GROW at
+# coarser scales (hidden_dim + channel_growth*level, capped at max_channels or 2*hidden_dim)
+# and skips are CONCATENATED + fused by a conv (classic U-Net), not added. Capacity is invested
+# where multi-token structure lives; recommended over the constant-width path (which underfits).
+# Causal (AR-safe) for cnn AND hyena at fixed length; NOTE hyena's positional filter is length-
+# normalized so it is NOT stable under incremental generation (fine for teacher-forced training).
+token_unet_dynamic: false
+token_unet_channel_growth: 256   # +channels per downsample level
+token_unet_max_channels: 0       # 0 => 2*hidden_dim
+token_unet_concat_skips: true    # true = concat+fuse (classic); false = additive
+# Hyena length-invariance: absolute-position filter (vs length-normalized) so past outputs are
+# STABLE as the sequence grows -> generation/KV-cache safe. Recommended if using hyena blocks.
+token_unet_hyena_length_invariant: true
+# Lookahead decode (coarse_tokenize only): a non-causal refinement branch for the right edge.
+token_unet_lookahead_decode_enable: false
+# --- MODE 1 (global-aware pooling) instead: set the three lines above to ---
+# token_unet_mode: coarse_tokenize
+# token_unet_scale: 4
+# --- Plain CNN baseline instead: set ---
+# token_unet_block: cnn
+
+# Cycle the (cheap) coarse levels for extra depth at the bottleneck.
+# Stage-2 consolidation: the gate monitor showed top_refiner and upper_cross INERT across two
+# runs (scales stuck ~0.01-0.02); upper_refiner was borderline (L3 self-refine 0.04, L2 ~0.002)
+# and is deactivated FOR NOW, not removed — re-enable by raising its steps. steps: 0 skips
+# building the module entirely. Only the downward cross-query pairs below still run here.
+pinball_multirate_enable: true
+pinball_multirate_schedule: midpoint   # or "midpoint"
+pinball_upper_refine_steps: 0     # was 8; deactivated for now (the borderline one)
+pinball_top_refine_steps: 0        # was 16; dead in both monitored runs
+pinball_upper_cross_attn_steps: 0  # was 4; dead in both monitored runs
+pinball_upper_refine_shared_weights: true   # weight-tied = recurrence, tiny param cost
+pinball_top_refine_shared_weights: true
+pinball_upper_refine_causal: true
+pinball_top_refine_causal: true
+pinball_upper_refine_window: 128    # 0 = full attention within the (short) level
+pinball_top_refine_window: 128
+pinball_l3_workspace_tokens: 8    # optional: small learned global register on L3
+
+# --- Cross-level query refiners (PinballPackedCrossAttentionRefiner) --------------------
+# Extra cross-attention "thinking" in the upper hierarchy: a query level attends into a
+# lower memory level, refined for N shared-weight steps, then written back with a small
+# gated residual (write_scale inits ~0, so this is an identity-safe add to a warm start).
+# Runs inside the multirate block on the pinball_upper_refine_every cadence, AFTER the L2/L3
+# level refiner and BEFORE the top refiner. All at pinball_work_dim / pinball_work_num_heads.
+# NOTE: with causal: true + ar_time these run on SDPA (flash is refused when a mask is needed).
+#
+# (1) Upper cross refiner — hardcoded L3 queries <- L2 memory.
+pinball_upper_cross_attn_steps: 0          # master switch; N cross-attn+FFN passes (0 = off; dead in both runs)
+pinball_upper_query_topk_l2: 0             # top-k L2 memory per query; 0 = all L2 (few nodes, fine)
+pinball_upper_cross_attn_backend: auto     # auto | flash | sdpa (auto -> sdpa when causal-masked)
+pinball_upper_cross_attn_causal: true      # mask L2 with ar_time > query ar_time
+pinball_upper_cross_attn_shared_weights: true   # weight-tie across steps (recurrence)
+pinball_upper_update_l2_enable: false      # also write gated updates back into L2 (bidirectional)
+pinball_upper_update_l2_scale_init: 0.01
+pinball_upper_cross_write_scale_init: 0.01 # L3 residual write scale (starts ~identity)
+#
+# (2) Generic cross-query pairs — arbitrary "query:memory" level pairs, one refiner each.
+# Each pair is "query:memory": the QUERY level is refined by reading the MEMORY level, and the
+# gated residual is written into the QUERY (memory stays read-only unless update_memory_enable).
+# DOWNWARD DISTRIBUTION (below): the lower levels QUERY L3, so L3's abstraction reaches L2/L1/L0
+# in ONE hop (fast, vs the bridges' multi-hop L3->L2->L1->L0). Because L3 is read-only memory, its
+# forward features are NOT pulled toward token specifics (no abstraction drift) — gradient only
+# shapes L3 to be a readable summary, which the aux loss reinforces. Causal: each L0/L1/L2 query
+# reads only L3 nodes whose window ends at/before it (leak-free). memory=L3 is few nodes -> cheap.
+# "2:3" dropped: its write scale self-selected to zero (0.1 -> 0.048 and falling by ep10) —
+# L2 is ADJACENT to L3, so the bridges edges already deliver L3->L2 in one hop; the explicit
+# cross-query only pays off where the bridge path is multi-hop (L1, L0).
+pinball_cross_query_pairs: ["1:3", "0:3"]  # L1<-L3, L0<-L3 (downward broadcast)
+pinball_cross_query_steps: 2               # master switch; passes per pair (0 = off)
+# 0 = attend ALL memory (no top-k selection). Memory here is L3 (few nodes) so this is cheap AND
+# avoids the global_mean selection's causality subtlety (its shared top-k is picked from a query
+# averaged over ALL positions incl. future). With 0 only the per-position causal mask applies.
+pinball_cross_query_topk: 0                # top-k memory nodes per selection; 0 = all
+pinball_cross_query_l0_window: 0           # only used when a pair's memory level is 0 (±ar_time window)
+pinball_cross_query_backend: auto
+pinball_cross_query_causal: true
+pinball_cross_query_shared_weights: true
+pinball_cross_query_update_memory_enable: false  # keep L3 read-only in the forward (no abstraction drift)
+pinball_cross_query_selection: global_mean # global_mean (shared top-k) | per_query (per-query top-k, heavier)
+# Residual write scale into the query level. Last run this COLLAPSED 0.01 -> 1e-4 (model gated the
+# upward "3:1" read off). Start higher to force the downward path open; if it re-collapses, the
+# fix is a hard floor in the refiner (currently soft, can still learn down).
+pinball_cross_query_write_scale_init: 0.1
+
+# Hierarchy auxiliary (reconstruction) loss. ON: trains L1/L2/L3 to reconstruct (detached) L0
+# features -> shapes L3 into a good L0-abstraction, which is exactly what the downward cross-query
+# (L0/L1/L2 <- L3) needs to be worth reading. Synergises with the copredict head.
+use_aux_loss: true
+
+# PREDICTIVE coarse aux (Stage 3, "next-concept" prediction) — the LM objective one timescale up.
+# Each coarse node at window i predicts the DETACHED pooled child summary of window i+h at its own
+# level, where h (auto) is the first strictly-future NON-overlapping window (h=2 at 50% overlap) —
+# so copying the current window scores NOTHING; only forecasting does. Complements (does not
+# replace) the reconstruction aux above: reconstruction rewards summarizing the past, this rewards
+# abstraction that carries forward. Training-only (forward untouched, no leak surface); targets
+# detached (JEPA-style). OFF here so the current upref_consolidated run is unaffected — flip on
+# for the next run (safe mid-warm-start too: it only adds small per-level predictor MLPs).
+hier_predaux_enable: true  # cleaner-pinball: ON — with the scatter gradient path gone, the
+                           # coarse levels carry their own predictive objective (Stage 3)
+lambda_hier_predaux: 0.05
+hier_predaux_levels: [1, 2, 3]
+hier_predaux_horizon: 0        # windows ahead; 0 = auto (first non-overlapping window)
+hier_predaux_loss_mode: cosine # cosine | mse_norm | mse
+hier_predaux_predictor: mlp    # mlp | linear
+# AR runs: next (forecast only — a "prev" head would be trivially copyable and empty). MASKED
+# runs: both (future is partially visible so "next" alone degrades toward copying; predicting
+# both non-overlapping neighbours = masked-window summary prediction, the bidirectional analogue).
+hier_predaux_directions: next  # next | both
+# By default the aux loss uses each level's features as a STOP-GRAD (detached) target (JEPA
+# anti-collapse): the coarse levels are trained to predict L0, but no aux gradient flows back
+# into L0. With coarse_tokenize, L0 IS the Hyena-pooled output — so this directly links the aux
+# objective to the Hyena pooling, letting the aux gradient shape the pooled representation
+# toward being reconstructable from the hierarchy. L1/L2/L3 stay detached to limit collapse
+# risk. Off by default (experimental).
+hier_aux_link_l0_target: false
+
+# Coarse co-prediction into L0 (deep supervision at the head). Each configured coarse level
+# (L1/L2/L3) projects its most-recent STRICTLY-PAST closed node (window_end <= token time —
+# the same node the staggered edges pick, so leak-free) into L0's pre-head features, scaled by
+# a learnable per-level gate. This gives the coarse compute a DIRECT next-token gradient and a
+# read-back path at the head, bypassing the late-ascent problem (L3 otherwise only fills at
+# layer ~11 and is never read). Reuses the tied vocab head (cheap). Improves inference too, not
+# just the loss. gate init 0.0 = warm-start bit-identical to a checkpoint without it.
+hier_copredict_l0: false  # cleaner-pinball: OFF — the per-layer downward refresh IS this same
+                          # gather, applied in-stack at every layer instead of only at the head
+hier_copredict_levels: [1, 2, 3]   # coarse levels that co-predict L0 (clipped to available levels)
+hier_copredict_gate_init: 0.0      # per-level gate init; 0.0 = identity warm start, e.g. 0.1 for fresh runs

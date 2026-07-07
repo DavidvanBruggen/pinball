@@ -2192,6 +2192,24 @@ class HierarchicalFlowGAT(nn.Module):
         hier_upward_refresh: bool = False,
         hier_upward_refresh_every: int = 1,       # apply after every k-th layer call
         hier_upward_refresh_gate_init: float = 0.0,
+        # Per-layer downward refresh — the linear-cost DENSE replacement for the bridges/
+        # staggered scatter edges: each fine node gathers the MOST-RECENT CLOSED node of each
+        # strictly-coarser level (the same node a bridge edge points at), projected per pair
+        # and added with a learnable gate. Project-then-gather: the Linear runs on the few
+        # coarse rows, the gather is bandwidth-only -> O(N) total, no attention, no scatter.
+        # Applied top-down chained (L2 reads L3, then L1 reads the UPDATED L2, ...), so L3
+        # reaches L0 within one layer. Causal: gathered window_end <= reader time (allow_same
+        # follows hier_ar_allow_same_time). gate 0 = exact no-op. Content-ADDRESSED far reads
+        # stay with the cross-query refiners; dynamic edges (HQD/zipper) are unaffected.
+        hier_downward_refresh: bool = False,
+        hier_downward_refresh_pairs: Optional[List[str]] = None,  # "fine:coarse"; None = all downward pairs
+        hier_downward_refresh_every: int = 1,
+        hier_downward_refresh_gate_init: float = 0.0,
+        # Drop the STATIC cross-level edges from the refinement edge set (the scatter vertical
+        # backbone), leaving vertical flow to the refreshes + cross-query. Graph construction,
+        # node metadata and the dynamic-edge paths (HQD/zipper inject their own ephemeral
+        # edges at attention time) are untouched — sparse/dynamic approaches stay possible.
+        drop_static_cross_level_edges: bool = False,
         # Predictive coarse aux ("next-concept" prediction): each coarse node predicts the
         # DETACHED pooled child summary of a strictly-future window at its own level — the LM
         # objective one timescale up. Unlike the reconstruction aux (which rewards summarizing
@@ -3606,6 +3624,28 @@ class HierarchicalFlowGAT(nn.Module):
             logger.info("Per-layer upward refresh enabled (every %d layer(s), gate init %.3g).",
                         self.hier_upward_refresh_every, float(hier_upward_refresh_gate_init))
 
+        # --- Per-layer downward refresh (see _apply_downward_refresh) ---
+        self.hier_downward_refresh = bool(hier_downward_refresh)
+        self.hier_downward_refresh_every = max(1, int(hier_downward_refresh_every))
+        self.drop_static_cross_level_edges = bool(drop_static_cross_level_edges)
+        if self.hier_downward_refresh:
+            if hier_downward_refresh_pairs is None:
+                pair_keys = [f"{q}:{m}" for q in range(num_levels - 1) for m in range(q + 1, num_levels)]
+            else:
+                pair_keys = []
+                for p in hier_downward_refresh_pairs:
+                    q, m = (int(v) for v in str(p).split(":"))
+                    if 0 <= q < m <= num_levels - 1:
+                        pair_keys.append(f"{q}:{m}")
+            self.downward_refresh_proj = nn.ModuleDict(
+                {k: nn.Linear(self.hidden_dim, self.hidden_dim) for k in pair_keys}
+            )
+            self.downward_refresh_gates = nn.ParameterDict(
+                {k: nn.Parameter(torch.tensor(float(hier_downward_refresh_gate_init))) for k in pair_keys}
+            )
+            logger.info("Per-layer downward refresh enabled for pairs %s (every %d layer(s), gate init %.3g).",
+                        pair_keys, self.hier_downward_refresh_every, float(hier_downward_refresh_gate_init))
+
         # --- Predictive coarse aux (see _compute_predictive_aux_loss) ---
         self.hier_predaux_enable = bool(hier_predaux_enable)
         self.lambda_hier_predaux = float(lambda_hier_predaux)
@@ -4846,6 +4886,68 @@ class HierarchicalFlowGAT(nn.Module):
         pieces.append(x[:, offsets[-1] :, :])
         return torch.cat(pieces, dim=1)
 
+    def _downward_gather_plan(self, level_offsets: torch.Tensor, node_ar_time: torch.Tensor) -> Dict[str, tuple]:
+        """Per (fine,coarse) pair: (chosen [n_fine] most-recent CLOSED coarse node, valid mask).
+        node_ar_time is content-independent and skeleton-cached, so this is computed once per
+        graph shape and keyed on tensor identity (no per-layer sync, no recompute)."""
+        key = (
+            int(level_offsets.data_ptr()), int(node_ar_time.data_ptr()),
+            int(node_ar_time.numel()), str(node_ar_time.device),
+        )
+        cached = getattr(self, "_downward_gather_plan_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        offsets = self._level_offsets_list(level_offsets)
+        num_levels = len(offsets) - 1
+        allow_same = bool(getattr(self, "hier_ar_allow_same_time", True))
+        t = node_ar_time.to(torch.long)
+        plan: Dict[str, tuple] = {}
+        for q in range(num_levels - 1):
+            q_time = t[offsets[q] : offsets[q + 1]]
+            for m in range(q + 1, num_levels):
+                pair = f"{q}:{m}"
+                if pair not in self.downward_refresh_proj:
+                    continue
+                m_time = t[offsets[m] : offsets[m + 1]]
+                if q_time.numel() == 0 or m_time.numel() == 0:
+                    continue
+                sorted_t, sidx = torch.sort(m_time)
+                pos = torch.searchsorted(sorted_t, q_time, right=allow_same) - 1
+                valid = (pos >= 0).view(1, -1, 1)
+                chosen = sidx[pos.clamp(min=0)]
+                plan[pair] = (chosen, valid)
+        self._downward_gather_plan_cache = (key, plan)
+        return plan
+
+    def _apply_downward_refresh(
+        self, x: torch.Tensor, level_offsets: torch.Tensor, node_ar_time: torch.Tensor
+    ) -> torch.Tensor:
+        """Gated per-layer downward gather: fine node t reads, from each configured coarser
+        level, that level's most-recent closed node (window_end <= t) — the same node a
+        bridge/staggered edge points at, as a dense O(N) gather instead of scatter attention.
+        Chained top-down (coarser levels update first), one full-tensor rebuild per call.
+        gate 0 = exact no-op."""
+        offsets = self._level_offsets_list(level_offsets)
+        num_levels = len(offsets) - 1
+        plan = self._downward_gather_plan(level_offsets, node_ar_time)
+        cur = {lvl: x[:, offsets[lvl] : offsets[lvl + 1], :] for lvl in range(num_levels)}
+        for q in range(num_levels - 2, -1, -1):
+            upd = None
+            for m in range(q + 1, num_levels):
+                pair = f"{q}:{m}"
+                if pair not in plan:
+                    continue
+                chosen, valid = plan[pair]
+                proj = self.downward_refresh_proj[pair](cur[m])          # few coarse rows
+                g = proj.index_select(1, chosen) * valid.to(proj.dtype)  # bandwidth-only gather
+                contrib = self.downward_refresh_gates[pair] * g
+                upd = contrib if upd is None else upd + contrib
+            if upd is not None:
+                cur[q] = cur[q] + upd
+        pieces = [x[:, : offsets[0], :]] + [cur[lvl] for lvl in range(num_levels)]
+        pieces.append(x[:, offsets[-1] :, :])
+        return torch.cat(pieces, dim=1)
+
     def _create_next_level(self, lower_graph, level_idx, compression_ratio, overlap_ratio):
         """
         Create the next level in the hierarchy based on processed lower level.
@@ -5595,6 +5697,11 @@ class HierarchicalFlowGAT(nn.Module):
         if getattr(self, "hier_upward_refresh", False) and hasattr(self, "upward_refresh_gates"):
             for i in range(self.upward_refresh_gates.numel()):
                 d[f"upref.L{i}->L{i + 1}.gate"] = float(self.upward_refresh_gates[i].detach())
+        # Per-layer downward refresh (most-recent-closed coarse gather) gates.
+        if getattr(self, "hier_downward_refresh", False) and hasattr(self, "downward_refresh_gates"):
+            for k, g in self.downward_refresh_gates.items():
+                q, m = k.split(":")
+                d[f"downref.L{q}<-L{m}.gate"] = float(g.detach())
         # Cross-query refiners (downward L0/L1/L2<-L3 or any query<-memory) residual write scale.
         for r in getattr(self, "pinball_cross_query_refiners", []) or []:
             d[f"crossq.L{r.query_level}<-L{r.memory_level}.write"] = float(r.write_scale.detach())
@@ -10831,12 +10938,14 @@ class HierarchicalFlowGAT(nn.Module):
         refine_ei = base_ei
         refine_ea = base_ea
         refine_et = base_et.to(device=device, dtype=torch.long) if base_et is not None else None
-        if use_multi_local:
+        drop_cross_level = bool(getattr(self, "drop_static_cross_level_edges", False))
+        if use_multi_local or drop_cross_level:
             prune_key = (
                 int(base_ei.data_ptr()),
                 int(base_nl.data_ptr()),
                 int(refine_et.data_ptr()) if refine_et is not None else 0,
                 tuple(sorted(int(lvl) for lvl in active_local_levels)),
+                bool(drop_cross_level),
                 str(device),
             )
             prune_cache = getattr(self, "_local_attn_pruned_edge_cache", {})
@@ -10853,6 +10962,11 @@ class HierarchicalFlowGAT(nn.Module):
                         prune_mask |= same_level
                     else:
                         prune_mask |= same_level & non_self
+                if drop_cross_level:
+                    # cleaner-pinball mode: retire the static vertical scatter backbone; the
+                    # up/down refreshes + cross-query carry vertical flow. Dynamic (HQD/zipper)
+                    # edges are injected separately at attention time and are unaffected.
+                    prune_mask |= src_levels != dst_levels
                 keep_edges = ~prune_mask
                 cached_prune = {
                     "keep_edges": keep_edges,
@@ -11495,6 +11609,16 @@ class HierarchicalFlowGAT(nn.Module):
                     and (layer_step % self.hier_upward_refresh_every) == 0
                 ):
                     x = self._apply_upward_refresh(x, base_lo)
+
+                # Per-layer downward refresh: broadcast each coarser level's freshest closed
+                # summary back down (dense gather replacement for the bridges scatter edges).
+                if (
+                    getattr(self, "hier_downward_refresh", False)
+                    and base_lo is not None
+                    and base_ar_time is not None
+                    and (layer_step % self.hier_downward_refresh_every) == 0
+                ):
+                    x = self._apply_downward_refresh(x, base_lo, base_ar_time)
 
                 # Per-layer co-evolution hook: run one memory round in lockstep with this
                 # native layer (memory graph evolves at the same depth as the native graph).
