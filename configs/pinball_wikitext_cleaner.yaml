@@ -161,6 +161,31 @@ hier_downward_refresh: true
 # hier_downward_refresh_pairs: ["0:1","0:2","0:3","1:2","1:3","2:3"]   # default: all downward
 hier_downward_refresh_every: 1
 hier_downward_refresh_gate_init: 0.1
+# The refreshes are kernel-LAUNCH-bound (many tiny ops x 12 layers): torch.compile fuses them,
+# measured ~14% whole-step win at seq 8196. Training mode only (fixed seq len = one compile);
+# eval/generation stay eager. Additional lever if needed: *_refresh_every: 2 (~12% win, stacks).
+hier_refresh_compile: true
+# HQD v2 — cross-query-guided nomination (NSA-style selective sparse attention). At the
+# multirate midpoint each L0 query scores the CLOSED L3 windows with the 0:3 refiner's TRAINED
+# q/k (per-query, causal), descends into the top-k winners' L1 children (cosine), and
+# nominates the winning L1 nodes' L0 children as ephemeral L0->L0 edges for all post-midpoint
+# layers (v1 HQD's injection path — works with the static edges dropped; children tables come
+# from window arithmetic, not edge lists). This is the DYNAMIC content-addressed read the
+# recency gathers can't do. OFF for the baseline cleaner run; flip on for the retrieval test.
+xq_nominate_enable: false
+xq_nominate_topk_l3: 2         # closed L3 windows shortlisted per query
+xq_nominate_topk_l1: 2         # L1 winners kept among the shortlist's children
+xq_nominate_exclude_local: true  # spend the edge budget beyond the L0 local window
+xq_nominate_max_layers: 2      # layers fed after nomination (0 = all; each costs a sparse pass)
+# When to nominate: auto = after the middle layer (mature queries/summaries, remaining layers
+# integrate the fetch); or an int (1-based, "after k layers") for earlier/later retrieval.
+# Independent of the multirate schedule (works even with multirate off).
+xq_nominate_after_layer: auto
+# Re-nominate every k layers (0 = once per forward). Each round re-selects with the EVOLVED
+# queries — retrieved content changes what the next round fetches (iterative / multi-hop
+# retrieval); scoring is ~1-2ms/round, the fed-layer budget above resets per round. For deep
+# stacks the pattern is e.g. after_layer: 4, every: 4, max_layers: 2.
+xq_nominate_every: 0
 norm_type: layernorm
 dropout: 0.1
 

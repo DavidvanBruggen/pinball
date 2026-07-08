@@ -2210,6 +2210,37 @@ class HierarchicalFlowGAT(nn.Module):
         # node metadata and the dynamic-edge paths (HQD/zipper inject their own ephemeral
         # edges at attention time) are untouched — sparse/dynamic approaches stay possible.
         drop_static_cross_level_edges: bool = False,
+        # torch.compile the up/down refresh functions (they are kernel-LAUNCH-bound: many tiny
+        # elementwise ops x 12 layers; inductor fuses them, measured ~14% whole-step win).
+        # Applied in TRAINING mode only — the training seq len is fixed (one compile), while
+        # generation varies lengths every step and would trigger recompile storms; eval/gen
+        # stay eager (numerics differ ~1e-6 from fusion, training-side only).
+        hier_refresh_compile: bool = False,
+        # HQD v2 — cross-query-guided nomination (NSA-style selective sparse attention). At the
+        # multirate midpoint, each L0 query scores the CLOSED L3 windows using the 0:3
+        # cross-query refiner's TRAINED q/k (per-query, causal — never global_mean), descends
+        # into the top-k winners' L1 children (cosine scores), and nominates the winning L1
+        # nodes' L0 children as ephemeral L0->L0 edges for all layers after the midpoint —
+        # the same injection path v1 HQD uses, so it works with the static cross-level edges
+        # dropped. Selection is no-grad (gradient flows through the attention over the added
+        # edges, as in v1); children tables come from window arithmetic, not edge lists.
+        xq_nominate_enable: bool = False,
+        xq_nominate_topk_l3: int = 2,      # closed L3 windows shortlisted per query
+        xq_nominate_topk_l1: int = 2,      # L1 winners kept among the shortlist's children
+        xq_nominate_exclude_local: bool = True,  # skip sources already inside the L0 local window
+        xq_nominate_max_layers: int = 0,   # layers fed after nomination (0 = all remaining);
+                                           # the sparse-edge path costs per layer — this is the budget dial
+        # When to nominate: "auto" = after the middle layer (queries/summaries are mature by
+        # then and the remaining layers integrate what was fetched); an int = after that many
+        # layers (1-based), for earlier/later retrieval experiments. Independent of the
+        # multirate schedule — nomination runs even with multirate disabled.
+        xq_nominate_after_layer: Union[str, int] = "auto",
+        # Re-nominate every k layers after the first (0 = once per forward). Each round
+        # RE-SELECTS with the current (evolved) queries — retrieved content changes what the
+        # next round looks for (iterative / multi-hop retrieval), instead of freezing one edge
+        # set for the rest of a deep stack. Scoring is cheap (~1-2ms); the per-interval fed
+        # layers are still capped by xq_nominate_max_layers (budget resets each round).
+        xq_nominate_every: int = 0,
         # Predictive coarse aux ("next-concept" prediction): each coarse node predicts the
         # DETACHED pooled child summary of a strictly-future window at its own level — the LM
         # objective one timescale up. Unlike the reconstruction aux (which rewards summarizing
@@ -3645,6 +3676,21 @@ class HierarchicalFlowGAT(nn.Module):
             )
             logger.info("Per-layer downward refresh enabled for pairs %s (every %d layer(s), gate init %.3g).",
                         pair_keys, self.hier_downward_refresh_every, float(hier_downward_refresh_gate_init))
+        self.hier_refresh_compile = bool(hier_refresh_compile)
+
+        # --- HQD v2: cross-query-guided nomination (see _cross_query_nominate) ---
+        self.xq_nominate_enable = bool(xq_nominate_enable)
+        self.xq_nominate_topk_l3 = max(1, int(xq_nominate_topk_l3))
+        self.xq_nominate_topk_l1 = max(1, int(xq_nominate_topk_l1))
+        self.xq_nominate_exclude_local = bool(xq_nominate_exclude_local)
+        self.xq_nominate_max_layers = max(0, int(xq_nominate_max_layers))
+        self.xq_nominate_after_layer = xq_nominate_after_layer
+        self.xq_nominate_every = max(0, int(xq_nominate_every))
+        self._xq_nom_edges: Optional[tuple] = None
+        self._xq_children_cache: Optional[tuple] = None
+        if self.xq_nominate_enable:
+            logger.info("Cross-query nomination enabled (topk L3=%d, L1=%d, exclude_local=%s).",
+                        self.xq_nominate_topk_l3, self.xq_nominate_topk_l1, self.xq_nominate_exclude_local)
 
         # --- Predictive coarse aux (see _compute_predictive_aux_loss) ---
         self.hier_predaux_enable = bool(hier_predaux_enable)
@@ -4872,8 +4918,16 @@ class HierarchicalFlowGAT(nn.Module):
         _apply_pooled_upper_seed (parent ar_time = child window END); nodes past the main
         hierarchy slices (level_offsets[-1]:) are untouched. gate=0 is an exact no-op.
         One full-tensor rebuild per call (single cat), sync-free.
+
+        Eager wrapper: resolves the offsets (cached .tolist() — data-dependent, must stay
+        OUTSIDE any compiled graph) and dispatches to the pure-tensor core, which is the
+        torch.compile target when hier_refresh_compile is on.
         """
-        offsets = self._level_offsets_list(level_offsets)
+        offsets = tuple(self._level_offsets_list(level_offsets))
+        core = self._refresh_callable(self._upward_refresh_core, "_upward_refresh_compiled")
+        return core(x, offsets)
+
+    def _upward_refresh_core(self, x: torch.Tensor, offsets: tuple) -> torch.Tensor:
         level_sizes = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
         pieces = [x[:, : offsets[1], :]]
         lower = x[:, offsets[0] : offsets[1], :]
@@ -4885,6 +4939,44 @@ class HierarchicalFlowGAT(nn.Module):
             lower = cur
         pieces.append(x[:, offsets[-1] :, :])
         return torch.cat(pieces, dim=1)
+
+    def _refresh_callable(self, eager, cache_attr: str):
+        """Return the torch.compile'd version of a refresh fn in training mode (fixed seq len
+        -> one compile, fused elementwise chains), the eager one otherwise (eval/generation
+        vary lengths and would recompile every step).
+
+        Compilation is lazy, so failures surface on the FIRST EXECUTION (e.g. inductor/triton
+        missing support for a new GPU arch), not at torch.compile() time — the probation
+        wrapper catches that, logs once, and permanently falls back to eager instead of
+        killing the run. After the first successful call the raw compiled fn is cached."""
+        if not (getattr(self, "hier_refresh_compile", False) and self.training):
+            return eager
+        fn = getattr(self, cache_attr, None)
+        if fn is None:
+            try:
+                compiled = torch.compile(eager, dynamic=False)
+            except Exception as e:
+                logger.warning("hier_refresh_compile: torch.compile unavailable (%s); staying eager.", e)
+                setattr(self, cache_attr, eager)
+                return eager
+
+            def _probation(*args, _c=compiled, _e=eager, _attr=cache_attr, **kwargs):
+                try:
+                    out = _c(*args, **kwargs)
+                except Exception as err:
+                    logger.warning(
+                        "hier_refresh_compile: compiled %s failed at runtime (%s: %s); "
+                        "falling back to eager permanently.",
+                        _attr, type(err).__name__, err,
+                    )
+                    setattr(self, _attr, _e)
+                    return _e(*args, **kwargs)
+                setattr(self, _attr, _c)  # first success -> cache the raw compiled fn
+                return out
+
+            fn = _probation
+            setattr(self, cache_attr, fn)
+        return fn
 
     def _downward_gather_plan(self, level_offsets: torch.Tensor, node_ar_time: torch.Tensor) -> Dict[str, tuple]:
         """Per (fine,coarse) pair: (chosen [n_fine] most-recent CLOSED coarse node, valid mask).
@@ -4926,10 +5018,18 @@ class HierarchicalFlowGAT(nn.Module):
         level, that level's most-recent closed node (window_end <= t) — the same node a
         bridge/staggered edge points at, as a dense O(N) gather instead of scatter attention.
         Chained top-down (coarser levels update first), one full-tensor rebuild per call.
-        gate 0 = exact no-op."""
-        offsets = self._level_offsets_list(level_offsets)
-        num_levels = len(offsets) - 1
+        gate 0 = exact no-op.
+
+        Eager wrapper: resolves the cached offsets + gather plan (data-dependent bookkeeping,
+        must stay OUTSIDE any compiled graph) and dispatches to the pure-tensor core — the
+        torch.compile target when hier_refresh_compile is on."""
+        offsets = tuple(self._level_offsets_list(level_offsets))
         plan = self._downward_gather_plan(level_offsets, node_ar_time)
+        core = self._refresh_callable(self._downward_refresh_core, "_downward_refresh_compiled")
+        return core(x, offsets, plan)
+
+    def _downward_refresh_core(self, x: torch.Tensor, offsets: tuple, plan: Dict[str, tuple]) -> torch.Tensor:
+        num_levels = len(offsets) - 1
         cur = {lvl: x[:, offsets[lvl] : offsets[lvl + 1], :] for lvl in range(num_levels)}
         for q in range(num_levels - 2, -1, -1):
             upd = None
@@ -4947,6 +5047,130 @@ class HierarchicalFlowGAT(nn.Module):
         pieces = [x[:, : offsets[0], :]] + [cur[lvl] for lvl in range(num_levels)]
         pieces.append(x[:, offsets[-1] :, :])
         return torch.cat(pieces, dim=1)
+
+    def _xq_children_tables(self, level_sizes: List[int], device: torch.device) -> tuple:
+        """(l3_to_l1 [n3,K31], l1_to_l0 [n1,K10]) descendant index tables from the 1D window
+        rule (same as _pooled_seed_indices), padded with -1. Built once per graph shape on the
+        host and cached — no dependence on edge lists."""
+        key = (tuple(int(s) for s in level_sizes), str(device))
+        cached = self._xq_children_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        def windows(n_child: int, lvl: int) -> List[range]:
+            comp = int(self.compression_ratios[lvl - 1])
+            stride = max(1, int(comp * (1 - self.overlap_ratios[lvl - 1])))
+            n_parent = int(level_sizes[lvl])
+            out = []
+            for i in range(n_parent):
+                start = min(i * stride, n_child - 1)
+                end = max(min(start + comp, n_child), start + 1)
+                out.append(range(start, end))
+            return out
+
+        w10 = windows(int(level_sizes[0]), 1)          # L1 -> its L0 children
+        w21 = windows(int(level_sizes[1]), 2)          # L2 -> L1
+        w32 = windows(int(level_sizes[2]), 3)          # L3 -> L2
+        l3_l1 = [sorted({c1 for c2 in w for c1 in w21[c2]}) for w in w32]
+
+        def pad(rows: List[List[int]]) -> torch.Tensor:
+            width = max(len(r) for r in rows)
+            t = torch.full((len(rows), width), -1, dtype=torch.long)
+            for i, r in enumerate(rows):
+                t[i, : len(r)] = torch.tensor(list(r), dtype=torch.long)
+            return t.to(device)
+
+        tables = (pad(l3_l1), pad([list(r) for r in w10]))
+        self._xq_children_cache = (key, tables)
+        return tables
+
+    @torch.no_grad()
+    def _cross_query_nominate(
+        self,
+        x: torch.Tensor,                      # [B, N, H] current node features (post-midpoint)
+        level_offsets: torch.Tensor,
+        node_ar_time: torch.Tensor,
+    ) -> Optional[tuple]:
+        """HQD v2: nominate far L0 sources per L0 query as ephemeral (b, src, dst) edges.
+
+        Stage 1: score every CLOSED L3 window per query with the 0:3 cross-query refiner's
+        TRAINED q/k (falls back to feature cosine if that refiner is absent) — per-query and
+        causal, so selection sees only the past. Stage 2: cosine-score the shortlisted L3
+        windows' L1 children, keep the winners, nominate their L0 children. Selection is
+        no-grad (the gradient flows through attention over the added edges, like v1 HQD).
+        """
+        offsets = self._level_offsets_list(level_offsets)
+        if len(offsets) < 5:
+            return None
+        o = offsets
+        n0, n1, n3 = o[1] - o[0], o[2] - o[1], o[4] - o[3]
+        if min(n0, n1, n3) <= 0:
+            return None
+        B, _, H = x.shape
+        dev = x.device
+        t = node_ar_time.to(device=dev, dtype=torch.long)
+        q_t, t1, t3 = t[o[0] : o[1]], t[o[1] : o[2]], t[o[3] : o[4]]
+        allow_same = bool(getattr(self, "hier_ar_allow_same_time", True))
+        x0, x1, x3 = x[:, o[0] : o[1], :], x[:, o[1] : o[2], :], x[:, o[3] : o[4], :]
+
+        # stage 1: L0 queries score L3 memory with the 0:3 refiner's trained q/k
+        refiner = None
+        for r in getattr(self, "pinball_cross_query_refiners", []) or []:
+            if int(r.query_level) == 0 and int(r.memory_level) == 3:
+                refiner = r
+                break
+        if refiner is not None:
+            q = refiner.q_projs[0](refiner.q_norms[0](x0))
+            k3 = refiner.kv_projs[0](refiner.kv_norms[0](x3))[..., : refiner.work_dim]
+        else:
+            q, k3 = F.normalize(x0.float(), dim=-1), F.normalize(x3.float(), dim=-1)
+        sc3 = torch.einsum("bqd,bnd->bqn", q.float(), k3.float())
+        closed3 = (t3.view(1, -1) <= q_t.view(-1, 1)) if allow_same else (t3.view(1, -1) < q_t.view(-1, 1))
+        sc3 = sc3.masked_fill(~closed3.unsqueeze(0), float("-inf"))
+        k3top = min(self.xq_nominate_topk_l3, n3)
+        idx3 = sc3.topk(k3top, dim=-1).indices                     # [B, n0, k3top]
+        q_has_any = closed3.any(dim=-1)                            # [n0]
+
+        # stage 2: cosine-score the shortlist's L1 children
+        l3_to_l1, l1_to_l0 = self._xq_children_tables(
+            [o[i + 1] - o[i] for i in range(len(o) - 1)], dev
+        )
+        cand1 = l3_to_l1[idx3.reshape(B, -1)].view(B, n0, -1)      # [B, n0, C] (-1 padded)
+        pad1 = cand1 < 0
+        cand1c = cand1.clamp(min=0)
+        sc1_full = torch.einsum(
+            "bqd,bnd->bqn", F.normalize(x0.float(), dim=-1), F.normalize(x1.float(), dim=-1)
+        )                                                          # [B, n0, n1]
+        closed1 = (t1.view(1, -1) <= q_t.view(-1, 1)) if allow_same else (t1.view(1, -1) < q_t.view(-1, 1))
+        sc1_full = sc1_full.masked_fill(~closed1.unsqueeze(0), float("-inf"))
+        sc1 = sc1_full.gather(2, cand1c).masked_fill(pad1, float("-inf"))
+        m = min(self.xq_nominate_topk_l1, sc1.size(-1))
+        top1 = sc1.topk(m, dim=-1)
+        chosen1 = cand1c.gather(2, top1.indices)                   # [B, n0, m]
+        chosen_ok = torch.isfinite(top1.values) & q_has_any.view(1, -1, 1)
+
+        # expand winners to their L0 children -> ephemeral edges
+        src = l1_to_l0[chosen1.reshape(B, -1)].view(B, n0, -1)     # [B, n0, m*K10] L0-local ids
+        ok = (src >= 0) & chosen_ok.repeat_interleave(l1_to_l0.size(1), dim=-1)
+        q_pos = torch.arange(n0, device=dev).view(1, -1, 1)
+        if self.xq_nominate_exclude_local:
+            ok &= src <= (q_pos - int(getattr(self, "l0_local_window", 0)))
+        else:
+            ok &= (src <= q_pos) if allow_same else (src < q_pos)
+        b_idx, qi, si = ok.nonzero(as_tuple=True)
+        if b_idx.numel() == 0:
+            return None
+        src_idx = o[0] + src[b_idx, qi, si]
+        dst_idx = o[0] + qi
+        # dedup (overlapping L1 windows share children)
+        key = (b_idx * (o[-1] + 1) + src_idx) * (o[-1] + 1) + dst_idx
+        keep = torch.unique(key, return_inverse=False, sorted=True)
+        b_idx = torch.div(keep, (o[-1] + 1) * (o[-1] + 1), rounding_mode="floor")
+        rem = keep - b_idx * (o[-1] + 1) * (o[-1] + 1)
+        src_idx = torch.div(rem, o[-1] + 1, rounding_mode="floor")
+        dst_idx = rem - src_idx * (o[-1] + 1)
+        self._last_xq_nom_count = int(b_idx.numel())
+        return b_idx.long(), src_idx.long(), dst_idx.long()
 
     def _create_next_level(self, lower_graph, level_idx, compression_ratio, overlap_ratio):
         """
@@ -10990,6 +11214,11 @@ class HierarchicalFlowGAT(nn.Module):
                         refine_ea = base_ea[:, keep_edges]
                 elif base_ea.dim() == 3 and base_ea.size(1) == keep_edges.numel():
                     refine_ea = base_ea[:, keep_edges, :]
+        # HQD/zipper walk the hierarchy STRUCTURE through parent<->child edges (children
+        # tables, descent). When drop_static_cross_level_edges removes those from the
+        # ATTENTION edge set, hand the structural consumers the full set instead — their
+        # attention contribution is ephemeral-only either way.
+        struct_ei = base_ei if drop_cross_level else refine_ei
 
         pos_local = getattr(unified_graph, "node_pos_local", None)
         if pos_local is not None:
@@ -11129,6 +11358,17 @@ class HierarchicalFlowGAT(nn.Module):
         self._hqd_reuse_cache = None
         hqd_cached_step = -1
         layer_step = 0
+        self._xq_nom_edges = None  # per-forward; filled once layer_step reaches _xq_nom_after
+        _xq_nom_layers_used = 0
+        _xq_nom_calls = 0
+        _xq_last_nom_step = -1
+        _xq_raw_after = getattr(self, "xq_nominate_after_layer", "auto")
+        _xq_nom_after = (
+            max(1, len(transformers_to_use) // 2)
+            if str(_xq_raw_after).lower() == "auto"
+            else max(1, int(_xq_raw_after))
+        )
+        _xq_every = int(getattr(self, "xq_nominate_every", 0))
         multirate_active = bool(
             getattr(self, "pinball_multirate_enable", False)
             and (
@@ -11386,7 +11626,7 @@ class HierarchicalFlowGAT(nn.Module):
                         k_runtime: torch.Tensor,
                         _transformer=transformer,
                         _x=x,
-                        _refine_ei=refine_ei,
+                        _refine_ei=struct_ei,
                         _base_nl=base_nl,
                         _base_ar_time=base_ar_time,
                     ):
@@ -11436,7 +11676,7 @@ class HierarchicalFlowGAT(nn.Module):
                     b_sel_idx, src_sel_idx, dst_sel_idx, added_hqd, hqd_stage_stats = self._hierarchical_query_descent_ephemeral_batched(
                         transformer=transformer,
                         x_bnh=x,
-                        base_edge_index=refine_ei,
+                        base_edge_index=struct_ei,
                         node_level=base_nl,
                         node_ar_time=base_ar_time,
                         x_in=shared_x_in,
@@ -11460,6 +11700,16 @@ class HierarchicalFlowGAT(nn.Module):
                         hqd_hit_layers += 1
                         hqd_reuse_added_total += int(b_cached.numel())
                         hqd_reused_layers += 1
+
+                # HQD v2: cross-query-guided nominations (computed once at the multirate
+                # midpoint) feed subsequent layers through the same ephemeral-edge path, up to
+                # the xq_nominate_max_layers budget (the sparse path costs per layer).
+                # v1 HQD, when enabled, takes precedence on layers where it selected.
+                if hqd_b_idx is None and getattr(self, "_xq_nom_edges", None) is not None:
+                    _xq_budget = int(getattr(self, "xq_nominate_max_layers", 0))
+                    if _xq_budget <= 0 or _xq_nom_layers_used < _xq_budget:
+                        hqd_b_idx, hqd_src_idx, hqd_dst_idx = self._xq_nom_edges
+                        _xq_nom_layers_used += 1
 
                 # ~~~~ Transformer step (HQD attention fused in, if edges provided) ~~~~
                 self._hqd_inside_mp_active = bool(select_hqd_inside_mp)
@@ -11573,7 +11823,7 @@ class HierarchicalFlowGAT(nn.Module):
                     x, added, stage_stats = self._zipper_apply_staged_ephemeral_batched(
                         transformer=transformer,
                         x_bnh=x,
-                        base_edge_index=refine_ei,
+                        base_edge_index=struct_ei,
                         node_level=base_nl,
                         node_ar_time=base_ar_time,
                         x_in=shared_x_in,
@@ -11641,6 +11891,28 @@ class HierarchicalFlowGAT(nn.Module):
                         if (not bool(getattr(self, "pinball_multirate_skip_after_last_cycle", True))) or (not is_final_cycle):
                             x = _run_multirate_repeats(x, 1)
 
+                # HQD v2 nomination: first fires after xq_nominate_after_layer layers ("auto"
+                # = mid-stack), on the post-layer/post-multirate x — independent of the
+                # multirate schedule. With xq_nominate_every > 0 it then RE-SELECTS every k
+                # layers with the evolved queries (iterative / multi-hop retrieval), resetting
+                # the per-interval fed-layer budget. Later layers consume the edges (see the
+                # injection hook).
+                if (
+                    getattr(self, "xq_nominate_enable", False)
+                    and base_lo is not None
+                    and base_ar_time is not None
+                    and layer_step >= _xq_nom_after
+                    and (
+                        _xq_nom_calls == 0
+                        or (_xq_every > 0 and (layer_step - _xq_last_nom_step) >= _xq_every)
+                    )
+                ):
+                    self._xq_nom_edges = self._cross_query_nominate(x, base_lo, base_ar_time)
+                    _xq_nom_calls += 1
+                    _xq_last_nom_step = layer_step
+                    _xq_nom_layers_used = 0
+                    self._last_xq_nom_calls = _xq_nom_calls
+
         if multirate_active and mr_schedule == "after_full_stack":
             x = _run_multirate_repeats(x, 1)
         if multirate_active:
@@ -11692,6 +11964,10 @@ class HierarchicalFlowGAT(nn.Module):
 
         x_out = self.pinball_work_out(x)
         g_out = Data(x=x_out, edge_index=refine_ei, node_level=base_nl)
+        # Full (pre-prune) edge set for the hierarchy aux loss: the aux derives its
+        # child<->parent map from cross-level edges, which drop_static_cross_level_edges
+        # removes from refine_ei (and local-attn pruning thins even without it).
+        g_out.edge_index_full = base_ei
         if refine_et is not None:
             g_out.edge_type = refine_et
         if edge_attr_work is not None:
@@ -11991,7 +12267,7 @@ class HierarchicalFlowGAT(nn.Module):
                     tb_lo = torch.as_tensor(tb_lo, device=device)
                 self._last_hier_aux_loss = self._compute_true_batch_aux_loss(
                     x_bnh=x_tb,
-                    base_ei=tb_graph.edge_index.to(device),
+                    base_ei=getattr(tb_graph, "edge_index_full", tb_graph.edge_index).to(device),
                     base_nl=tb_graph.node_level.to(device),
                     base_lo=tb_lo,
                     base_ar_time=getattr(tb_graph, "node_ar_time", None),
