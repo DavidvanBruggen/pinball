@@ -406,6 +406,18 @@ token_unet_lookahead_decode_enable: false
 # building the module entirely. Only the downward cross-query pairs below still run here.
 pinball_multirate_enable: true
 pinball_multirate_schedule: midpoint   # or "midpoint"
+
+# --- Energy-gated adaptive multirate cycling ---------------------------------------------
+# Instead of a fixed number of multirate passes, iterate the block until each node's own
+# relative update (||dx||/||x||, the "energy") falls below tau, up to max_cycles. Halting is
+# PER NODE (a settled node freezes at its value; a global halt would leak future settle
+# times into past rows through the cycle count). The loop breaks early once ALL rows are
+# frozen — provably a no-op, so it's causal AND saves compute on easy batches. Nodes that
+# converge fast stop burning updates; unsettled ones keep cycling. Watch
+# _last_pinball_multirate_stats: adaptive_cycles / adaptive_energy / adaptive_frozen_frac.
+pinball_multirate_adaptive: false   # default off = existing fixed-repeats behavior
+pinball_multirate_energy_tau: 0.05  # relative-update threshold; lower = more cycles
+pinball_multirate_max_cycles: 4     # hard cap on settling iterations per invocation
 pinball_upper_refine_steps: 0     # was 8; deactivated for now (the borderline one)
 pinball_top_refine_steps: 0        # was 16; dead in both monitored runs
 pinball_upper_cross_attn_steps: 0  # was 4; dead in both monitored runs

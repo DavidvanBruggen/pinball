@@ -2413,6 +2413,9 @@ class HierarchicalFlowGAT(nn.Module):
         pinball_multirate_midpoint_repeats: int = 1,
         pinball_multirate_skip_after_last_cycle: bool = True,
         pinball_multirate_debug: bool = False,
+        pinball_multirate_adaptive: bool = False,
+        pinball_multirate_energy_tau: float = 0.05,
+        pinball_multirate_max_cycles: int = 4,
         pinball_upper_refine_steps: int = 0,
         pinball_top_refine_steps: int = 0,
         pinball_l3_workspace_tokens: int = 0,
@@ -2657,6 +2660,9 @@ class HierarchicalFlowGAT(nn.Module):
         self.pinball_multirate_midpoint_repeats = max(1, int(pinball_multirate_midpoint_repeats))
         self.pinball_multirate_skip_after_last_cycle = bool(pinball_multirate_skip_after_last_cycle)
         self.pinball_multirate_debug = bool(pinball_multirate_debug)
+        self.pinball_multirate_adaptive = bool(pinball_multirate_adaptive)
+        self.pinball_multirate_energy_tau = float(pinball_multirate_energy_tau)
+        self.pinball_multirate_max_cycles = max(1, int(pinball_multirate_max_cycles))
         self.pinball_upper_refine_steps = max(0, int(pinball_upper_refine_steps))
         self.pinball_top_refine_steps = max(0, int(pinball_top_refine_steps))
         self.pinball_l3_workspace_tokens = max(0, int(pinball_l3_workspace_tokens))
@@ -11535,12 +11541,51 @@ class HierarchicalFlowGAT(nn.Module):
         graph_segment_t0 = graph_refine_t0
         midpoint_ran = False
 
+        mr_adaptive = bool(getattr(self, "pinball_multirate_adaptive", False))
+        mr_energy_tau = float(getattr(self, "pinball_multirate_energy_tau", 0.05))
+        mr_max_cycles = max(1, int(getattr(self, "pinball_multirate_max_cycles", 4)))
+        _mr_adaptive_cycles: int = 0
+        _mr_adaptive_energy: List[float] = []
+        _mr_adaptive_frozen_frac: float = 0.0
+
         def _run_multirate_repeats(x_in: torch.Tensor, repeats: int) -> torch.Tensor:
             nonlocal _mr_graph_ms, graph_segment_t0
+            nonlocal _mr_adaptive_cycles, _mr_adaptive_frozen_frac
             _mr_graph_ms = float(_mr_graph_ms + (time.monotonic() - graph_segment_t0) * 1000.0)
             x_out = x_in
-            for _ in range(max(1, int(repeats))):
-                x_out = _run_multirate_block(x_out)
+            if not mr_adaptive:
+                for _ in range(max(1, int(repeats))):
+                    x_out = _run_multirate_block(x_out)
+            else:
+                # Energy-gated settling: iterate the block until every node's relative
+                # update falls below tau, up to max_cycles. Halting must be PER NODE on
+                # the node's own energy — any global "batch is settled" halt would let
+                # future windows' settle time modulate how many updates past rows
+                # receive (an AR leak through the amount of compute). Frozen rows keep
+                # their settled values, so breaking once all rows are frozen is a
+                # bit-exact no-op. The block writes L0 too (0:q cross-query pairs), so
+                # the freeze mask covers ALL rows, not just coarse levels.
+                call0 = int(getattr(self, "_pinball_multirate_call_count", 0))
+                frozen: Optional[torch.Tensor] = None  # [B, N] bool
+                for _ in range(mr_max_cycles):
+                    x_new = _run_multirate_block(x_out)
+                    if frozen is not None:
+                        x_new = torch.where(frozen.unsqueeze(-1), x_out, x_new)
+                    with torch.no_grad():
+                        delta = (x_new - x_out).float().norm(dim=-1)
+                        ref = x_out.float().norm(dim=-1).clamp_min(1e-6)
+                        settled = (delta / ref) <= mr_energy_tau
+                        frozen = settled if frozen is None else (frozen | settled)
+                        _mr_adaptive_energy.append(float((delta / ref).mean().item()))
+                        _mr_adaptive_frozen_frac = float(frozen.float().mean().item())
+                    x_out = x_new
+                    _mr_adaptive_cycles = int(_mr_adaptive_cycles) + 1
+                    if bool(frozen.all().item()):
+                        break
+                # The persistent call counter gates the sub-refiner `_every` schedule;
+                # pin it to the max so a content-dependent early break cannot shift
+                # which refiners run in later invocations (schedule stays deterministic).
+                self._pinball_multirate_call_count = call0 + mr_max_cycles
             graph_segment_t0 = time.monotonic()
             return x_out
 
@@ -11942,8 +11987,13 @@ class HierarchicalFlowGAT(nn.Module):
                 "generic_cross_selected": int(_mr_generic_selected),
                 "generic_cross_updated": int(_mr_generic_updated),
                 "touched_levels": list(touched_levels),
+                "adaptive": bool(mr_adaptive),
+                "adaptive_cycles": int(_mr_adaptive_cycles),
+                "adaptive_energy": [round(float(e), 5) for e in _mr_adaptive_energy],
+                "adaptive_frozen_frac": float(_mr_adaptive_frozen_frac),
             }
             self._last_pinball_multirate_stats = multirate_stats
+            self._last_mr_adaptive_cycles = int(_mr_adaptive_cycles)
             if bool(getattr(self, "pinball_multirate_debug", False)) and not bool(getattr(self, "_pinball_multirate_runtime_logged", False)):
                 logger.info(
                     "Pinball multirate runtime: graph_ms=%.2f upper_ms=%.2f cross_ms=%.2f top_ms=%.2f upper_steps=%d cross_steps=%d top_steps=%d l2=%d l2_selected=%d l2_updated=%d l3=%d workspace=%d",
