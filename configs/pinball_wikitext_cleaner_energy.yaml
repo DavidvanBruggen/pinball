@@ -9,7 +9,7 @@ tokenizer_name: gpt2
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
 block_size: 8196 #16384 #32768 #1024
-batch_size: 4
+batch_size: 2
 val_split: 0.01
 
 # Training
@@ -30,7 +30,7 @@ muon_adjust_lr_fn: match_rms_adamw
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
 num_epochs: 100
 samples_per_epoch: 3125 #25000 #782 #25000
-gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
+gradient_accumulation_steps: 2   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
 # in seq-chunks of `chunked_ce_seq_chunk`, never materializing the full [B,T,vocab] logits (+ its
@@ -66,7 +66,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_energy/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -104,8 +104,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 768 #768
-num_heads: 12 #12
+hidden_dim: 192 #768
+num_heads: 3 #12
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -420,16 +420,20 @@ pinball_multirate_midpoint_layer: 9
 # frozen — provably a no-op, so it's causal AND saves compute on easy batches. Nodes that
 # converge fast stop burning updates; unsettled ones keep cycling. Watch
 # _last_pinball_multirate_stats: adaptive_cycles / adaptive_energy / adaptive_frozen_frac.
-pinball_multirate_adaptive: false   # default off = existing fixed-repeats behavior
+pinball_multirate_adaptive: true   # default off = existing fixed-repeats behavior
 pinball_multirate_energy_tau: 0.05  # relative-update threshold; lower = more cycles
-pinball_multirate_max_cycles: 4     # hard cap on settling iterations per invocation
-pinball_multirate_active_rows: true # cycles 2+ only compute unfrozen query rows in the
-                                    # cross-query pairs (exact, verified). Eval fwd ~wash
-                                    # (launch-bound) but TRAIN step +4.9% and -1.17 GiB
-                                    # peak @8k (frozen rows leave the autograd graph)
-pinball_upper_refine_steps: 0     # was 8; deactivated for now (the borderline one)
+pinball_multirate_max_cycles: 16     # hard cap on settling iterations per invocation
+# Cycles 2+ compute only the UNFROZEN query rows inside the cross-query pairs (exact:
+# queries are independent there — cross-attn into memory + pointwise FFN; auto-skipped if
+# the memory write-back is enabled). MEASURED at hidden 768 / seq 8192 bf16 on the 4090
+# at ~99% frozen: eval fwd is a tiny LOSS (+2ms, launch-bound) but a TRAINING step is
+# -15.7ms (+4.9%) and -1.17 GiB peak activations — frozen rows drop out of the autograd
+# graph, so backward compute AND per-cycle activation storage shrink to the stragglers.
+# (Assumes gradient_checkpointing: false, which this config uses.) The memory saving
+# scales with max_cycles, which is what makes high caps affordable.
+pinball_multirate_active_rows: true
+pinball_upper_refine_steps: 1     # was 8; deactivated for now (the borderline one)
 pinball_top_refine_steps: 0        # was 16; dead in both monitored runs
-pinball_upper_cross_attn_steps: 0  # was 4; dead in both monitored runs
 pinball_upper_refine_shared_weights: true   # weight-tied = recurrence, tiny param cost
 pinball_top_refine_shared_weights: true
 pinball_upper_refine_causal: true
@@ -447,11 +451,14 @@ pinball_l3_workspace_tokens: 8    # optional: small learned global register on L
 # NOTE: with causal: true + ar_time these run on SDPA (flash is refused when a mask is needed).
 #
 # (1) Upper cross refiner — hardcoded L3 queries <- L2 memory.
-pinball_upper_cross_attn_steps: 0          # master switch; N cross-attn+FFN passes (0 = off; dead in both runs)
+pinball_upper_cross_attn_steps: 1          # master switch; N cross-attn+FFN passes (0 = off).
+                                           # NOTE: this key appeared TWICE in this file (yaml
+                                           # silently keeps the LAST) — deduped 2026-07-08;
+                                           # runs before that trained with the effective 0.
 pinball_upper_query_topk_l2: 0             # top-k L2 memory per query; 0 = all L2 (few nodes, fine)
 pinball_upper_cross_attn_backend: auto     # auto | flash | sdpa (auto -> sdpa when causal-masked)
 pinball_upper_cross_attn_causal: true      # mask L2 with ar_time > query ar_time
-pinball_upper_cross_attn_shared_weights: true   # weight-tie across steps (recurrence)
+pinball_upper_cross_attn_shared_weights: true   # weight-tie across steps (recurrence) # false gives each block
 pinball_upper_update_l2_enable: false      # also write gated updates back into L2 (bidirectional)
 pinball_upper_update_l2_scale_init: 0.01
 pinball_upper_cross_write_scale_init: 0.01 # L3 residual write scale (starts ~identity)

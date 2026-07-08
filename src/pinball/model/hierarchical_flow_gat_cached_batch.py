@@ -594,6 +594,7 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
         x: torch.Tensor,
         node_level: torch.Tensor,
         node_ar_time: Optional[torch.Tensor] = None,
+        query_keep: Optional[Tuple[torch.Tensor, int]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, int]]:
         if self.steps <= 0 or x.dim() != 3:
             return x, {"steps": 0, "memory_selected": 0, "memory_updated": 0, "query_nodes": 0}
@@ -613,6 +614,37 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
             memory_time_for_attn = selected_memory_time
         else:
             memory_time_for_attn = memory_time if memory.dim() == 3 and memory.size(1) == memory_all.size(1) else None
+        # Active-rows execution (adaptive multirate): queries are independent here
+        # (cross-attn into memory + pointwise FFN), so computing only the kept rows is
+        # exact. Disabled when the memory write-back is on (its ctx is a mean over ALL
+        # queries). Memory selection above already ran on the full query set, so the
+        # selected memory is identical to the full path.
+        keep = None
+        n_act = -1
+        if query_keep is not None and not self.update_l2_enable:
+            keep, n_act = query_keep  # n_act precomputed by the caller — NO host sync here
+            if n_act == 0:
+                # every query row of this level is frozen; all writes would be discarded
+                return x, {"steps": 0, "memory_selected": 0, "memory_updated": 0, "query_nodes": 0,
+                           "query_level": int(self.query_level), "memory_level": int(self.memory_level)}
+            if n_act < 0 or n_act >= keep.size(1):
+                keep = None
+        order = None
+        pad_valid = None
+        if keep is not None:
+            # Stable argsort puts kept rows first (order preserved); the tail pads each
+            # batch row to a rectangle with DISTINCT inactive rows, whose redundant
+            # updates are discarded on write-back.
+            order = torch.argsort((~keep).to(torch.int8), dim=1, stable=True)[:, :n_act]
+            pad_valid = keep.gather(1, order)
+            query_start = query_start.gather(1, order.unsqueeze(-1).expand(-1, -1, query_start.size(-1)))
+            if query_time is not None:
+                qt_full = query_time.view(1, -1).expand(x.size(0), -1) if query_time.dim() == 1 else query_time
+                query_time = qt_full.gather(1, order)
+            if memory.dim() == 4:
+                memory = memory.gather(1, order.view(order.size(0), n_act, 1, 1).expand(-1, -1, memory.size(2), memory.size(3)))
+                if memory_time_for_attn is not None and memory_time_for_attn.dim() == 3:
+                    memory_time_for_attn = memory_time_for_attn.gather(1, order.unsqueeze(-1).expand(-1, -1, memory_time_for_attn.size(2)))
         query = query_start
         for step in range(self.steps):
             block_idx = 0 if self.shared_weights else min(step, len(self.q_projs) - 1)
@@ -620,7 +652,12 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
             query = query + self.dropout(self.ffns[block_idx](self.ffn_norms[block_idx](query)))
         updated = query_start + self.write_scale.to(device=query.device, dtype=query.dtype) * (query - query_start)
         out = x.clone()
-        out.index_copy_(1, query_idx, updated.to(dtype=out.dtype))
+        if order is not None:
+            updated = torch.where(pad_valid.unsqueeze(-1), updated, query_start)
+            flat_pos = query_idx.view(1, -1).expand(x.size(0), -1).gather(1, order)
+            out.scatter_(1, flat_pos.unsqueeze(-1).expand(-1, -1, out.size(-1)), updated.to(dtype=out.dtype))
+        else:
+            out.index_copy_(1, query_idx, updated.to(dtype=out.dtype))
         memory_updated = 0
         if self.update_l2_enable and memory.dim() == 3 and selected_memory_local is not None and selected_memory_local.numel() > 0 and int(self.memory_level) != 0:
             ctx = query.mean(dim=1, keepdim=True)
@@ -2416,6 +2453,7 @@ class HierarchicalFlowGAT(nn.Module):
         pinball_multirate_adaptive: bool = False,
         pinball_multirate_energy_tau: float = 0.05,
         pinball_multirate_max_cycles: int = 4,
+        pinball_multirate_active_rows: bool = True,
         pinball_upper_refine_steps: int = 0,
         pinball_top_refine_steps: int = 0,
         pinball_l3_workspace_tokens: int = 0,
@@ -2663,6 +2701,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.pinball_multirate_adaptive = bool(pinball_multirate_adaptive)
         self.pinball_multirate_energy_tau = float(pinball_multirate_energy_tau)
         self.pinball_multirate_max_cycles = max(1, int(pinball_multirate_max_cycles))
+        self.pinball_multirate_active_rows = bool(pinball_multirate_active_rows)
         self.pinball_upper_refine_steps = max(0, int(pinball_upper_refine_steps))
         self.pinball_top_refine_steps = max(0, int(pinball_top_refine_steps))
         self.pinball_l3_workspace_tokens = max(0, int(pinball_l3_workspace_tokens))
@@ -5945,6 +5984,24 @@ class HierarchicalFlowGAT(nn.Module):
             if mod is not None and hasattr(mod, "level_scales"):
                 for k, s in mod.level_scales.items():
                     d[f"{name}.L{k}.scale"] = float(s.detach())
+        # Energy-gated adaptive multirate: settings + observed settling behavior.
+        # cycles.ema pinned at max_cycles = tau too low (never settles, cap does the work);
+        # cycles.ema ~1 = tau too high (always settles immediately); in between = regulating.
+        # energy.last_cycle is the mean energy at the final cycle — set tau just above the
+        # settled plateau this converges to on a warm run.
+        if bool(getattr(self, "pinball_multirate_adaptive", False)):
+            d["mradapt.tau"] = float(getattr(self, "pinball_multirate_energy_tau", 0.0))
+            d["mradapt.max_cycles"] = float(getattr(self, "pinball_multirate_max_cycles", 1))
+            d["mradapt.cycles.last"] = float(getattr(self, "_last_mr_adaptive_cycles", 0))
+            d["mradapt.cycles.ema"] = float(getattr(self, "_mr_adaptive_cycles_ema", 0.0))
+            d["mradapt.cycles.max_seen"] = float(getattr(self, "_mr_adaptive_cycles_max", 0))
+            st = getattr(self, "_last_pinball_multirate_stats", None) or {}
+            if st.get("adaptive"):
+                d["mradapt.frozen_frac"] = float(st.get("adaptive_frozen_frac", 0.0))
+                energies = st.get("adaptive_energy") or []
+                if energies:
+                    d["mradapt.energy.first_cycle"] = float(energies[0])
+                    d["mradapt.energy.last_cycle"] = float(energies[-1])
         return d
 
     def _maybe_log_gate_monitor(self) -> None:
@@ -11468,7 +11525,7 @@ class HierarchicalFlowGAT(nn.Module):
         _mr_top_steps: int = 0
         _mr_runtime_logged: bool = False
 
-        def _run_multirate_block(x_in: torch.Tensor) -> torch.Tensor:
+        def _run_multirate_block(x_in: torch.Tensor, query_keep_by_level: Optional[Dict[int, Tuple[torch.Tensor, int]]] = None) -> torch.Tensor:
             nonlocal _mr_call_count, _mr_touched_all, _mr_graph_ms, _mr_cross_ms, _mr_upper_ms, _mr_top_ms
             nonlocal _mr_generic_pairs, _mr_generic_selected, _mr_generic_updated, _mr_runtime_logged
             nonlocal _mr_cross_l2_selected, _mr_cross_l2_updated
@@ -11501,7 +11558,8 @@ class HierarchicalFlowGAT(nn.Module):
             if generic_cross_should_run:
                 for refiner in self.pinball_cross_query_refiners:
                     t0 = time.monotonic()
-                    x_out, pair_stats = refiner(x_out, base_nl, node_ar_time=base_ar_time)
+                    q_keep = None if query_keep_by_level is None else query_keep_by_level.get(int(refiner.query_level))
+                    x_out, pair_stats = refiner(x_out, base_nl, node_ar_time=base_ar_time, query_keep=q_keep)
                     _mr_cross_ms = float(_mr_cross_ms + (time.monotonic() - t0) * 1000.0)
                     _mr_generic_pairs = int(_mr_generic_pairs + 1)
                     _mr_generic_selected = int(_mr_generic_selected + int(pair_stats.get("memory_selected", 0)))
@@ -11566,22 +11624,52 @@ class HierarchicalFlowGAT(nn.Module):
                 # bit-exact no-op. The block writes L0 too (0:q cross-query pairs), so
                 # the freeze mask covers ALL rows, not just coarse levels.
                 call0 = int(getattr(self, "_pinball_multirate_call_count", 0))
+                mr_active_rows = bool(getattr(self, "pinball_multirate_active_rows", True))
                 frozen: Optional[torch.Tensor] = None  # [B, N] bool
+                active_keep: Optional[Dict[int, Tuple[torch.Tensor, int]]] = None
+                keep_level_idx: Optional[Dict[int, torch.Tensor]] = None
+                if mr_active_rows:
+                    keep_levels = sorted({int(r.query_level) for r in (getattr(self, "pinball_cross_query_refiners", []) or [])})
+                    keep_level_idx = {l: torch.nonzero(base_nl == l, as_tuple=False).view(-1) for l in keep_levels}
                 for _ in range(mr_max_cycles):
-                    x_new = _run_multirate_block(x_out)
+                    x_new = _run_multirate_block(x_out, query_keep_by_level=active_keep)
                     if frozen is not None:
                         x_new = torch.where(frozen.unsqueeze(-1), x_out, x_new)
                     with torch.no_grad():
                         delta = (x_new - x_out).float().norm(dim=-1)
                         ref = x_out.float().norm(dim=-1).clamp_min(1e-6)
-                        settled = (delta / ref) <= mr_energy_tau
+                        energy = delta / ref
+                        settled = energy <= mr_energy_tau
                         frozen = settled if frozen is None else (frozen | settled)
-                        _mr_adaptive_energy.append(float((delta / ref).mean().item()))
-                        _mr_adaptive_frozen_frac = float(frozen.float().mean().item())
+                        level_masks: Dict[int, torch.Tensor] = {}
+                        if keep_level_idx:
+                            keep_all = ~frozen
+                            level_masks = {l: keep_all.index_select(1, idx) for l, idx in keep_level_idx.items()}
+                        # ONE host sync per cycle: mean energy, frozen frac (1.0 = break),
+                        # and each level's max active-row count for the gather path.
+                        packed = torch.cat(
+                            [energy.mean().view(1), frozen.float().mean().view(1)]
+                            + [mk.sum(dim=1).max().to(torch.float32).view(1) for mk in level_masks.values()]
+                        ).tolist()
+                    _mr_adaptive_energy.append(float(packed[0]))
+                    _mr_adaptive_frozen_frac = float(packed[1])
                     x_out = x_new
                     _mr_adaptive_cycles = int(_mr_adaptive_cycles) + 1
-                    if bool(frozen.all().item()):
+                    if packed[1] >= 1.0:
                         break
+                    # Active-rows: from the next cycle on, the cross-query refiners only
+                    # compute unfrozen query rows (exact — queries are independent there;
+                    # frozen rows would be discarded by the where() above anyway). Only
+                    # gather when a solid majority is frozen; below that the gather
+                    # overhead outweighs the saved compute.
+                    active_keep = None
+                    if level_masks:
+                        gathered = {}
+                        for j, (l, mk) in enumerate(level_masks.items()):
+                            lvl_n_act = int(packed[2 + j])
+                            if lvl_n_act <= int(0.75 * mk.size(1)):
+                                gathered[l] = (mk, lvl_n_act)
+                        active_keep = gathered or None
                 # The persistent call counter gates the sub-refiner `_every` schedule;
                 # pin it to the max so a content-dependent early break cannot shift
                 # which refiners run in later invocations (schedule stays deterministic).
@@ -11994,6 +12082,11 @@ class HierarchicalFlowGAT(nn.Module):
             }
             self._last_pinball_multirate_stats = multirate_stats
             self._last_mr_adaptive_cycles = int(_mr_adaptive_cycles)
+            if mr_adaptive:
+                prev_ema = float(getattr(self, "_mr_adaptive_cycles_ema", 0.0))
+                cur = float(_mr_adaptive_cycles)
+                self._mr_adaptive_cycles_ema = cur if prev_ema <= 0.0 else (0.98 * prev_ema + 0.02 * cur)
+                self._mr_adaptive_cycles_max = max(int(getattr(self, "_mr_adaptive_cycles_max", 0)), int(_mr_adaptive_cycles))
             if bool(getattr(self, "pinball_multirate_debug", False)) and not bool(getattr(self, "_pinball_multirate_runtime_logged", False)):
                 logger.info(
                     "Pinball multirate runtime: graph_ms=%.2f upper_ms=%.2f cross_ms=%.2f top_ms=%.2f upper_steps=%d cross_steps=%d top_steps=%d l2=%d l2_selected=%d l2_updated=%d l3=%d workspace=%d",

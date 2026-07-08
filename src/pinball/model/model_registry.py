@@ -351,6 +351,7 @@ def build_pinball_model(
         pinball_multirate_adaptive=bool(getattr(args, "pinball_multirate_adaptive", False)),
         pinball_multirate_energy_tau=float(getattr(args, "pinball_multirate_energy_tau", 0.05)),
         pinball_multirate_max_cycles=int(getattr(args, "pinball_multirate_max_cycles", 4)),
+        pinball_multirate_active_rows=bool(getattr(args, "pinball_multirate_active_rows", True)),
         pinball_upper_refine_steps=int(getattr(args, "pinball_upper_refine_steps", 0)),
         pinball_top_refine_steps=int(getattr(args, "pinball_top_refine_steps", 0)),
         pinball_l3_workspace_tokens=int(getattr(args, "pinball_l3_workspace_tokens", 0)),
