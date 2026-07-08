@@ -405,7 +405,12 @@ token_unet_lookahead_decode_enable: false
 # and is deactivated FOR NOW, not removed — re-enable by raising its steps. steps: 0 skips
 # building the module entirely. Only the downward cross-query pairs below still run here.
 pinball_multirate_enable: true
-pinball_multirate_schedule: midpoint   # or "midpoint"
+pinball_multirate_schedule: midpoint   # "midpoint" fires once after midpoint_layer; "after_full_stack" = after ALL layers
+# Placement of the multirate/thinking episode: "auto" = mid-stack (layer 6 of 12).
+# Prelude -> loop -> coda shape: 9 leaves 3 coda layers to locally mix + decode what the
+# episode wrote into L0/L1 (thinking against a MATURE hierarchy, but not so late that the
+# head reads unintegrated gated residuals). Old runs trained with auto (=6).
+pinball_multirate_midpoint_layer: 9
 
 # --- Energy-gated adaptive multirate cycling ---------------------------------------------
 # Instead of a fixed number of multirate passes, iterate the block until each node's own
