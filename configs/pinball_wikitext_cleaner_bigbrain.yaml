@@ -66,7 +66,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_bigbrain/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -104,8 +104,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 192 #768
-num_heads: 3 #12
+hidden_dim: 768
+num_heads: 12
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -226,7 +226,10 @@ cross_level_qkv: shared
 # LARGE dim = capacity at the "bottleneck", like a U-Net's channel growth. Input/output stay
 # hidden_dim (residual + cross-level attention unaffected). Compute drops (L0 shrunk); params
 # grow (big coarse FFNs, few nodes). [] = uniform (default). e.g. [384, 768, 1152, 1536] for L0..L3.
-per_level_ffn_dims: [] #[192, 384, 1152, 1536]
+# BIG-BRAIN: parameters live where rows are few. FFN widths per level: L0 stays at the
+# default 4x hidden; L1/L2/L3 get 8x/16x/32x. Because coarse rows are ~1/8, ~1/32, ~1/128
+# of L0, each level's FFN FLOPs stay at or below L0's despite the giant widths.
+per_level_ffn_dims: [] #[768, 1536, 3072, 6144]
 # Per-level LOCAL-attention dim (the big lever — attention is ~84% of graph compute). Each level's
 # window attention runs at num_heads_L = round(mult_L * num_heads) heads, head_dim FIXED at 64
 # (full per-head resolution). L0 (most nodes) fewer heads = cheaper; coarse levels more heads =
@@ -420,23 +423,27 @@ pinball_multirate_midpoint_layer: 9
 # frozen — provably a no-op, so it's causal AND saves compute on easy batches. Nodes that
 # converge fast stop burning updates; unsettled ones keep cycling. Watch
 # _last_pinball_multirate_stats: adaptive_cycles / adaptive_energy / adaptive_frozen_frac.
-pinball_multirate_adaptive: false   # default off = existing fixed-repeats behavior
+pinball_multirate_adaptive: true   # default off = existing fixed-repeats behavior
 pinball_multirate_energy_tau: 0.05  # relative-update threshold; lower = more cycles
-pinball_multirate_max_cycles: 4     # hard cap on settling iterations per invocation
-pinball_multirate_active_rows: true # cycles 2+ only compute unfrozen query rows in the
-                                    # cross-query pairs (exact, verified). Eval fwd ~wash
-                                    # (launch-bound) but TRAIN step +4.9% and -1.17 GiB
-                                    # peak @8k (frozen rows leave the autograd graph)
-pinball_upper_refine_steps: 0     # was 8; deactivated for now (the borderline one)
-pinball_top_refine_steps: 0        # was 16; dead in both monitored runs
-pinball_upper_cross_attn_steps: 0  # was 4; dead in both monitored runs
-pinball_upper_refine_shared_weights: true   # weight-tied = recurrence, tiny param cost
-pinball_top_refine_shared_weights: true
+pinball_multirate_max_cycles: 16     # hard cap on settling iterations per invocation
+# Cycles 2+ compute only the UNFROZEN query rows inside the cross-query pairs (exact:
+# queries are independent there — cross-attn into memory + pointwise FFN; auto-skipped if
+# the memory write-back is enabled). MEASURED at hidden 768 / seq 8192 bf16 on the 4090
+# at ~99% frozen: eval fwd is a tiny LOSS (+2ms, launch-bound) but a TRAINING step is
+# -15.7ms (+4.9%) and -1.17 GiB peak activations — frozen rows drop out of the autograd
+# graph, so backward compute AND per-cycle activation storage shrink to the stragglers.
+# (Assumes gradient_checkpointing: false, which this config uses.) The memory saving
+# scales with max_cycles, which is what makes high caps affordable.
+pinball_multirate_active_rows: true
+pinball_upper_refine_steps: 8     # BIG-BRAIN: 8 UNSHARED blocks on L2/L3 (~2% of rows = nearly free FLOPs)
+pinball_top_refine_steps: 4        # BIG-BRAIN: re-enabled (was dead pre-seed/upref; gate monitor will tell)
+pinball_upper_refine_shared_weights: false  # BIG-BRAIN: true depth, one weight set per step
+pinball_top_refine_shared_weights: false
 pinball_upper_refine_causal: true
 pinball_top_refine_causal: true
 pinball_upper_refine_window: 128    # 0 = full attention within the (short) level
 pinball_top_refine_window: 128
-pinball_l3_workspace_tokens: 8    # optional: small learned global register on L3
+pinball_l3_workspace_tokens: 64   # BIG-BRAIN: 8 -> 64 learned global registers on L3 (pure params)
 
 # --- Cross-level query refiners (PinballPackedCrossAttentionRefiner) --------------------
 # Extra cross-attention "thinking" in the upper hierarchy: a query level attends into a
@@ -447,11 +454,14 @@ pinball_l3_workspace_tokens: 8    # optional: small learned global register on L
 # NOTE: with causal: true + ar_time these run on SDPA (flash is refused when a mask is needed).
 #
 # (1) Upper cross refiner — hardcoded L3 queries <- L2 memory.
-pinball_upper_cross_attn_steps: 0          # master switch; N cross-attn+FFN passes (0 = off; dead in both runs)
+pinball_upper_cross_attn_steps: 1          # master switch; N cross-attn+FFN passes (0 = off).
+                                           # NOTE: this key appeared TWICE in this file (yaml
+                                           # silently keeps the LAST) — deduped 2026-07-08;
+                                           # runs before that trained with the effective 0.
 pinball_upper_query_topk_l2: 0             # top-k L2 memory per query; 0 = all L2 (few nodes, fine)
 pinball_upper_cross_attn_backend: auto     # auto | flash | sdpa (auto -> sdpa when causal-masked)
 pinball_upper_cross_attn_causal: true      # mask L2 with ar_time > query ar_time
-pinball_upper_cross_attn_shared_weights: true   # weight-tie across steps (recurrence)
+pinball_upper_cross_attn_shared_weights: false  # BIG-BRAIN: unshared steps
 pinball_upper_update_l2_enable: false      # also write gated updates back into L2 (bidirectional)
 pinball_upper_update_l2_scale_init: 0.01
 pinball_upper_cross_write_scale_init: 0.01 # L3 residual write scale (starts ~identity)
@@ -476,7 +486,7 @@ pinball_cross_query_topk: 0                # top-k memory nodes per selection; 0
 pinball_cross_query_l0_window: 0           # only used when a pair's memory level is 0 (±ar_time window)
 pinball_cross_query_backend: auto
 pinball_cross_query_causal: true
-pinball_cross_query_shared_weights: true
+pinball_cross_query_shared_weights: false  # BIG-BRAIN: unshared; params 2x, FLOPs unchanged (steps stay 2)
 pinball_cross_query_update_memory_enable: false  # keep L3 read-only in the forward (no abstraction drift)
 pinball_cross_query_selection: global_mean # global_mean (shared top-k) | per_query (per-query top-k, heavier)
 # Residual write scale into the query level. Last run this COLLAPSED 0.01 -> 1e-4 (model gated the

@@ -7,12 +7,12 @@ tokenizer_name: gpt2
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt #./data/wikitext_combined.txt
 block_size: 8196 #16384 #32768 #1024
-batch_size: 4
+batch_size: 2
 val_split: 0.01
 
 num_epochs: 100
 samples_per_epoch: 3125 #25000 #782 #25000
-gradient_accumulation_steps: 1  # accumulate grads over N batches before an optimizer step
+gradient_accumulation_steps: 2  # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Long-context diagnostic: every N validations, log next-token PPL bucketed by in-context
 # recurrence distance (never / <128 / 128-511 / 512-2k / >2k). Cheap — reuses the val batches,
@@ -26,7 +26,7 @@ longctx_diag_every: 1
 gen_prompt_tokens: 512
 gen_max_new_tokens: 512
 save_every: 0
-checkpoint_dir: ./transformer/checkpoints_gpt2_longcontext_test
+checkpoint_dir: ./transformer/checkpoints_gpt2_longcontext_test_small
 
 train_mode: ar
 learning_rate: 0.0003
@@ -37,8 +37,8 @@ optimizer: muon_hybrid    # adamw | muon_hybrid (Muon on matrices, AdamW on 1D p
 muon_lr_mult: 6.0
 
 # Transformer shape
-hidden_dim: 768
-num_heads: 12
+hidden_dim: 192 #768
+num_heads: 3 #12
 transformer_n_layer: 12
 transformer_ffn_type: swiglu
 transformer_use_rope: true
