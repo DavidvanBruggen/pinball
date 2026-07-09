@@ -30,7 +30,7 @@ muon_adjust_lr_fn: match_rms_adamw
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
 num_epochs: 100
 samples_per_epoch: 3125 #25000 #782 #25000
-gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
+gradient_accumulation_steps: 2   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
 # in seq-chunks of `chunked_ce_seq_chunk`, never materializing the full [B,T,vocab] logits (+ its
@@ -66,7 +66,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_hqd/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -172,9 +172,9 @@ hier_refresh_compile: true
 # layers (v1 HQD's injection path — works with the static edges dropped; children tables come
 # from window arithmetic, not edge lists). This is the DYNAMIC content-addressed read the
 # recency gathers can't do. OFF for the baseline cleaner run; flip on for the retrieval test.
-xq_nominate_enable: false
-xq_nominate_topk_l3: 2         # closed L3 windows shortlisted per query
-xq_nominate_topk_l1: 2         # L1 winners kept among the shortlist's children
+xq_nominate_enable: true
+xq_nominate_topk_l3: 4         # closed L3 windows shortlisted per query
+xq_nominate_topk_l1: 4        # L1 winners kept among the shortlist's children
 xq_nominate_exclude_local: true  # spend the edge budget beyond the L0 local window
 xq_nominate_max_layers: 2      # layers fed after nomination (0 = all; each costs a sparse pass)
 # When to nominate: auto = after the middle layer (mature queries/summaries, remaining layers
@@ -185,7 +185,7 @@ xq_nominate_after_layer: auto
 # queries — retrieved content changes what the next round fetches (iterative / multi-hop
 # retrieval); scoring is ~1-2ms/round, the fed-layer budget above resets per round. For deep
 # stacks the pattern is e.g. after_layer: 4, every: 4, max_layers: 2.
-xq_nominate_every: 0
+xq_nominate_every: 2
 norm_type: layernorm
 dropout: 0.1
 

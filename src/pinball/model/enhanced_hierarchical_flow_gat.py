@@ -3519,7 +3519,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         force_autoregressive: bool = False,
         use_recurrent: bool = False,
         recurrent_l0_window: Optional[int] = None,
-        use_kv_cache: bool = False,
+        use_kv_cache: bool = True,   # cached-tail decode (see base class); safe auto-fallback
         kv_frontier_width: Optional[int] = None,
         verify_incremental: bool = False,
     ) -> torch.Tensor:

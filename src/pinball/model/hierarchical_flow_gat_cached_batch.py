@@ -308,7 +308,17 @@ class PinballPackedLevelRefiner(nn.Module):
         else:
             self.workspace = None
 
-    def forward(self, x: torch.Tensor, node_level: torch.Tensor, steps: Optional[int] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        node_level: torch.Tensor,
+        steps: Optional[int] = None,
+        extra_prefix: Optional[Dict[int, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        # extra_prefix: {level: [B, P, H]} frozen context rows (KV-cached decode) prepended
+        # in time order before this graph's rows of that level — they serve as causal keys
+        # for the windowed attention exactly like the pre-tail nodes they cache, and their
+        # (recomputed) outputs are sliced off before write-back.
         steps = self.max_steps if steps is None else max(0, min(int(steps), self.max_steps))
         if steps <= 0 or x.dim() != 3:
             return x
@@ -320,6 +330,12 @@ class PinballPackedLevelRefiner(nn.Module):
                 continue
             z0 = out.index_select(1, idx)
             z = z0
+            n_prefix = 0
+            if extra_prefix is not None and int(level) in extra_prefix:
+                pre = extra_prefix[int(level)]
+                if pre is not None and pre.dim() == 3 and pre.size(1) > 0:
+                    n_prefix = int(pre.size(1))
+                    z = torch.cat([pre.to(device=z.device, dtype=z.dtype), z], dim=1)
             use_workspace = self.workspace is not None and int(level) == 3
             if use_workspace:
                 # Prefix learned workspace tokens; causal packed attention keeps L3 from reading future L3 tokens through workspace.
@@ -327,8 +343,9 @@ class PinballPackedLevelRefiner(nn.Module):
             for step in range(steps):
                 block = self.blocks[0] if self.shared_weights else self.blocks[min(step, len(self.blocks) - 1)]
                 z = block(z)
-            if use_workspace:
-                z_level = z[:, self.workspace_tokens :, :]
+            skip = (self.workspace_tokens if use_workspace else 0) + n_prefix
+            if skip > 0:
+                z_level = z[:, skip:, :]
             else:
                 z_level = z
             scale = self.level_scales[str(level)].to(device=z_level.device, dtype=z_level.dtype)
@@ -595,7 +612,12 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
         node_level: torch.Tensor,
         node_ar_time: Optional[torch.Tensor] = None,
         query_keep: Optional[Tuple[torch.Tensor, int]] = None,
+        extra_memory: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, int]]:
+        # extra_memory: (x_mem [B, M, H], mem_time [M]) frozen memory rows (KV-cached decode)
+        # PREPENDED to this graph's memory-level rows before selection: cached pre-tail coarse
+        # nodes the tail graph doesn't contain. mem_time must be on the same (shifted) clock
+        # as node_ar_time. Read-only: the update_l2 write-back is skipped when present.
         if self.steps <= 0 or x.dim() != 3:
             return x, {"steps": 0, "memory_selected": 0, "memory_updated": 0, "query_nodes": 0}
         memory_idx = torch.nonzero(node_level == int(self.memory_level), as_tuple=False).view(-1)
@@ -609,6 +631,16 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
         if node_ar_time is not None:
             query_time = node_ar_time.index_select(0, query_idx)
             memory_time = node_ar_time.index_select(0, memory_idx)
+        has_extra_memory = False
+        if extra_memory is not None:
+            mem_x, mem_t = extra_memory
+            if mem_x is not None and mem_x.dim() == 3 and mem_x.size(1) > 0:
+                memory_all = torch.cat([mem_x.to(device=memory_all.device, dtype=memory_all.dtype), memory_all], dim=1)
+                if memory_time is not None and mem_t is not None:
+                    memory_time = torch.cat(
+                        [mem_t.to(device=memory_time.device, dtype=memory_time.dtype), memory_time], dim=0
+                    )
+                has_extra_memory = True
         memory, selected_memory_local, selected_memory_time = self._select_memory(query_start, memory_all, memory_time=memory_time, query_time=query_time)
         if selected_memory_time is not None:
             memory_time_for_attn = selected_memory_time
@@ -659,7 +691,7 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
         else:
             out.index_copy_(1, query_idx, updated.to(dtype=out.dtype))
         memory_updated = 0
-        if self.update_l2_enable and memory.dim() == 3 and selected_memory_local is not None and selected_memory_local.numel() > 0 and int(self.memory_level) != 0:
+        if self.update_l2_enable and (not has_extra_memory) and memory.dim() == 3 and selected_memory_local is not None and selected_memory_local.numel() > 0 and int(self.memory_level) != 0:
             ctx = query.mean(dim=1, keepdim=True)
             delta = self.l2_update_proj(self.l2_update_norm(ctx)).expand(-1, memory.size(1), -1)
             gate = torch.sigmoid(self.l2_update_gate(torch.cat([memory, delta], dim=-1)))
@@ -11539,15 +11571,23 @@ class HierarchicalFlowGAT(nn.Module):
             top_should_run = getattr(self, "pinball_top_refiner", None) is not None and (call_count % int(self.pinball_top_refine_every) == 0)
             touched: List[int] = []
             x_out = x_in
+            # KV-cached decode: cached pre-tail coarse rows enter as frozen context —
+            # per-level causal prefixes for the within-level refiners, extra memory rows
+            # for the cross-attention refiners. None (the default) is a strict no-op.
+            gen_prefix = getattr(self, "_gen_mr_level_prefix", None)
+            gen_extra_mem = getattr(self, "_gen_mr_extra_memory", None)
             if upper_should_run:
                 t0 = time.monotonic()
-                x_out = self.pinball_upper_refiner(x_out, base_nl, steps=self.pinball_upper_refine_steps)
+                x_out = self.pinball_upper_refiner(x_out, base_nl, steps=self.pinball_upper_refine_steps, extra_prefix=gen_prefix)
                 _mr_upper_ms = float(_mr_upper_ms + (time.monotonic() - t0) * 1000.0)
                 _mr_upper_steps = int(_mr_upper_steps + int(self.pinball_upper_refine_steps))
                 touched.extend([2, 3])
             if cross_should_run:
                 t0 = time.monotonic()
-                x_out, cross_stats = self.pinball_upper_cross_refiner(x_out, base_nl, node_ar_time=base_ar_time)
+                x_out, cross_stats = self.pinball_upper_cross_refiner(
+                    x_out, base_nl, node_ar_time=base_ar_time,
+                    extra_memory=None if gen_extra_mem is None else gen_extra_mem.get(int(self.pinball_upper_cross_refiner.memory_level)),
+                )
                 _mr_cross_ms = float(_mr_cross_ms + (time.monotonic() - t0) * 1000.0)
                 _mr_cross_steps = int(_mr_cross_steps + int(self.pinball_upper_cross_attn_steps))
                 _mr_cross_l2_selected = int(_mr_cross_l2_selected + int(cross_stats.get("l2_selected", 0)))
@@ -11559,7 +11599,10 @@ class HierarchicalFlowGAT(nn.Module):
                 for refiner in self.pinball_cross_query_refiners:
                     t0 = time.monotonic()
                     q_keep = None if query_keep_by_level is None else query_keep_by_level.get(int(refiner.query_level))
-                    x_out, pair_stats = refiner(x_out, base_nl, node_ar_time=base_ar_time, query_keep=q_keep)
+                    x_out, pair_stats = refiner(
+                        x_out, base_nl, node_ar_time=base_ar_time, query_keep=q_keep,
+                        extra_memory=None if gen_extra_mem is None else gen_extra_mem.get(int(refiner.memory_level)),
+                    )
                     _mr_cross_ms = float(_mr_cross_ms + (time.monotonic() - t0) * 1000.0)
                     _mr_generic_pairs = int(_mr_generic_pairs + 1)
                     _mr_generic_selected = int(_mr_generic_selected + int(pair_stats.get("memory_selected", 0)))
@@ -11569,7 +11612,7 @@ class HierarchicalFlowGAT(nn.Module):
                         touched.append(int(pair_stats.get("memory_level", -1)))
             if top_should_run:
                 t0 = time.monotonic()
-                x_out = self.pinball_top_refiner(x_out, base_nl, steps=self.pinball_top_refine_steps)
+                x_out = self.pinball_top_refiner(x_out, base_nl, steps=self.pinball_top_refine_steps, extra_prefix=gen_prefix)
                 _mr_top_ms = float(_mr_top_ms + (time.monotonic() - t0) * 1000.0)
                 _mr_top_steps = int(_mr_top_steps + int(self.pinball_top_refine_steps))
                 touched.append(3)
@@ -11611,9 +11654,30 @@ class HierarchicalFlowGAT(nn.Module):
             nonlocal _mr_adaptive_cycles, _mr_adaptive_frozen_frac
             _mr_graph_ms = float(_mr_graph_ms + (time.monotonic() - graph_segment_t0) * 1000.0)
             x_out = x_in
+            # KV-cached decode: settled context rows are pre-frozen for the whole episode —
+            # they hold their (cache-injected) episode-entry values while only frontier rows
+            # iterate, and the active-rows gather skips computing them from cycle 1. The
+            # post-episode divergence this causes on context rows is repaired by the
+            # _gen_mr_hook overwrite below. None (the default) is a strict no-op.
+            gen_prefrozen = getattr(self, "_gen_mr_prefrozen", None)  # [B, N] bool
+            gen_prefrozen_keep = getattr(self, "_gen_mr_prefrozen_keep", None)  # {level: (mask, n_act)}
+            # Per-CYCLE hook: settled rows evolve within the episode in the true forward, so
+            # boundary injection alone is not enough — the decode driver captures every
+            # cycle's state on the refill forward and re-injects settled rows after every
+            # cycle here (exact by causality). Also fires in capture mode. None = no-op.
+            gen_cycle_hook = getattr(self, "_gen_mr_cycle_hook", None)
             if not mr_adaptive:
-                for _ in range(max(1, int(repeats))):
-                    x_out = _run_multirate_block(x_out)
+                if gen_prefrozen is None and gen_cycle_hook is None:
+                    for _ in range(max(1, int(repeats))):
+                        x_out = _run_multirate_block(x_out)
+                else:
+                    for rep_i in range(max(1, int(repeats))):
+                        x_new = _run_multirate_block(x_out, query_keep_by_level=gen_prefrozen_keep)
+                        if gen_prefrozen is not None:
+                            x_new = torch.where(gen_prefrozen.unsqueeze(-1), x_out, x_new)
+                        if gen_cycle_hook is not None:
+                            x_new = gen_cycle_hook(x_new, int(rep_i))
+                        x_out = x_new
             else:
                 # Energy-gated settling: iterate the block until every node's relative
                 # update falls below tau, up to max_cycles. Halting must be PER NODE on
@@ -11625,16 +11689,21 @@ class HierarchicalFlowGAT(nn.Module):
                 # the freeze mask covers ALL rows, not just coarse levels.
                 call0 = int(getattr(self, "_pinball_multirate_call_count", 0))
                 mr_active_rows = bool(getattr(self, "pinball_multirate_active_rows", True))
-                frozen: Optional[torch.Tensor] = None  # [B, N] bool
-                active_keep: Optional[Dict[int, Tuple[torch.Tensor, int]]] = None
+                frozen: Optional[torch.Tensor] = gen_prefrozen  # [B, N] bool
+                active_keep: Optional[Dict[int, Tuple[torch.Tensor, int]]] = gen_prefrozen_keep
                 keep_level_idx: Optional[Dict[int, torch.Tensor]] = None
                 if mr_active_rows:
                     keep_levels = sorted({int(r.query_level) for r in (getattr(self, "pinball_cross_query_refiners", []) or [])})
                     keep_level_idx = {l: torch.nonzero(base_nl == l, as_tuple=False).view(-1) for l in keep_levels}
-                for _ in range(mr_max_cycles):
+                for _cyc_i in range(mr_max_cycles):
                     x_new = _run_multirate_block(x_out, query_keep_by_level=active_keep)
                     if frozen is not None:
                         x_new = torch.where(frozen.unsqueeze(-1), x_out, x_new)
+                    if gen_cycle_hook is not None:
+                        # decode: overwrite settled rows with their true (captured) state for
+                        # this cycle BEFORE the energy step, so the freeze dynamics of the
+                        # frontier rows see exactly what the full forward's would.
+                        x_new = gen_cycle_hook(x_new, int(_cyc_i))
                     with torch.no_grad():
                         delta = (x_new - x_out).float().norm(dim=-1)
                         ref = x_out.float().norm(dim=-1).clamp_min(1e-6)
@@ -11674,6 +11743,12 @@ class HierarchicalFlowGAT(nn.Module):
                 # pin it to the max so a content-dependent early break cannot shift
                 # which refiners run in later invocations (schedule stays deterministic).
                 self._pinball_multirate_call_count = call0 + mr_max_cycles
+            # KV-cached decode: capture (prompt) or re-inject (decode) the POST-episode
+            # state — the layer-boundary hook alone can't see it, and the next layer
+            # reads context rows at exactly this state. No-op when unset.
+            gen_mr_hook = getattr(self, "_gen_mr_hook", None)
+            if gen_mr_hook is not None:
+                x_out = gen_mr_hook(x_out)
             graph_segment_t0 = time.monotonic()
             return x_out
 
@@ -12331,6 +12406,12 @@ class HierarchicalFlowGAT(nn.Module):
         per_layer_hook=None,
     ): #_gemini
             from torch_geometric.data import Data
+
+            # KV-cached decode: the generation driver installs its capture/inject hook as an
+            # attribute (the enhanced forward doesn't plumb per_layer_hook through). Explicit
+            # arguments win; unset attribute = existing behavior.
+            if per_layer_hook is None:
+                per_layer_hook = getattr(self, "_gen_layer_hook", None)
 
             # 1. Detect Batching
             x = unified_graph.x
@@ -13232,6 +13313,60 @@ class HierarchicalFlowGAT(nn.Module):
     #   0    -> approx (recompute only the new token; coarse treated as settled)
     #   big  -> exact (recompute enough recent context to match full forward in bf16)
     # ------------------------------------------------------------------
+    def _gen_graph_meta(self, l0_len: int):
+        """(level_sizes, level_offsets, node_level, node_ar_time) of the sequence-mode packed
+        graph for l0_len tokens, computed directly from the window rule (parent ar_time =
+        last child's ar_time; start = min(i*stride, n_child-1), end clamped like
+        _xq_children_tables). Skeleton-free so the decode driver can build row maps before
+        any forward has cached that length; asserted equal to the skeleton in the probe."""
+        sizes = [int(s) for s in self._predict_level_sizes(int(l0_len))]
+        offsets = [0]
+        for s in sizes:
+            offsets.append(offsets[-1] + s)
+        node_level = torch.cat([torch.full((s,), lvl, dtype=torch.long) for lvl, s in enumerate(sizes)])
+        ar_chunks = [torch.arange(sizes[0], dtype=torch.long)]
+        child_t = ar_chunks[0]
+        for lvl in range(1, len(sizes)):
+            comp = int(self.compression_ratios[lvl - 1])
+            stride = max(1, int(comp * (1.0 - self.overlap_ratios[lvl - 1])))
+            n_child, n_parent = sizes[lvl - 1], sizes[lvl]
+            starts = torch.clamp(torch.arange(n_parent, dtype=torch.long) * stride, max=max(0, n_child - 1))
+            ends = torch.maximum(torch.clamp(starts + comp, max=n_child), starts + 1)
+            parent_t = child_t[ends - 1]
+            ar_chunks.append(parent_t)
+            child_t = parent_t
+        return sizes, offsets, node_level, torch.cat(ar_chunks)
+
+    def _gen_kv_guard_reasons(self, batch_size: int) -> List[str]:
+        """Config features the cached-tail decode does not cover. Non-empty -> the caller
+        falls back to the full-rebuild loop (never silently wrong, just slower)."""
+        reasons: List[str] = []
+        if int(batch_size) != 1:
+            reasons.append("batch_size>1")
+        if str(getattr(self, "graph_geometry_mode", "sequence")).lower() != "sequence":
+            reasons.append("grid2d geometry")
+        if not bool(getattr(self, "enable_unified_skeleton_cache", False)):
+            reasons.append("skeleton cache off")
+        if str(getattr(self, "refinement_batch_mode", "")) != "true_batch_nozip":
+            reasons.append("refinement_batch_mode != true_batch_nozip")
+        if not bool(getattr(self, "drop_static_cross_level_edges", False)):
+            reasons.append("static cross-level scatter edges on (cleaner mode only)")
+        if bool(getattr(self, "hierarchical_query_descent_enable", False)):
+            reasons.append("HQD on (data-dependent far edges)")
+        if bool(getattr(self, "zip_enable", False)):
+            reasons.append("zipper on")
+        if bool(getattr(self, "xq_nominate_enable", False)):
+            reasons.append("xq_nominate on")
+        if getattr(self, "token_unet", None) is not None:
+            reasons.append("token_unet on (length-dependent stem)")
+        if str(getattr(self, "autoenc_graph_mode", "off")).lower() not in ("off", "none", ""):
+            reasons.append("autoenc graph nodes")
+        if bool(getattr(self, "hier_copredict_l0", False)):
+            reasons.append("hier_copredict_l0 on")
+        if bool(getattr(self, "pinball_level_cycle_enable", False)):
+            reasons.append("pinball_level_cycle on")
+        return reasons
+
     def _generate_incremental(
         self,
         current_ids: torch.Tensor,
@@ -13246,70 +13381,336 @@ class HierarchicalFlowGAT(nn.Module):
         frontier_width: Optional[int] = None,
         verify: bool = False,
     ) -> torch.Tensor:
+        """S3: cached-tail incremental decode ("reuse the previous graph").
+
+        Causality makes every node with ar_time behind the frontier BIT-IDENTICAL across
+        appends, so a full forward every REFILL_CHUNK tokens captures the packed state at
+        every layer boundary (plus the post-episode state), and each decode step re-runs the
+        forward only on a stride-aligned TAIL of the sequence, overwriting all settled rows
+        from the cache at every boundary. The tail is sized to cover the widest backbone
+        local-attention span, so everything a frontier row reads is either computed in-tail
+        or cache-injected. The multirate episode additionally gets the cached pre-tail coarse
+        rows as frozen extra memory (cross-query refiners, topk=0 long-range channel) and as
+        causal prefixes (upper/top level refiners); settled rows are pre-frozen there. The
+        single approximation: pre-tail rows hold their episode-ENTRY state during episode
+        cycles >= 2 instead of their (sub-tau, soon-frozen) mid-episode updates — measured by
+        `verify`, and repaired at the next boundary by the post-episode hook.
+        """
         device = current_ids.device
         cycles = num_cycles if num_cycles is not None else self.refinement_cycles
+        B = int(current_ids.size(0))
 
-        # Auto frontier width = the measured drift span: the widest local window
-        # plus the coarsest compression stride (positions whose coarse summary can
-        # still re-pool under append). Stored for S3; S1 below is full-forward exact.
-        if frontier_width is None:
-            try:
-                win = max([int(self.l0_local_window)] + [int(w) for w in (getattr(self, "local_attn_windows", []) or [])])
-            except Exception:
-                win = int(getattr(self, "l0_local_window", 128) or 128)
-            try:
-                comp = int(max(getattr(self, "compression_ratios", [16]) or [16]))
-            except Exception:
-                comp = 16
-            frontier_width = max(1, win + comp)
-        self._kv_frontier_width = int(frontier_width)
+        reasons = self._gen_kv_guard_reasons(B)
+        if reasons:
+            raise RuntimeError("kv-decode unsupported here: " + "; ".join(reasons))
 
-        # Use bf16 autocast so the flash local-attention path is available during
-        # decode (generation otherwise runs fp32, which flash rejects).
         import contextlib
         amp_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         use_amp = device.type == "cuda"
-
         eos_token_id = min(self.vocab_size - 1, int(getattr(self, "eos_token_id", self.vocab_size - 1)))
-        max_verify_err = 0.0
+        pad_id = int(getattr(self, "pad_token_id", None) or getattr(self, "mask_token_id", 0) or 0)
 
-        for _ in range(int(max_new_tokens)):
-            if current_ids.size(1) >= self.max_seq_len:
-                break
-            with torch.no_grad():
-                ctx = torch.autocast("cuda", dtype=amp_dtype) if use_amp else contextlib.nullcontext()
-                with ctx:
-                    # S1: correct-by-construction full forward. S3 replaces this with the
-                    # cached frontier-subset refinement; `verify` will then compare the two.
-                    logits = self.forward(
-                        current_ids,
-                        num_cycles=cycles,
-                        use_level_prediction=use_level_prediction,
-                        logits_last_only=True,
-                    )
-                    next_token_logits = logits[:, -1, :]
-                    if verify:
-                        # In S1 the incremental path *is* the full forward, so the
-                        # invariant is trivially satisfied (0 error). Wired now so S3
-                        # only has to point the reference at the cached path.
-                        ref = next_token_logits
-                        max_verify_err = max(max_verify_err, float((next_token_logits - ref).abs().max().item()))
+        # ---- geometry ----
+        comps = [int(c) for c in (getattr(self, "compression_ratios", []) or [])]
+        ovs = list(getattr(self, "overlap_ratios", []) or [])
+        stride_l0 = [1]
+        for i, c in enumerate(comps):
+            ov = float(ovs[i]) if i < len(ovs) else 0.0
+            stride_l0.append(stride_l0[-1] * max(1, int(c * (1.0 - ov))))
+        lookahead = int(self._gen_frontier_lookahead())
+        REFILL_CHUNK = 256
+        ALIGN = REFILL_CHUNK  # multiple of every stride_l0 entry (powers chain up)
+        for s in stride_l0:
+            if ALIGN % s != 0:
+                ALIGN = s * ((ALIGN + s - 1) // s)
 
-            next_token = self._safe_sampling(
-                next_token_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                current_ids=current_ids,
-                do_sample=do_sample,
+        # Widest backbone within-level local-attention span in L0 units: reads the tail
+        # must contain because the backbone gets no memory injection (unlike the episode).
+        span = int(getattr(self, "l0_local_window", 128) or 128)
+        for lvl, cfg in (getattr(self, "local_attn_config", {}) or {}).items():
+            if int(lvl) < len(stride_l0):
+                span = max(span, int(cfg.get("window", 0)) * stride_l0[int(lvl)])
+        if frontier_width is not None and int(frontier_width) > 0:
+            span = int(frontier_width)  # user override: smaller = faster + more approximate
+        elif frontier_width is not None and int(frontier_width) == 0:
+            span = 512
+        self._kv_frontier_width = int(span)
+
+        def _align_up(v: int, a: int) -> int:
+            return ((int(v) + a - 1) // a) * a
+
+        # ---- per-refill state (rebuilt by _refill) ----
+        state: Dict[str, object] = {}
+        n_layer_entries = 0
+
+        def _capture_layer_hook(x, layer_idx, entry_idx):
+            state["layer_cache"][int(entry_idx)] = x.detach().clone()
+            state["last_entry"] = int(entry_idx)
+            return x
+
+        def _capture_mr_hook(x):
+            # fires right after a multirate episode; the episode's ENTRY state is the
+            # per-layer capture that ran immediately before it (hook precedes the episode).
+            state["mr_cache"].append(x.detach().clone())
+            state["mr_after_entry"].append(int(state.get("last_entry", -1)))
+            return x
+
+        def _capture_mr_cycle_hook(x, cycle_idx):
+            # fires after every episode CYCLE; ordinal = episodes completed so far (the
+            # episode-end hook above increments the list length AFTER its cycles ran)
+            state["mr_cycles"].setdefault(len(state["mr_after_entry"]), []).append(x.detach().clone())
+            return x
+
+        def _forward_padded(ids_full: torch.Tensor, proj_idx: int):
+            ctx = torch.autocast("cuda", dtype=amp_dtype) if use_amp else contextlib.nullcontext()
+            with torch.no_grad(), ctx:
+                return self.forward(
+                    ids_full,
+                    num_cycles=cycles,
+                    use_level_prediction=use_level_prediction,
+                    logits_last_index=int(proj_idx),
+                )
+
+        def _clear_hooks():
+            self._gen_layer_hook = None
+            self._gen_mr_hook = None
+            self._gen_mr_cycle_hook = None
+            self._gen_mr_prefrozen = None
+            self._gen_mr_prefrozen_keep = None
+            self._gen_mr_extra_memory = None
+            self._gen_mr_level_prefix = None
+
+        def _prewarm_skeleton(l0_len: int):
+            sizes = self._predict_level_sizes(int(l0_len))
+            self._runtime_l0_grid_shape = None
+            if self._unified_skeleton_cache.get(self._unified_cache_key(sizes), None) is None:
+                dummy = torch.full((B, int(l0_len)), pad_id, dtype=current_ids.dtype, device=device)
+                call_save = int(getattr(self, "_pinball_multirate_call_count", 0))
+                _forward_padded(dummy, 0)
+                self._pinball_multirate_call_count = call_save  # side-effect-free prewarm
+
+        def _refill(ids_now: torch.Tensor):
+            """Full padded capture forward at the current length; rebuilds bucket, caches,
+            row maps and per-step hook tensors. Returns this step's next-token logits."""
+            L_now = int(ids_now.size(1))
+            bucket = min(int(self.max_seq_len), _align_up(L_now + lookahead + REFILL_CHUNK, ALIGN))
+            # Anchor the tail at the FRONTIER, not the bucket end: every position the frontier
+            # reads directly (widest local-attention span) must exist as a tail row, and the
+            # tail extends to the bucket end so the frontier stays inside it for a full refill
+            # chunk of growth. Alignment keeps every coarse level's windows on full-graph
+            # window boundaries (t0 divisible by all level strides).
+            t0 = max(0, L_now - span - 64)
+            t0 = (t0 // ALIGN) * ALIGN
+            tail_len = bucket - t0
+
+            _prewarm_skeleton(bucket)
+            if tail_len != bucket:
+                _prewarm_skeleton(tail_len)
+
+            padded = torch.full((B, bucket), pad_id, dtype=ids_now.dtype, device=device)
+            padded[:, :L_now] = ids_now
+
+            _, off_f, _, ar_f = self._gen_graph_meta(bucket)
+            sizes_t, off_t, nl_t, ar_t = self._gen_graph_meta(tail_len)
+            ar_f = ar_f.to(device)
+            ar_t = ar_t.to(device)
+            nl_t = nl_t.to(device)
+
+            # tail row -> full row map (stride-aligned slice of every level)
+            maps = []
+            for lvl in range(len(sizes_t)):
+                shift = t0 // stride_l0[lvl] if lvl < len(stride_l0) else 0
+                n_t_lvl = off_t[lvl + 1] - off_t[lvl]
+                maps.append(torch.arange(n_t_lvl, dtype=torch.long, device=device) + int(off_f[lvl] + shift))
+            tail_to_full = torch.cat(maps)
+
+            state.clear()
+            state["layer_cache"] = {}
+            state["mr_cache"] = []
+            state["mr_after_entry"] = []
+            state["mr_cycles"] = {}
+            self._gen_layer_hook = _capture_layer_hook
+            self._gen_mr_hook = _capture_mr_hook
+            self._gen_mr_cycle_hook = _capture_mr_cycle_hook
+            try:
+                logits = _forward_padded(padded, L_now - 1)
+            finally:
+                _clear_hooks()
+
+            # settled rows: everything whose receptive window closed before this refill.
+            # Static until the next refill; younger rows are recomputed in-tail each step.
+            settle_t = L_now - 1
+            inject_tail = ((ar_t + t0) <= settle_t).view(1, -1, 1)  # [1, N_t, 1]
+            prefrozen = inject_tail.view(1, -1).expand(B, -1).contiguous()
+
+            # pre-gather every cache entry to tail rows (static per refill)
+            layer_tail = {e: t.index_select(1, tail_to_full) for e, t in state["layer_cache"].items()}
+            mr_tail = [t.index_select(1, tail_to_full) for t in state["mr_cache"]]
+            mr_cycles_tail = {
+                o: [t.index_select(1, tail_to_full) for t in cyc]
+                for o, cyc in state["mr_cycles"].items()
+            }
+
+            # episode context: pre-tail coarse rows, PER CYCLE (they evolve inside the
+            # episode; the block at cycle k reads their state after cycle k-1, entry state
+            # at k=0). extra memory for the cross-attention refiners (memory_level rows),
+            # causal prefixes for the within-level upper/top refiners.
+            mem_levels = set()
+            for r in getattr(self, "pinball_cross_query_refiners", []) or []:
+                mem_levels.add(int(r.memory_level))
+            if getattr(self, "pinball_upper_cross_refiner", None) is not None:
+                mem_levels.add(int(self.pinball_upper_cross_refiner.memory_level))
+            prefix_specs: Dict[int, int] = {}
+            for ref_name, win_attr in (("pinball_upper_refiner", "pinball_upper_refine_window"),
+                                       ("pinball_top_refiner", "pinball_top_refine_window")):
+                ref = getattr(self, ref_name, None)
+                if ref is not None:
+                    w = int(getattr(self, win_attr, 0) or 0)
+                    for lvl in getattr(ref, "levels", []):
+                        want = w * max(1, int(getattr(ref, "max_steps", 1))) if w > 0 else 1 << 30
+                        prefix_specs[int(lvl)] = max(prefix_specs.get(int(lvl), 0), want)
+
+            def _episode_ctx_from(src):
+                extra_l, prefix_l = {}, {}
+                if src is not None:
+                    for lvl in range(1, len(sizes_t)):
+                        shift = t0 // stride_l0[lvl]
+                        if shift <= 0:
+                            continue
+                        f_lo, f_hi = int(off_f[lvl]), int(off_f[lvl] + shift)
+                        if lvl in mem_levels:
+                            extra_l[lvl] = (src[:, f_lo:f_hi, :], ar_f[f_lo:f_hi] - t0)
+                        if lvl in prefix_specs:
+                            keep = min(int(prefix_specs[lvl]), f_hi - f_lo)
+                            if keep > 0:
+                                prefix_l[lvl] = src[:, f_hi - keep : f_hi, :]
+                return (extra_l or None, prefix_l or None)
+
+            # mr_ctx_by_cycle[episode][k] = (extra_memory, level_prefix) the block reads at
+            # cycle k: entry state for k=0, then the captured state after cycle k-1.
+            mr_ctx_by_cycle = []
+            for o, after_entry in enumerate(state["mr_after_entry"]):
+                srcs = [state["layer_cache"].get(int(after_entry), None)] + state["mr_cycles"].get(o, [])
+                mr_ctx_by_cycle.append([_episode_ctx_from(s) for s in srcs])
+
+            # per-level active-row counts for the episode's pre-freeze gather (one host
+            # sync per refill, none per step)
+            keep_levels = sorted({int(r.query_level) for r in (getattr(self, "pinball_cross_query_refiners", []) or [])})
+            prefrozen_keep = None
+            if keep_levels:
+                keep_all = ~prefrozen
+                masks = {l: keep_all[:, (nl_t == l).nonzero(as_tuple=False).view(-1)] for l in keep_levels}
+                counts = {l: int(m.sum(dim=1).max().item()) for l, m in masks.items()}
+                prefrozen_keep = {
+                    l: (masks[l], counts[l]) for l in keep_levels
+                    if 0 < counts[l] <= int(0.75 * masks[l].size(1))
+                }
+                prefrozen_keep = prefrozen_keep or None
+
+            state.update(
+                padded=padded, bucket=bucket, t0=t0, tail_len=tail_len, refill_len=L_now,
+                layer_tail=layer_tail, mr_tail=mr_tail, mr_cycles_tail=mr_cycles_tail,
+                inject_tail=inject_tail, prefrozen=prefrozen, prefrozen_keep=prefrozen_keep,
+                mr_ctx_by_cycle=mr_ctx_by_cycle,
             )
-            current_ids = torch.cat([current_ids, next_token], dim=1)
-            if next_token.item() == eos_token_id:
-                break
+            return logits
+
+        def _inject_layer_hook(x, layer_idx, entry_idx):
+            cached = state["layer_tail"].get(int(entry_idx), None)
+            if cached is None:
+                return x
+            return torch.where(state["inject_tail"], cached.to(dtype=x.dtype), x)
+
+        def _set_episode_ctx(ordinal: int, cycle: int):
+            ctx = state["mr_ctx_by_cycle"]
+            if 0 <= ordinal < len(ctx) and ctx[ordinal]:
+                extra, prefix = ctx[ordinal][min(int(cycle), len(ctx[ordinal]) - 1)]
+                self._gen_mr_extra_memory = extra
+                self._gen_mr_level_prefix = prefix
+
+        def _inject_mr_cycle_hook(x, cycle_idx):
+            o = int(state.get("mr_ordinal", 0))
+            cyc = state["mr_cycles_tail"].get(o, [])
+            _set_episode_ctx(o, int(cycle_idx) + 1)  # what the block reads NEXT cycle
+            if not cyc:
+                return x
+            k = min(int(cycle_idx), len(cyc) - 1)
+            return torch.where(state["inject_tail"], cyc[k].to(dtype=x.dtype), x)
+
+        def _inject_mr_hook(x):
+            i = int(state.get("mr_ordinal", 0))
+            state["mr_ordinal"] = i + 1
+            mr_tail = state["mr_tail"]
+            _set_episode_ctx(i + 1, 0)  # arm the NEXT episode (multi-episode schedules)
+            if i >= len(mr_tail):
+                return x
+            return torch.where(state["inject_tail"], mr_tail[i].to(dtype=x.dtype), x)
+
+        def _decode_step(t_len: int):
+            """Next-token logits for position t_len given padded[:, :t_len] real tokens."""
+            t0 = int(state["t0"])
+            tail_ids = state["padded"][:, t0 : t0 + int(state["tail_len"])]
+            state["mr_ordinal"] = 0
+            if not bool(getattr(self, "_kv_disable_inject", False)):  # diagnostic ablation:
+                # True = raw sliding-window decode (context beyond the tail is DROPPED).
+                self._gen_layer_hook = _inject_layer_hook
+                self._gen_mr_hook = _inject_mr_hook
+                self._gen_mr_cycle_hook = _inject_mr_cycle_hook
+                self._gen_mr_prefrozen = state["prefrozen"]
+                self._gen_mr_prefrozen_keep = state["prefrozen_keep"]
+                _set_episode_ctx(0, 0)
+            try:
+                return _forward_padded(tail_ids, t_len - 1 - t0)
+            finally:
+                _clear_hooks()
+
+        # ---- decode loop ----
+        max_verify_err = 0.0
+        was_training = self.training
+        self.eval()
+        try:
+            logits = None
+            for _ in range(int(max_new_tokens)):
+                t_len = int(current_ids.size(1))
+                if t_len >= int(self.max_seq_len):
+                    break
+                need_refill = (
+                    "padded" not in state
+                    or t_len + lookahead >= int(state["t0"]) + int(state["tail_len"])
+                    or t_len + lookahead >= int(state["bucket"])
+                    or t_len - int(state["refill_len"]) >= REFILL_CHUNK
+                )
+                if need_refill:
+                    logits = _refill(current_ids)
+                else:
+                    state["padded"][:, t_len - 1] = current_ids[:, t_len - 1]
+                    logits = _decode_step(t_len)
+                    if verify:
+                        call_save = int(getattr(self, "_pinball_multirate_call_count", 0))
+                        ref = _forward_padded(state["padded"][:, : int(state["bucket"])], t_len - 1)
+                        self._pinball_multirate_call_count = call_save  # side-effect-free reference
+                        err = float((logits[:, -1, :].float() - ref[:, -1, :].float()).abs().max().item())
+                        max_verify_err = max(max_verify_err, err)
+                next_token = self._safe_sampling(
+                    logits[:, -1, :],
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    current_ids=current_ids,
+                    do_sample=do_sample,
+                )
+                current_ids = torch.cat([current_ids, next_token], dim=1)
+                if next_token.item() == eos_token_id:
+                    break
+        finally:
+            _clear_hooks()
+            if was_training:
+                self.train()
 
         if verify:
-            logger.info("[KV-CACHE] verify_incremental max|logit err| = %.3e (S1: full-forward path)", max_verify_err)
+            logger.info("[KV-CACHE] verify_incremental max|logit err| = %.3e (cached-tail vs full forward)", max_verify_err)
+            self._kv_last_verify_err = float(max_verify_err)
         return current_ids
 
     def _gen_frontier_lookahead(self) -> int:
@@ -13345,9 +13746,12 @@ class HierarchicalFlowGAT(nn.Module):
         use_direct_prediction: bool = False,
         rebuild_graph: bool = False,  # New option to rebuild the graph for each token
         num_cycles: int = None,  # Allow overriding cycles
-        use_kv_cache: bool = False,        # opt-in incremental KV-cached decode (additive)
-        kv_frontier_width: Optional[int] = None,  # 0 = approx, large = exact; None = auto
-        verify_incremental: bool = False,  # assert incremental logits == full-forward (debug)
+        use_kv_cache: bool = True,         # cached-tail incremental decode (2.6-3.8x at 2k-8k,
+                                           # verified exact-mod-bf16); guarded configs fall back
+                                           # to the rebuild loop automatically
+        kv_frontier_width: Optional[int] = None,  # None = auto (exact span); smaller = faster but
+                                           # approximate (truncates coarse local-attn reach)
+        verify_incremental: bool = False,  # log max |kv logits - full-forward logits| (debug)
     ) -> torch.Tensor:
         """
         Generate text using hierarchical flow with multiple generation options.
@@ -13413,13 +13817,20 @@ class HierarchicalFlowGAT(nn.Module):
                 frontier_consistent = bool(getattr(self, "gen_frontier_consistent", True))
                 pad_id = int(getattr(self, "pad_token_id", None) or getattr(self, "mask_token_id", 0) or 0)
                 lookahead = self._gen_frontier_lookahead() if frontier_consistent else 0
+                # bf16 autocast: flash local attention rejects fp32 — without this, flash
+                # configs silently fell through to the emergency generation path.
+                import contextlib
+                _gen_amp = (
+                    torch.autocast("cuda", dtype=torch.bfloat16)
+                    if device.type == "cuda" else contextlib.nullcontext()
+                )
                 for _ in range(max_length):
                     # Check if we've reached maximum sequence length
                     if current_ids.size(1) >= self.max_seq_len:
                         break
 
                     # Get next token logits by calling forward, completely rebuilding the graph
-                    with torch.no_grad():
+                    with torch.no_grad(), _gen_amp:
                         cur_len = int(current_ids.size(1))
                         pad_n = min(lookahead, int(self.max_seq_len) - cur_len)
                         if frontier_consistent and pad_n > 0:

@@ -196,6 +196,19 @@ dropout: 0.1
 # Verified bit-exact; fixes "generate with only the graph" gibberish. Costs ~span extra tokens/step.
 gen_frontier_consistent: true
 
+# KV-cached generation (2026-07-09, DEFAULT ON in generate(); no yaml knob needed): a full
+# forward every 256 tokens captures every layer-boundary + episode-cycle state; each decode
+# step re-forwards only a stride-aligned tail (~the widest coarse local-attn span, 4096+ here)
+# and re-injects all settled rows from the cache (causality makes them bit-identical), with
+# pre-tail L3 rows fed to the cross-query refiners as frozen extra memory. Verified on this
+# run's ckpt: greedy tokens == rebuild path, max logit err = 1 bf16 ulp; 167->65 ms/tok @2k,
+# 344->90 @8k on the 4090 (near-flat beyond ~4.5k prompts). generate(use_kv_cache=False)
+# restores the rebuild loop; verify_incremental=True logs the kv-vs-full logit gap;
+# kv_frontier_width < auto = faster but approximate (not recommended: 1024 flipped greedy
+# tokens for only -19 ms). NOTE: the rebuild loop itself was silently broken for flash
+# configs (fp32 -> "emergency" fallback); fixed the same day with bf16 autocast — rebuild
+# samples logged before this date came from the emergency path.
+
 # Attention / hierarchy toggles
 attn_backend: flash        # pyg | flash | sdpa
 qkv_sharing: separate      # shared | separate
