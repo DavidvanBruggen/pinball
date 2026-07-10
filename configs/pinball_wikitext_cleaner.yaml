@@ -30,7 +30,7 @@ muon_adjust_lr_fn: match_rms_adamw
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
 num_epochs: 100
 samples_per_epoch: 3125 #25000 #782 #25000
-gradient_accumulation_steps: 2   # accumulate grads over N batches before an optimizer step
+gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
 # in seq-chunks of `chunked_ce_seq_chunk`, never materializing the full [B,T,vocab] logits (+ its
@@ -173,19 +173,50 @@ hier_refresh_compile: true
 # from window arithmetic, not edge lists). This is the DYNAMIC content-addressed read the
 # recency gathers can't do. OFF for the baseline cleaner run; flip on for the retrieval test.
 xq_nominate_enable: true
-xq_nominate_topk_l3: 4         # closed L3 windows shortlisted per query
-xq_nominate_topk_l1: 4        # L1 winners kept among the shortlist's children
+# RECALL knobs (stage 1/2 shortlist width). Since the stage-3 scored prune fixes the read
+# at topk_l0 sources/query, widening these grows ONLY the nomination scoring cost (~4.5ms/
+# round, roughly linear) — NOT the per-layer read. 8 L3 windows ~= 700 tokens of candidate
+# span (4 was ~350 of an 8k context — the stage-1 shortlist is the recall bottleneck).
+xq_nominate_topk_l3: 8         # closed L3 windows shortlisted per query
+xq_nominate_topk_l1: 8        # L1 winners kept among the shortlist's children
 xq_nominate_exclude_local: true  # spend the edge budget beyond the L0 local window
-xq_nominate_max_layers: 2      # layers fed after nomination (0 = all; each costs a sparse pass)
-# When to nominate: auto = after the middle layer (mature queries/summaries, remaining layers
-# integrate the fetch); or an int (1-based, "after k layers") for earlier/later retrieval.
-# Independent of the multirate schedule (works even with multirate off).
-xq_nominate_after_layer: auto
-# Re-nominate every k layers (0 = once per forward). Each round re-selects with the EVOLVED
-# queries — retrieved content changes what the next round fetches (iterative / multi-hop
-# retrieval); scoring is ~1-2ms/round, the fed-layer budget above resets per round. For deep
-# stacks the pattern is e.g. after_layer: 4, every: 4, max_layers: 2.
+# SCHEDULING — two ORTHOGONAL dials:
+#   xq_nominate_every      = when to re-SELECT: a fresh nomination every k layers, using the
+#                            evolved queries (multi-hop retrieval). 0 = select once/forward.
+#   xq_nominate_max_layers = how many layers each selection FEEDS (each read ~7ms/step at
+#                            seq 8k B=2). 0 = no cap (feed until the next round or stack end).
+# "Once and reuse everywhere" = every: 0 + max_layers: 0. With every==max_layers (as here)
+# the cap never binds — every layer past after_layer reads. Speed dial: max_layers: 1
+# halves the read cost while keeping selection freshness.
+xq_nominate_max_layers: 1
+# When to nominate: auto = after the middle layer; or an int (1-based, "after k layers").
+# 4 = earlier retrieval so the fetch integrates over more depth.
+xq_nominate_after_layer: 4
 xq_nominate_every: 2
+# --- v2.1 (2026-07-10, from the 100ep diagnosis: saturated indiscriminate fetch, mostly-
+# padding reads, untrained stage-2 metric, scatter-read memory cost) ---------------------
+# Stage-3 scored prune: score the L1 winners' L0 children with the SAME shared RoPE'd q/k
+# the consuming read uses (NSA select-what-you'd-attend-to) and keep top-k. Without it every
+# query dumped ~48 mostly-padding sources. 0 = legacy all-children.
+xq_nominate_topk_l0: 16
+# Consume nominations as a packed fixed-K per-query table (dense GEMM read) instead of the
+# per-edge scatter list — same math, a fraction of the train memory (the scatter path's
+# per-edge autograd gathers were the 165->110 tok/s cost). Requires topk_l0 > 0.
+xq_nominate_packed_read: true
+# Per-query relevance gate: read output scaled by sigmoid(w*stage1_top_score + b) — a no-op
+# option for queries with nothing to fetch (ungated reads HURT never-recurring tokens by
+# ~1.6%) and a task gradient into the 0:3 selector q/k (NSA-style selector training).
+xq_nominate_gate_enable: true
+# Stage-2 (L1 descent) scoring: local_qk = the layer's trained per-level q/k (the raw-cosine
+# default was a speed placeholder). No new params.
+xq_nominate_stage2: local_qk
+# NOTE (2026-07-10): the pre-v2.1 nomination projected the 0:3 refiner q/k inside no_grad
+# UNDER AUTOCAST — the first-call bf16 weight-cast cache then fed a DETACHED cast to the
+# multirate episode's grad-mode call, so the cross-query projections received NO gradient
+# for the entire run (the 100ep hqd run trained its main long-range read frozen at init —
+# do not compare that ckpt's far-recall against baselines). Fixed: nomination now projects
+# in grad mode and detaches for selection. Same latent bug class exists in v1 HQD/witness
+# no_grad selection when use_hqd: true.
 norm_type: layernorm
 dropout: 0.1
 

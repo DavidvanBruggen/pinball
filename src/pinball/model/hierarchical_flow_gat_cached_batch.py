@@ -2310,6 +2310,28 @@ class HierarchicalFlowGAT(nn.Module):
         # set for the rest of a deep stack. Scoring is cheap (~1-2ms); the per-interval fed
         # layers are still capped by xq_nominate_max_layers (budget resets each round).
         xq_nominate_every: int = 0,
+        # Stage-3 scored prune (0 = off = legacy "all children"). Without it every L1 winner
+        # dumps ALL its L0 children (~48 sources/query, mostly padding around the one useful
+        # token — measured on the 100ep run). >0: score the candidates with the SAME shared
+        # RoPE'd q/k the consuming read uses (NSA's select-what-you'd-attend-to) and keep the
+        # top-k. Precision up, read cost down ~3x at 16.
+        xq_nominate_topk_l0: int = 0,
+        # Consume nominations as a packed fixed-K per-query candidate table (dense GEMM-shaped
+        # attention, _compute_hqd_packed_l0_attn) instead of a flat per-edge scatter list. The
+        # scatter path materializes per-edge q/k/v gathers in autograd (~GBs at seq 8k, the
+        # measured 165->110 tok/s cost); packed is uniform [B,Q,K] — same math, fraction of the
+        # memory. Requires topk_l0 > 0 (fixed K).
+        xq_nominate_packed_read: bool = False,
+        # Per-query differentiable relevance gate: hqd read output scaled by
+        # sigmoid(w * stage1_top_score + b). Gives queries a no-op option (the ungated read
+        # HURT never-recurring tokens by ~1.6% on the 100ep run) AND routes a task gradient
+        # into the 0:3 selector q/k through the score (NSA-style selector training — the
+        # selection top-k itself stays no-grad). w init 0 / b init 2.2 => starts ~0.90 open.
+        xq_nominate_gate_enable: bool = False,
+        # Stage-2 (L1 descent) scoring: "cosine" = raw feature cosine (legacy placeholder) |
+        # "local_qk" = the layer's trained per-level local q/k (L0-query proj x L1-key proj;
+        # falls back to the shared q/k, then cosine). No new params.
+        xq_nominate_stage2: str = "cosine",
         # Predictive coarse aux ("next-concept" prediction): each coarse node predicts the
         # DETACHED pooled child summary of a strictly-future window at its own level — the LM
         # objective one timescale up. Unlike the reconstruction aux (which rewards summarizing
@@ -3763,11 +3785,29 @@ class HierarchicalFlowGAT(nn.Module):
         self.xq_nominate_max_layers = max(0, int(xq_nominate_max_layers))
         self.xq_nominate_after_layer = xq_nominate_after_layer
         self.xq_nominate_every = max(0, int(xq_nominate_every))
+        self.xq_nominate_topk_l0 = max(0, int(xq_nominate_topk_l0))
+        self.xq_nominate_packed_read = bool(xq_nominate_packed_read)
+        self.xq_nominate_gate_enable = bool(xq_nominate_gate_enable)
+        self.xq_nominate_stage2 = str(xq_nominate_stage2).lower()
+        if self.xq_nominate_packed_read and self.xq_nominate_topk_l0 <= 0:
+            raise ValueError("xq_nominate_packed_read requires xq_nominate_topk_l0 > 0 (fixed K)")
+        if self.xq_nominate_gate_enable:
+            # gate = sigmoid(w * s/sqrt(d) + b), b=2.2 => near-open start (~0.9 at s=0) that
+            # learns per-query selectivity. w MUST start nonzero: the selector projections'
+            # gradient is dL/dgate * w, so w=0 would leave the NSA-style selector-training
+            # path dead until w drifts off zero.
+            self.xq_gate_w = nn.Parameter(torch.full((), 0.5))
+            self.xq_gate_b = nn.Parameter(torch.full((), 2.2))
         self._xq_nom_edges: Optional[tuple] = None
+        self._xq_query_gate_full: Optional[torch.Tensor] = None  # [B,N,1], per nomination round
         self._xq_children_cache: Optional[tuple] = None
         if self.xq_nominate_enable:
-            logger.info("Cross-query nomination enabled (topk L3=%d, L1=%d, exclude_local=%s).",
-                        self.xq_nominate_topk_l3, self.xq_nominate_topk_l1, self.xq_nominate_exclude_local)
+            logger.info(
+                "Cross-query nomination enabled (topk L3=%d, L1=%d, L0=%d, exclude_local=%s, "
+                "packed=%s, gate=%s, stage2=%s).",
+                self.xq_nominate_topk_l3, self.xq_nominate_topk_l1, self.xq_nominate_topk_l0,
+                self.xq_nominate_exclude_local, self.xq_nominate_packed_read,
+                self.xq_nominate_gate_enable, self.xq_nominate_stage2)
 
         # --- Predictive coarse aux (see _compute_predictive_aux_loss) ---
         self.hier_predaux_enable = bool(hier_predaux_enable)
@@ -5161,20 +5201,27 @@ class HierarchicalFlowGAT(nn.Module):
         self._xq_children_cache = (key, tables)
         return tables
 
-    @torch.no_grad()
     def _cross_query_nominate(
         self,
         x: torch.Tensor,                      # [B, N, H] current node features (post-midpoint)
         level_offsets: torch.Tensor,
         node_ar_time: torch.Tensor,
+        block: Optional[nn.Module] = None,    # the layer that just ran (trained q/k for stages 2/3)
     ) -> Optional[tuple]:
-        """HQD v2: nominate far L0 sources per L0 query as ephemeral (b, src, dst) edges.
+        """HQD v2: nominate far L0 sources per L0 query as ephemeral reads.
 
         Stage 1: score every CLOSED L3 window per query with the 0:3 cross-query refiner's
         TRAINED q/k (falls back to feature cosine if that refiner is absent) — per-query and
-        causal, so selection sees only the past. Stage 2: cosine-score the shortlisted L3
-        windows' L1 children, keep the winners, nominate their L0 children. Selection is
-        no-grad (the gradient flows through attention over the added edges, like v1 HQD).
+        causal, so selection sees only the past. Stage 2: score the shortlisted L3 windows'
+        L1 children (trained local q/k when xq_nominate_stage2=local_qk, else cosine), keep
+        the winners. Stage 3 (topk_l0 > 0): score the winners' L0 children with the SAME
+        shared RoPE'd q/k the consuming read uses and keep the top-k. Selection is no-grad
+        (the gradient flows through attention over the added reads, like v1 HQD); the
+        optional per-query gate re-scores the stage-1 winner WITH grad (selector training).
+
+        Returns (b_idx, src_idx, dst_idx) flat edges, or — packed mode — a marker tuple
+        (zeros(1), candidates [B, n0, K] (-1 padded), dst_nodes [n0]) detected downstream
+        by src.dim() == 3 and consumed by the dense fixed-K packed read.
         """
         offsets = self._level_offsets_list(level_offsets)
         if len(offsets) < 5:
@@ -5190,63 +5237,166 @@ class HierarchicalFlowGAT(nn.Module):
         allow_same = bool(getattr(self, "hier_ar_allow_same_time", True))
         x0, x1, x3 = x[:, o[0] : o[1], :], x[:, o[1] : o[2], :], x[:, o[3] : o[4], :]
 
-        # stage 1: L0 queries score L3 memory with the 0:3 refiner's trained q/k
         refiner = None
         for r in getattr(self, "pinball_cross_query_refiners", []) or []:
             if int(r.query_level) == 0 and int(r.memory_level) == 3:
                 refiner = r
                 break
+
+        # CRITICAL: run the refiner projections in the AMBIENT grad mode, NOT inside the
+        # no_grad selection block. Under autocast the FIRST call to a Linear caches its
+        # bf16 weight cast; a no_grad-first call caches a DETACHED cast that every later
+        # grad-mode call in the same forward silently reuses — severing the multirate
+        # episode's (and the relevance gate's) gradient to these projections. Measured on
+        # the 100ep xq run: q/kv_projs grads were None for the whole run (the projections
+        # never trained). Selection below uses detached views; cost is unchanged.
+        q_live = k3_live = None
         if refiner is not None:
-            q = refiner.q_projs[0](refiner.q_norms[0](x0))
-            k3 = refiner.kv_projs[0](refiner.kv_norms[0](x3))[..., : refiner.work_dim]
-        else:
-            q, k3 = F.normalize(x0.float(), dim=-1), F.normalize(x3.float(), dim=-1)
-        sc3 = torch.einsum("bqd,bnd->bqn", q.float(), k3.float())
-        closed3 = (t3.view(1, -1) <= q_t.view(-1, 1)) if allow_same else (t3.view(1, -1) < q_t.view(-1, 1))
-        sc3 = sc3.masked_fill(~closed3.unsqueeze(0), float("-inf"))
-        k3top = min(self.xq_nominate_topk_l3, n3)
-        idx3 = sc3.topk(k3top, dim=-1).indices                     # [B, n0, k3top]
-        q_has_any = closed3.any(dim=-1)                            # [n0]
+            q_live = refiner.q_projs[0](refiner.q_norms[0](x0))
+            k3_live = refiner.kv_projs[0](refiner.kv_norms[0](x3))[..., : refiner.work_dim]
 
-        # stage 2: cosine-score the shortlist's L1 children
-        l3_to_l1, l1_to_l0 = self._xq_children_tables(
-            [o[i + 1] - o[i] for i in range(len(o) - 1)], dev
-        )
-        cand1 = l3_to_l1[idx3.reshape(B, -1)].view(B, n0, -1)      # [B, n0, C] (-1 padded)
-        pad1 = cand1 < 0
-        cand1c = cand1.clamp(min=0)
-        sc1_full = torch.einsum(
-            "bqd,bnd->bqn", F.normalize(x0.float(), dim=-1), F.normalize(x1.float(), dim=-1)
-        )                                                          # [B, n0, n1]
-        closed1 = (t1.view(1, -1) <= q_t.view(-1, 1)) if allow_same else (t1.view(1, -1) < q_t.view(-1, 1))
-        sc1_full = sc1_full.masked_fill(~closed1.unsqueeze(0), float("-inf"))
-        sc1 = sc1_full.gather(2, cand1c).masked_fill(pad1, float("-inf"))
-        m = min(self.xq_nominate_topk_l1, sc1.size(-1))
-        top1 = sc1.topk(m, dim=-1)
-        chosen1 = cand1c.gather(2, top1.indices)                   # [B, n0, m]
-        chosen_ok = torch.isfinite(top1.values) & q_has_any.view(1, -1, 1)
+        with torch.no_grad():
+            # stage 1: L0 queries score L3 memory with the 0:3 refiner's trained q/k
+            if refiner is not None:
+                q, k3 = q_live.detach(), k3_live.detach()
+            else:
+                q, k3 = F.normalize(x0.float(), dim=-1), F.normalize(x3.float(), dim=-1)
+            sc3 = torch.einsum("bqd,bnd->bqn", q.float(), k3.float())
+            closed3 = (t3.view(1, -1) <= q_t.view(-1, 1)) if allow_same else (t3.view(1, -1) < q_t.view(-1, 1))
+            sc3 = sc3.masked_fill(~closed3.unsqueeze(0), float("-inf"))
+            k3top = min(self.xq_nominate_topk_l3, n3)
+            idx3 = sc3.topk(k3top, dim=-1).indices                     # [B, n0, k3top]
+            q_has_any = closed3.any(dim=-1)                            # [n0]
 
-        # expand winners to their L0 children -> ephemeral edges
-        src = l1_to_l0[chosen1.reshape(B, -1)].view(B, n0, -1)     # [B, n0, m*K10] L0-local ids
-        ok = (src >= 0) & chosen_ok.repeat_interleave(l1_to_l0.size(1), dim=-1)
-        q_pos = torch.arange(n0, device=dev).view(1, -1, 1)
-        if self.xq_nominate_exclude_local:
-            ok &= src <= (q_pos - int(getattr(self, "l0_local_window", 0)))
-        else:
-            ok &= (src <= q_pos) if allow_same else (src < q_pos)
-        b_idx, qi, si = ok.nonzero(as_tuple=True)
-        if b_idx.numel() == 0:
-            return None
+            # stage 2: score the shortlist's L1 children
+            l3_to_l1, l1_to_l0 = self._xq_children_tables(
+                [o[i + 1] - o[i] for i in range(len(o) - 1)], dev
+            )
+            cand1 = l3_to_l1[idx3.reshape(B, -1)].view(B, n0, -1)      # [B, n0, C] (-1 padded)
+            pad1 = cand1 < 0
+            cand1c = cand1.clamp(min=0)
+            mp = getattr(block, "message_passing", None) if block is not None else None
+            norm1 = getattr(block, "norm1", None) if block is not None else None
+            use_local_qk = (
+                self.xq_nominate_stage2 == "local_qk" and mp is not None and norm1 is not None
+            )
+            if use_local_qk:
+                # trained metric: the layer's L0-query / L1-key local projections (per-level
+                # when available, shared backbone q/k otherwise). Full-dim dot == sum of the
+                # per-head dots the attention itself would compute.
+                x0n, x1n = norm1(x0), norm1(x1)
+                if getattr(mp, "per_level_local_qkv", False) and mp.num_local_levels >= 2:
+                    q1s, k1s = mp.q_proj_level[0](x0n), mp.k_proj_level[1](x1n)
+                else:
+                    q1s, k1s = mp.q_proj(x0n), mp.k_proj(x1n)
+                sc1_full = torch.einsum("bqd,bnd->bqn", q1s.float(), k1s.float())
+            else:
+                sc1_full = torch.einsum(
+                    "bqd,bnd->bqn", F.normalize(x0.float(), dim=-1), F.normalize(x1.float(), dim=-1)
+                )                                                      # [B, n0, n1]
+            closed1 = (t1.view(1, -1) <= q_t.view(-1, 1)) if allow_same else (t1.view(1, -1) < q_t.view(-1, 1))
+            sc1_full = sc1_full.masked_fill(~closed1.unsqueeze(0), float("-inf"))
+            sc1 = sc1_full.gather(2, cand1c).masked_fill(pad1, float("-inf"))
+            m = min(self.xq_nominate_topk_l1, sc1.size(-1))
+            top1 = sc1.topk(m, dim=-1)
+            chosen1 = cand1c.gather(2, top1.indices)                   # [B, n0, m]
+            chosen_ok = torch.isfinite(top1.values) & q_has_any.view(1, -1, 1)
+
+            # expand winners to their L0 children (per-query candidate table, -1 = invalid)
+            src = l1_to_l0[chosen1.reshape(B, -1)].view(B, n0, -1)     # [B, n0, m*K10] L0-local ids
+            ok = (src >= 0) & chosen_ok.repeat_interleave(l1_to_l0.size(1), dim=-1)
+            q_pos = torch.arange(n0, device=dev).view(1, -1, 1)
+            if self.xq_nominate_exclude_local:
+                ok &= src <= (q_pos - int(getattr(self, "l0_local_window", 0)))
+            else:
+                ok &= (src <= q_pos) if allow_same else (src < q_pos)
+            # per-row dedup (overlapping L1 windows share children; duplicates would double-
+            # weight the packed softmax). Sort each row, void consecutive equals.
+            src = torch.where(ok, src, torch.full_like(src, -1))
+            src, _ = src.sort(dim=-1, descending=True)                 # -1s sink to the end
+            dup = torch.zeros_like(src, dtype=torch.bool)
+            dup[..., 1:] = src[..., 1:] == src[..., :-1]
+            src = torch.where(dup | (src < 0), torch.full_like(src, -1), src)
+
+            # stage 3: scored prune to topk_l0 with the read's OWN shared RoPE'd q/k
+            k0top = int(self.xq_nominate_topk_l0)
+            if k0top > 0 and src.size(-1) > k0top:
+                if mp is not None and norm1 is not None:
+                    x0n = norm1(x0)
+                    q0r = mp.q_proj(x0n).view(B, n0, mp.num_heads, mp.head_dim)
+                    k0r = mp.k_proj(x0n).view(B, n0, mp.num_heads, mp.head_dim)
+                    if hasattr(mp, "rotary_pos_enc"):
+                        pos0 = torch.arange(n0, device=dev).view(1, -1).expand(B, -1).reshape(-1)
+                        q0r = mp.rotary_pos_enc.apply_rotary_pos_emb(
+                            q0r.reshape(B * n0, mp.num_heads, mp.head_dim), pos0
+                        ).view(B, n0, mp.num_heads, mp.head_dim)
+                        k0r = mp.rotary_pos_enc.apply_rotary_pos_emb(
+                            k0r.reshape(B * n0, mp.num_heads, mp.head_dim), pos0
+                        ).view(B, n0, mp.num_heads, mp.head_dim)
+                    q0f = q0r.reshape(B, n0, -1).float()
+                    k0f = k0r.reshape(B, n0, -1).float()
+                else:  # no block handle: cosine fallback keeps the prune functional
+                    q0f = F.normalize(x0.float(), dim=-1)
+                    k0f = q0f
+                pruned = torch.full((B, n0, k0top), -1, device=dev, dtype=src.dtype)
+                CH = 2048  # bound the [B, chunk, C, H*D] gather
+                for s0 in range(0, n0, CH):
+                    e0 = min(n0, s0 + CH)
+                    cnd = src[:, s0:e0]                                 # [B, c, C]
+                    vld = cnd >= 0
+                    safe = cnd.clamp(min=0)
+                    k_g = k0f.gather(
+                        1, safe.reshape(B, -1, 1).expand(-1, -1, k0f.size(-1))
+                    ).view(B, e0 - s0, cnd.size(-1), -1)
+                    s3 = torch.einsum("bqd,bqcd->bqc", q0f[:, s0:e0], k_g)
+                    s3 = s3.masked_fill(~vld, float("-inf"))
+                    ti = s3.topk(k0top, dim=-1)
+                    picked = cnd.gather(2, ti.indices)
+                    pruned[:, s0:e0] = torch.where(
+                        torch.isfinite(ti.values), picked, torch.full_like(picked, -1))
+                src = pruned
+            elif k0top > 0:
+                pad_w = k0top - src.size(-1)
+                if pad_w > 0:
+                    src = F.pad(src, (0, pad_w), value=-1)
+
+            has_any = src >= 0
+            n_edges = int(has_any.sum())
+            if n_edges == 0:
+                self._xq_query_gate_full = None
+                return None
+            # visibility (gate monitor): edges, queries reached, mean fetch distance
+            q_hit = has_any.any(dim=-1)                                # [B, n0]
+            self._last_xq_nom_count = n_edges
+            self._last_xq_nom_queries = int(q_hit.any(dim=0).sum())
+            dist = (q_pos - src).float()
+            self._last_xq_nom_mean_dist = float(dist[has_any].mean())
+
+        # per-query relevance gate — WITH grad: re-scores the stage-1 winner so the task
+        # gradient trains (w, b) AND the 0:3 selector projections. Applied to the read
+        # output at every consuming layer via the message-passing hook attr.
+        self._xq_query_gate_full = None
+        if self.xq_nominate_gate_enable and refiner is not None and hasattr(self, "xq_gate_w"):
+            # reuse the LIVE (grad-mode) stage-1 projections: gather each query's winning
+            # L3 window key and re-dot — the gate is d(gate)/d(selector q/k)'s entry point
+            k_g = k3_live.gather(1, idx3[:, :, 0].unsqueeze(-1).expand(-1, -1, k3_live.size(-1)))
+            # attention-style scale keeps s O(1) across widths, so the w/b init is portable
+            s_top = (q_live.float() * k_g.float()).sum(dim=-1) / float(max(1, int(refiner.work_dim))) ** 0.5
+            gate = torch.sigmoid(self.xq_gate_w.float() * s_top + self.xq_gate_b.float())
+            gate = gate * q_hit.to(gate.dtype)                         # no candidates -> hard 0
+            gate_full = torch.ones(B, int(o[-1]), 1, device=dev, dtype=x.dtype)
+            gate_full[:, o[0] : o[1], 0] = gate.to(x.dtype)
+            self._xq_query_gate_full = gate_full
+            self._last_xq_gate_mean = float(gate[q_hit].detach().mean()) if bool(q_hit.any()) else 0.0
+
+        if self.xq_nominate_packed_read:
+            dst_nodes = o[0] + torch.arange(n0, device=dev, dtype=torch.long)
+            return torch.zeros(1, device=dev, dtype=torch.long), (o[0] + src.clamp(min=0)).masked_fill(src < 0, -1).long(), dst_nodes
+
+        # legacy flat edge list for the per-edge scatter read
+        b_idx, qi, si = has_any.nonzero(as_tuple=True)
         src_idx = o[0] + src[b_idx, qi, si]
         dst_idx = o[0] + qi
-        # dedup (overlapping L1 windows share children)
-        key = (b_idx * (o[-1] + 1) + src_idx) * (o[-1] + 1) + dst_idx
-        keep = torch.unique(key, return_inverse=False, sorted=True)
-        b_idx = torch.div(keep, (o[-1] + 1) * (o[-1] + 1), rounding_mode="floor")
-        rem = keep - b_idx * (o[-1] + 1) * (o[-1] + 1)
-        src_idx = torch.div(rem, o[-1] + 1, rounding_mode="floor")
-        dst_idx = rem - src_idx * (o[-1] + 1)
-        self._last_xq_nom_count = int(b_idx.numel())
         return b_idx.long(), src_idx.long(), dst_idx.long()
 
     def _create_next_level(self, lower_graph, level_idx, compression_ratio, overlap_ratio):
@@ -6034,6 +6184,22 @@ class HierarchicalFlowGAT(nn.Module):
                 if energies:
                     d["mradapt.energy.first_cycle"] = float(energies[0])
                     d["mradapt.energy.last_cycle"] = float(energies[-1])
+        # HQD v2 (xq_nominate) selection stats — LAST nomination round of the last forward:
+        # edges = ephemeral L0->L0 edges injected; queries = L0 positions that received >=1
+        # far edge (÷ batch for per-seq); dist = mean src->dst token distance of the fetch;
+        # rounds = nomination rounds fired (xq_nominate_every). edges/queries ~= fetched
+        # tokens per reading position.
+        if bool(getattr(self, "xq_nominate_enable", False)):
+            d["xq.edges"] = float(getattr(self, "_last_xq_nom_count", 0))
+            d["xq.queries"] = float(getattr(self, "_last_xq_nom_queries", 0))
+            d["xq.mean_dist"] = float(getattr(self, "_last_xq_nom_mean_dist", 0.0))
+            d["xq.rounds"] = float(getattr(self, "_last_xq_nom_calls", 0))
+            # relevance gate: w/b are the learned mapping score->gate; gate.mean is the mean
+            # gate over queries that fetched (drifting DOWN = model learning to say "no-op").
+            if bool(getattr(self, "xq_nominate_gate_enable", False)) and hasattr(self, "xq_gate_w"):
+                d["xq.gate.w"] = float(self.xq_gate_w.detach())
+                d["xq.gate.b"] = float(self.xq_gate_b.detach())
+                d["xq.gate.mean"] = float(getattr(self, "_last_xq_gate_mean", 0.0))
         return d
 
     def _maybe_log_gate_monitor(self) -> None:
@@ -11454,6 +11620,17 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_cached_step = -1
         layer_step = 0
         self._xq_nom_edges = None  # per-forward; filled once layer_step reaches _xq_nom_after
+        self._xq_query_gate_full = None  # per-forward; the per-query relevance gate (with grad)
+        # Clear LAST forward's gate hooks now, UNCONDITIONALLY (not per-layer in the loop:
+        # gradient checkpointing re-reads the attr during backward, so it must outlive the
+        # forward; and not guarded on gate_enable: a runtime toggle-off would otherwise
+        # leave stale armed gates whose graph is freed -> backward crash / wrong grads).
+        # Each fed layer's mp re-arms below; a layer fed twice in one forward (weight-tied
+        # multi-cycle schedules) would keep only the last round's gate.
+        for _t in getattr(self, "refinement_transformers", []) or []:
+            _mp = getattr(_t, "message_passing", None)
+            if _mp is not None and getattr(_mp, "_hqd_out_query_gate", None) is not None:
+                _mp._hqd_out_query_gate = None
         _xq_nom_layers_used = 0
         _xq_nom_calls = 0
         _xq_last_nom_step = -1
@@ -11918,6 +12095,12 @@ class HierarchicalFlowGAT(nn.Module):
                     if _xq_budget <= 0 or _xq_nom_layers_used < _xq_budget:
                         hqd_b_idx, hqd_src_idx, hqd_dst_idx = self._xq_nom_edges
                         _xq_nom_layers_used += 1
+                        # per-query relevance gate: this layer's read output is scaled by the
+                        # differentiable gate computed at nomination time (hook attr on the
+                        # message passing; cleared after the layer so it can't go stale).
+                        _mp_gate = getattr(transformer, "message_passing", None)
+                        if _mp_gate is not None and self._xq_query_gate_full is not None:
+                            _mp_gate._hqd_out_query_gate = self._xq_query_gate_full
 
                 # ~~~~ Transformer step (HQD attention fused in, if edges provided) ~~~~
                 self._hqd_inside_mp_active = bool(select_hqd_inside_mp)
@@ -12110,12 +12293,16 @@ class HierarchicalFlowGAT(nn.Module):
                     and base_lo is not None
                     and base_ar_time is not None
                     and layer_step >= _xq_nom_after
+                    # no consumer left after the final layer — don't pay a wasted selection
+                    # (with after=6, every=2 on 12 layers the round at step 12 fed nothing)
+                    and layer_step < len(schedule_entries)
                     and (
                         _xq_nom_calls == 0
                         or (_xq_every > 0 and (layer_step - _xq_last_nom_step) >= _xq_every)
                     )
                 ):
-                    self._xq_nom_edges = self._cross_query_nominate(x, base_lo, base_ar_time)
+                    self._xq_nom_edges = self._cross_query_nominate(
+                        x, base_lo, base_ar_time, block=transformer)
                     _xq_nom_calls += 1
                     _xq_last_nom_step = layer_step
                     _xq_nom_layers_used = 0

@@ -150,6 +150,10 @@ def build_pinball_model(
         xq_nominate_max_layers=int(getattr(args, "xq_nominate_max_layers", 0)),
         xq_nominate_after_layer=getattr(args, "xq_nominate_after_layer", "auto"),
         xq_nominate_every=int(getattr(args, "xq_nominate_every", 0)),
+        xq_nominate_topk_l0=int(getattr(args, "xq_nominate_topk_l0", 0)),
+        xq_nominate_packed_read=bool(getattr(args, "xq_nominate_packed_read", False)),
+        xq_nominate_gate_enable=bool(getattr(args, "xq_nominate_gate_enable", False)),
+        xq_nominate_stage2=str(getattr(args, "xq_nominate_stage2", "cosine")),
         hier_predaux_enable=bool(getattr(args, "hier_predaux_enable", False)),
         lambda_hier_predaux=float(getattr(args, "lambda_hier_predaux", 0.05)),
         hier_predaux_levels=(list(getattr(args, "hier_predaux_levels", None))

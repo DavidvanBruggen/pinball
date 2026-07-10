@@ -2230,7 +2230,16 @@ class HierarchicalMessagePassing(MessagePassing):
 
         if hqd_edges is not None:
             hqd_b_idx, hqd_src_idx, hqd_dst_idx = hqd_edges
-            if str(getattr(self, "hqd_attn_impl", "scatter")).lower() == "dense":
+            if hqd_src_idx is not None and hqd_src_idx.dim() == 3:
+                # Packed per-query candidate table [B, Q, K] (-1 padded) from xq nomination:
+                # fixed-K dense read — same math as the per-edge scatter, but GEMM-shaped and
+                # without materializing per-edge q/k/v gathers in autograd.
+                hqd_out = self._compute_hqd_packed_l0_attn(
+                    q=q, k=k, v=v_hqd,
+                    dst_nodes=hqd_dst_idx, candidate_nodes=hqd_src_idx,
+                    num_nodes=num_nodes, B=B,
+                )
+            elif str(getattr(self, "hqd_attn_impl", "scatter")).lower() == "dense":
                 hqd_out = self._compute_hqd_dense_attn(
                     q=q, k=k, v=v_hqd,
                     b_idx=hqd_b_idx, src_idx=hqd_src_idx, dst_idx=hqd_dst_idx,
@@ -2244,6 +2253,11 @@ class HierarchicalMessagePassing(MessagePassing):
                     num_nodes=num_nodes, B=B,
                 )
             if hqd_out is not None:
+                # xq per-query relevance gate (differentiable; set/cleared around the layer
+                # call by the model when nominations feed this layer).
+                _q_gate = getattr(self, "_hqd_out_query_gate", None)
+                if _q_gate is not None:
+                    hqd_out = hqd_out * _q_gate.to(dtype=hqd_out.dtype)
                 if source_gates is not None:
                     hqd_out = source_gates["hqd"] * hqd_out
                 out = out + hqd_out
