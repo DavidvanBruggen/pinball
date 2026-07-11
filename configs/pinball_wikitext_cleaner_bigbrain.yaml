@@ -66,7 +66,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_bigbrain/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_bigbrain_small/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -104,8 +104,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 768
-num_heads: 12
+hidden_dim: 192 #768
+num_heads: 3 #12
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -423,9 +423,9 @@ pinball_multirate_midpoint_layer: 9
 # frozen — provably a no-op, so it's causal AND saves compute on easy batches. Nodes that
 # converge fast stop burning updates; unsettled ones keep cycling. Watch
 # _last_pinball_multirate_stats: adaptive_cycles / adaptive_energy / adaptive_frozen_frac.
-pinball_multirate_adaptive: true   # default off = existing fixed-repeats behavior
+pinball_multirate_adaptive: false   # default off = existing fixed-repeats behavior
 pinball_multirate_energy_tau: 0.05  # relative-update threshold; lower = more cycles
-pinball_multirate_max_cycles: 16     # hard cap on settling iterations per invocation
+pinball_multirate_max_cycles: 10    # hard cap on settling iterations per invocation
 # Cycles 2+ compute only the UNFROZEN query rows inside the cross-query pairs (exact:
 # queries are independent there — cross-attn into memory + pointwise FFN; auto-skipped if
 # the memory write-back is enabled). MEASURED at hidden 768 / seq 8192 bf16 on the 4090
