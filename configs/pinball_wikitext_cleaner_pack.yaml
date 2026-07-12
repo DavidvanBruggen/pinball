@@ -1,4 +1,7 @@
 # Pinball hierarchical graph transformer — autoregressive LM on WikiText-103.
+# PACKED CROSS-LEVEL LOCAL run: pinball_wikitext_cleaner.yaml + local_pack_* on
+# (all-levels mixed window, level tags). Fresh runs only — do not warm-start from
+# non-pack checkpoints (L0's local attention distribution changes).
 # Friendly toggles (attn_backend / qkv_sharing / train_mode / use_hqd) expand to the
 # underlying flags in pinball.config.PinballConfig. See README for the full toggle table.
 
@@ -66,7 +69,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_hqd/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_pack/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -172,7 +175,7 @@ hier_refresh_compile: true
 # layers (v1 HQD's injection path — works with the static edges dropped; children tables come
 # from window arithmetic, not edge lists). This is the DYNAMIC content-addressed read the
 # recency gathers can't do. OFF for the baseline cleaner run; flip on for the retrieval test.
-xq_nominate_enable: true
+xq_nominate_enable: false
 # RECALL knobs (stage 1/2 shortlist width). Since the stage-3 scored prune fixes the read
 # at topk_l0 sources/query, widening these grows ONLY the nomination scoring cost (~4.5ms/
 # round, roughly linear) — NOT the per-layer read. 8 L3 windows ~= 700 tokens of candidate
@@ -206,7 +209,7 @@ xq_nominate_packed_read: true
 # Per-query relevance gate: read output scaled by sigmoid(w*stage1_top_score + b) — a no-op
 # option for queries with nothing to fetch (ungated reads HURT never-recurring tokens by
 # ~1.6%) and a task gradient into the 0:3 selector q/k (NSA-style selector training).
-xq_nominate_gate_enable: true
+xq_nominate_gate_enable: false
 # Stage-2 (L1 descent) scoring: local_qk = the layer's trained per-level q/k (the raw-cosine
 # default was a speed placeholder). No new params.
 xq_nominate_stage2: local_qk
@@ -230,12 +233,20 @@ xq_nominate_stage2: local_qk
 # reach far beyond either). FRESH-RUN knob (changes L0's local distribution). Generation
 # falls back to full rebuild (packed tail decode not built). Default [0] keeps L1-L3
 # lateral windows untouched; add 1-3 to route coarse laterals through the mixed window too.
-local_pack_cross_level: false
-local_pack_window: 0               # mixed slots; 0 = reuse L0's local window (128)
-# local_pack_query_levels: [0]
-# local_pack_level_bias: true      # zero-init per-level K/V tags for the mixed softmax (the
-#                                  # flash-eligible stand-in for the scatter level-pair bias)
-# => the enabled experiment lives in pinball_wikitext_cleaner_pack.yaml
+# THIS CONFIG: the pack experiment (vs pinball_wikitext_cleaner.yaml = identical run with
+# pack off). ALL levels query through the mixed window — coarse laterals move from their
+# 128-same-level-node windows (1k-4k token span) into the ~130-token mixed span. Measured
+# FASTER than baseline (-8.5%: one flash call over 9984 rows replaces four per-level calls);
+# the open question is whether the coarse-lateral repositioning hurts or helps quality.
+# Fall back to query_levels [0] to keep coarse laterals untouched (+2% cost instead).
+local_pack_cross_level: true
+local_pack_window: 156             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const)
+local_pack_query_levels: [0, 1, 2, 3]
+# Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
+# bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
+# query-dependent level bias) and to V (output carries its source level). Zero init =
+# exactly the untagged packed call at step 0.
+local_pack_level_bias: true
 norm_type: layernorm
 dropout: 0.1
 

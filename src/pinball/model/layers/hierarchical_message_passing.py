@@ -404,6 +404,7 @@ class HierarchicalMessagePassing(MessagePassing):
         num_local_levels: int = 4,
         per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
+        local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
         rope_level_axis_enable: bool = False,
         rope_level_axis_scale: float = 32.0,
         norm_type: str = "rmsnorm",
@@ -482,6 +483,15 @@ class HierarchicalMessagePassing(MessagePassing):
             )
         else:
             self.rotary_pos_enc_attn = self.rotary_pos_enc
+        # Packed mixed-level local call (local_pack_cross_level): per-level per-head K/V tags.
+        # The scatter path carries a learned level-PAIR logit bias (_edge_level_attention_bias)
+        # that flash cannot take; adding a zero-init embedding to the RoPE'd K instead makes
+        # q·e_level a query-dependent level bias inside the same softmax (and the V tag lets
+        # the output carry its source level). Zero init = bit-identical to untagged at start.
+        self.local_pack_level_bias = bool(local_pack_level_bias)
+        if self.local_pack_level_bias:
+            self.local_pack_level_k_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
+            self.local_pack_level_v_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
         self.l0_local_backend = str(l0_local_backend).lower()
         if self.l0_local_backend not in {"pyg", "flash", "xformers", "sdpa"}:
             self.l0_local_backend = "pyg"
@@ -1979,6 +1989,19 @@ class HierarchicalMessagePassing(MessagePassing):
         k = self.k_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
 
+        # Packed cross-level local attention (model-injected spec; consumed in the local
+        # block below by _apply_local_pack_out). Keep PRE-RoPE q/k references: the packed
+        # mixed-level sequence is RoPE'd at token-scale close positions, while the standard
+        # rotation below places coarse nodes at level-local indices (wrong scale for a mixed
+        # window). Shape-guarded: subset calls (multirate upper cycling etc.) see a stale-
+        # sized spec and fall back to the per-level path untouched.
+        _pack_spec = getattr(self, "_local_pack_spec", None)
+        if _pack_spec is not None and int(_pack_spec.get("num_nodes", -1)) != int(num_nodes):
+            _pack_spec = None
+        q_prerope = k_prerope = None
+        if _pack_spec is not None:
+            q_prerope, k_prerope = q, k
+
         pos_rep = None
         if hasattr(self, 'rotary_pos_enc') and rope_pos is not None:
             self.rotary_pos_enc.local_attn_runtime_level_grid_shapes = dict(getattr(self, "local_attn_runtime_level_grid_shapes", {}))
@@ -2144,8 +2167,20 @@ class HierarchicalMessagePassing(MessagePassing):
         if _use_multi:
             global_causal_gate = bool(getattr(self, "local_attn_runtime_causal_gate", True))
             runtime_group = getattr(self, "local_attn_runtime_group", None)
+            # Packed cross-level local attention: one causal mixed-level windowed call
+            # REPLACES the per-level local call for the spec's query levels (others keep
+            # their lateral windows). Empty set = ineligible here, per-level path runs.
+            _pack_covered: set = set()
+            if _pack_spec is not None:
+                _pack_covered = self._apply_local_pack_out(
+                    out=out, q_pre=q_prerope, k_pre=k_prerope, v=v,
+                    spec=_pack_spec, source_gates=source_gates,
+                    active_level_set=active_level_set, B=B, num_nodes=num_nodes,
+                )
             for lvl, cfg in self.local_attn_config.items():
                 lvl_int = int(lvl)
+                if lvl_int in _pack_covered:
+                    continue
                 if active_level_set is not None and lvl_int not in active_level_set:
                     continue
                 cfg_causal = bool(cfg.get("causal", False))
@@ -3305,6 +3340,91 @@ class HierarchicalMessagePassing(MessagePassing):
         o_L = self.out_proj_attn_level[L](o_L.reshape(B, n_L, h_L * Dh))  # d_L -> hidden
         return (slice(s, e) if idx is None else idx), o_L
 
+    def _local_pack_log_once(self, msg: str) -> None:
+        seen = getattr(self, "_local_pack_logged", None)
+        if seen is None:
+            seen = set()
+            self._local_pack_logged = seen
+        if msg not in seen:
+            logger.warning("[HMP:PACK] %s", msg)
+            seen.add(msg)
+
+    def _apply_local_pack_out(
+        self,
+        out: torch.Tensor,
+        q_pre: Optional[torch.Tensor],
+        k_pre: Optional[torch.Tensor],
+        v: torch.Tensor,
+        spec: Dict,
+        source_gates: Optional[Dict[str, torch.Tensor]],
+        active_level_set: Optional[set],
+        B: int,
+        num_nodes: int,
+    ) -> set:
+        """Packed cross-level local attention: ONE causal sliding-window attention over ALL
+        nodes interleaved by close time (model-built spec), so fine queries see recent CLOSED
+        coarse summaries and coarse queries see their strictly-past children inside the same
+        softmax as their lateral neighbors. Adds the result into `out` for the spec's query
+        levels and returns that level set; an empty set means ineligible-here and the caller
+        runs the normal per-level path. Leak-free by construction: packed order is close-time
+        order, so a causal window only exposes nodes with ar_time <= the query's (equal-time
+        ties resolved at spec build per hier_ar_allow_same_time)."""
+        query_levels = set(int(l) for l in spec.get("query_levels", (0,)))
+        # Anything that changes the meaning of "one causal pass over close-time order"
+        # falls back to the per-level path (never silently wrong).
+        global_causal_gate = bool(getattr(self, "local_attn_runtime_causal_gate", True))
+        l0_causal = bool(getattr(self, "l0_local_runtime_causal", self.l0_local_causal_default))
+        if not (global_causal_gate and l0_causal):
+            self._local_pack_log_once("non-causal runtime flags; packed cross-level local skipped")
+            return set()
+        if getattr(self, "local_attn_runtime_group", None) is not None or bool(
+            getattr(self, "local_attn_runtime_sampled", False)
+        ):
+            self._local_pack_log_once("sampled/grouped local runtime; packed cross-level local skipped")
+            return set()
+        if self.per_level_attn_active:
+            self._local_pack_log_once("per-level local attn dims active; packed cross-level local skipped")
+            return set()
+        if active_level_set is not None and not query_levels.issubset(active_level_set):
+            return set()
+        window = int(spec.get("window", 0))
+        if window <= 0 or q_pre is None or k_pre is None:
+            return set()
+
+        perm = spec["perm"]
+        pos = spec["pos"]
+        sel = spec["query_sel"]
+        tgt = spec["query_nodes"]
+        qp = q_pre.index_select(1, perm)
+        kp = k_pre.index_select(1, perm)
+        vp = v.index_select(1, perm)
+        if hasattr(self, "rotary_pos_enc") and pos is not None:
+            pos_rep = pos.view(1, num_nodes).expand(B, num_nodes).reshape(-1)
+            qp = self.rotary_pos_enc.apply_rotary_pos_emb(
+                qp.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep
+            ).view(B, num_nodes, self.num_heads, self.head_dim)
+            kp = self.rotary_pos_enc.apply_rotary_pos_emb(
+                kp.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep
+            ).view(B, num_nodes, self.num_heads, self.head_dim)
+        # Level tags (local_pack_level_bias): post-RoPE additive K/V embeddings per source
+        # level — the flash-eligible stand-in for the scatter path's level-pair logit bias.
+        lvl_packed = spec.get("levels", None)
+        if getattr(self, "local_pack_level_bias", False) and lvl_packed is not None:
+            kp = kp + self.local_pack_level_k_emb.index_select(0, lvl_packed).unsqueeze(0).to(kp.dtype)
+            vp = vp + self.local_pack_level_v_emb.index_select(0, lvl_packed).unsqueeze(0).to(vp.dtype)
+        out_pack = self._compute_local_attn_from_qkv(
+            q_lvl=qp, k_lvl=kp, v_lvl=vp,
+            window=window, causal=True,
+            backend=str(spec.get("backend", "sdpa")), level=-1,
+        )
+        if out_pack is None:
+            return set()
+        contrib = out_pack.index_select(1, sel)
+        if source_gates is not None:
+            contrib = source_gates["local"] * contrib
+        out.index_add_(1, tgt, contrib.to(dtype=out.dtype))
+        return query_levels
+
     def _compute_level_local_out_batched(
         self,
         q: torch.Tensor,
@@ -3890,6 +4010,7 @@ class HierarchicalTransformerLayer(nn.Module):
         num_local_levels: int = 4,
         per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
+        local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
         per_level_ffn_dims: Optional[List[int]] = None,  # per-level FFN "processing dim" (inner ~ mult*dim); [] => uniform
         norm_type: str = "layernorm",
         norm_eps: float = 1e-6,
@@ -3968,6 +4089,7 @@ class HierarchicalTransformerLayer(nn.Module):
             num_local_levels=num_local_levels,
             per_level_attn_mult=per_level_attn_mult,
             local_attn_head_dim=local_attn_head_dim,
+            local_pack_level_bias=local_pack_level_bias,
             norm_type=norm_type,
             norm_eps=norm_eps,
             rope_level_axis_enable=rope_level_axis_enable,

@@ -154,6 +154,11 @@ def build_pinball_model(
         xq_nominate_packed_read=bool(getattr(args, "xq_nominate_packed_read", False)),
         xq_nominate_gate_enable=bool(getattr(args, "xq_nominate_gate_enable", False)),
         xq_nominate_stage2=str(getattr(args, "xq_nominate_stage2", "cosine")),
+        local_pack_cross_level=bool(getattr(args, "local_pack_cross_level", False)),
+        local_pack_window=int(getattr(args, "local_pack_window", 0)),
+        local_pack_query_levels=(list(getattr(args, "local_pack_query_levels", None))
+                                 if getattr(args, "local_pack_query_levels", None) else None),
+        local_pack_level_bias=bool(getattr(args, "local_pack_level_bias", False)),
         hier_predaux_enable=bool(getattr(args, "hier_predaux_enable", False)),
         lambda_hier_predaux=float(getattr(args, "lambda_hier_predaux", 0.05)),
         hier_predaux_levels=(list(getattr(args, "hier_predaux_levels", None))

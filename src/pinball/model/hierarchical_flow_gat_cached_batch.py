@@ -2332,6 +2332,30 @@ class HierarchicalFlowGAT(nn.Module):
         # "local_qk" = the layer's trained per-level local q/k (L0-query proj x L1-key proj;
         # falls back to the shared q/k, then cosine). No new params.
         xq_nominate_stage2: str = "cosine",
+        # Packed cross-level LOCAL attention: interleave ALL levels' nodes by close time
+        # (ar_time) and run ONE causal sliding-window attention over the mixed sequence, in
+        # place of the per-level local call for `local_pack_query_levels`. Fine queries then
+        # see the recent CLOSED coarse summaries (staggered ancestors) and coarse queries see
+        # their strictly-past children INSIDE the same softmax as their lateral neighbors —
+        # query-adaptive vertical mixing (softmax competition) instead of scalar-gated
+        # residual refresh writes. Leak-free by construction: causal over close-time order.
+        # RoPE for the packed call is applied at token-scale close positions (the per-level
+        # local path RoPEs coarse nodes level-locally, the wrong scale for mixed windows).
+        # Levels NOT in query_levels keep their per-level lateral windows untouched, and the
+        # packed rows are ephemeral to the local-attention call (refiners/HQD/xq unaffected).
+        local_pack_cross_level: bool = False,
+        # Packed window in mixed SLOTS (0 = reuse L0's local window). With strides 8/16/32
+        # a 128-slot window spans ~105 tokens plus ~23 coarse rows (~22% dilution).
+        local_pack_window: int = 0,
+        # Levels whose local attention is taken from the packed call (None = [0]). Add 1-3
+        # to also route coarse laterals through the mixed window (shrinks their lateral
+        # token-reach to the packed span — raise local_pack_window accordingly).
+        local_pack_query_levels: Optional[List[int]] = None,
+        # Per-level per-head K/V tags for the packed call: flash can't take the scatter
+        # path's level-pair logit bias, so a zero-init embedding added to the RoPE'd K makes
+        # q·e_level a query-dependent level bias inside the same softmax (V tag marks the
+        # output's source level). Zero init = bit-identical to untagged at start.
+        local_pack_level_bias: bool = False,
         # Predictive coarse aux ("next-concept" prediction): each coarse node predicts the
         # DETACHED pooled child summary of a strictly-future window at its own level — the LM
         # objective one timescale up. Unlike the reconstruction aux (which rewards summarizing
@@ -2666,6 +2690,19 @@ class HierarchicalFlowGAT(nn.Module):
         self.per_level_ffn_dims = [int(d) for d in (per_level_ffn_dims or [])]
         self.per_level_attn_mult = [float(m) for m in (per_level_attn_mult or [])]
         self.local_attn_head_dim = int(local_attn_head_dim)
+        # Packed cross-level local attention: stored BEFORE transformer construction (the
+        # level-bias flag is threaded into every layer's mp constructor as parameters).
+        self.local_pack_cross_level = bool(local_pack_cross_level)
+        self.local_pack_window = max(0, int(local_pack_window or 0))
+        self.local_pack_query_levels = [
+            int(l) for l in (local_pack_query_levels if local_pack_query_levels is not None else [0])
+        ]
+        self.local_pack_level_bias = bool(local_pack_level_bias)
+        if self.local_pack_cross_level and int(local_attn_head_dim or 0) > 0:
+            raise ValueError(
+                "local_pack_cross_level mixes levels in one attention call and requires the "
+                "shared local q/k/v (set local_attn_head_dim: 0)"
+            )
         self.lap_pe_k = lap_pe_k
         self.refinement_style = refinement_style
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -3428,6 +3465,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_level_role_bias_enable=self.local_attn_level_role_bias_enable,
                         local_attn_level_role_bias_scale=self.local_attn_level_role_bias_scale,
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
+                        local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         cross_level_packed=self.cross_level_packed,
                         cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
@@ -3507,6 +3545,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_level_role_bias_enable=self.local_attn_level_role_bias_enable,
                         local_attn_level_role_bias_scale=self.local_attn_level_role_bias_scale,
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
+                        local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         cross_level_packed=self.cross_level_packed,
                         cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
@@ -3801,6 +3840,19 @@ class HierarchicalFlowGAT(nn.Module):
         self._xq_nom_edges: Optional[tuple] = None
         self._xq_query_gate_full: Optional[torch.Tensor] = None  # [B,N,1], per nomination round
         self._xq_children_cache: Optional[tuple] = None
+
+        # --- Packed cross-level local attention (attrs stored pre-construction above; see
+        # _local_pack_build_spec) ---
+        self._local_pack_spec_cache: Optional[tuple] = None
+        self._last_local_pack_spec_stats: Optional[Dict[str, int]] = None
+        if self.local_pack_cross_level:
+            logger.info(
+                "Packed cross-level local attention enabled (window=%s slots, query_levels=%s, "
+                "level_bias=%s).",
+                self.local_pack_window if self.local_pack_window > 0 else "l0",
+                self.local_pack_query_levels,
+                self.local_pack_level_bias,
+            )
         if self.xq_nominate_enable:
             logger.info(
                 "Cross-query nomination enabled (topk L3=%d, L1=%d, L0=%d, exclude_local=%s, "
@@ -5128,6 +5180,66 @@ class HierarchicalFlowGAT(nn.Module):
         self._downward_gather_plan_cache = (key, plan)
         return plan
 
+    def _local_pack_build_spec(
+        self,
+        level_offsets: torch.Tensor,
+        node_level: torch.Tensor,
+        node_ar_time: torch.Tensor,
+    ) -> Optional[Dict[str, object]]:
+        """Skeleton-cached spec for packed cross-level LOCAL attention (local_pack_cross_level):
+        all nodes sorted by close time (ar_time), plus token-scale RoPE positions and the
+        packed-row selection for the query levels. Ties at equal close time put coarse nodes
+        BEFORE the L0 token when hier_ar_allow_same_time (a token may read a window closing
+        AT its own position — same convention as _downward_gather_plan). Causality of the
+        consuming attention follows from the sort: a causal window over close-time order only
+        exposes nodes with ar_time <= the query's. Content-independent, cached on tensor
+        identity like _downward_gather_plan."""
+        key = (
+            int(level_offsets.data_ptr()), int(node_ar_time.data_ptr()),
+            int(node_ar_time.numel()), str(node_ar_time.device),
+        )
+        cached = getattr(self, "_local_pack_spec_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        n_total = int(node_ar_time.numel())
+        t = node_ar_time.to(torch.long)
+        lvl = node_level.to(device=t.device, dtype=torch.long)
+        if int(lvl.numel()) != n_total or n_total <= 1:
+            return None
+        num_levels = max(1, int(lvl.max().item()) + 1)
+        if bool(getattr(self, "hier_ar_allow_same_time", True)):
+            # coarse first at equal close time: L1 < L2 < L3 < L0-token
+            tie = torch.where(lvl > 0, lvl - 1, torch.full_like(lvl, num_levels - 1))
+        else:
+            tie = lvl  # token first; a same-time coarse row lands after it (invisible)
+        stride = max(num_levels, 4)
+        perm = torch.argsort(t * stride + tie, stable=True)
+        pos = t.index_select(0, perm).contiguous()
+        lvl_packed = lvl.index_select(0, perm)
+        q_levels = tuple(int(l) for l in (getattr(self, "local_pack_query_levels", None) or [0]))
+        sel_mask = torch.zeros_like(lvl_packed, dtype=torch.bool)
+        for l in q_levels:
+            sel_mask |= lvl_packed == int(l)
+        sel = torch.nonzero(sel_mask, as_tuple=False).view(-1)
+        cfg0 = dict(getattr(self, "local_attn_config", {}) or {}).get(0, {})
+        window = int(getattr(self, "local_pack_window", 0) or 0)
+        if window <= 0:
+            window = int(cfg0.get("window", getattr(self, "l0_local_window", 0)) or 0)
+        backend = str(cfg0.get("backend", getattr(self, "l0_local_backend", "sdpa")))
+        spec: Dict[str, object] = {
+            "num_nodes": n_total,
+            "perm": perm,
+            "pos": pos,
+            "levels": lvl_packed.clamp(0, 3).contiguous(),  # per packed row, for the K/V level tags
+            "query_sel": sel,
+            "query_nodes": perm.index_select(0, sel),
+            "query_levels": q_levels,
+            "window": window,
+            "backend": backend,
+        }
+        self._local_pack_spec_cache = (key, spec)
+        return spec
+
     def _apply_downward_refresh(
         self, x: torch.Tensor, level_offsets: torch.Tensor, node_ar_time: torch.Tensor
     ) -> torch.Tensor:
@@ -6200,6 +6312,13 @@ class HierarchicalFlowGAT(nn.Module):
                 d["xq.gate.w"] = float(self.xq_gate_w.detach())
                 d["xq.gate.b"] = float(self.xq_gate_b.detach())
                 d["xq.gate.mean"] = float(getattr(self, "_last_xq_gate_mean", 0.0))
+        # Packed cross-level local attention: mixed-sequence length (all levels), query rows
+        # taken from the packed call, and the slot window it ran with.
+        _ps = getattr(self, "_last_local_pack_spec_stats", None)
+        if bool(getattr(self, "local_pack_cross_level", False)) and _ps:
+            d["pack.len"] = float(_ps.get("len", 0))
+            d["pack.queries"] = float(_ps.get("queries", 0))
+            d["pack.window"] = float(_ps.get("window", 0))
         return d
 
     def _maybe_log_gate_monitor(self) -> None:
@@ -11627,10 +11746,33 @@ class HierarchicalFlowGAT(nn.Module):
         # leave stale armed gates whose graph is freed -> backward crash / wrong grads).
         # Each fed layer's mp re-arms below; a layer fed twice in one forward (weight-tied
         # multi-cycle schedules) would keep only the last round's gate.
+        # Packed cross-level local attention: build (or fetch the skeleton-cached) spec once
+        # per forward and inject it on every layer's message passing; None when off/ineligible
+        # clears any stale spec from a previous forward (specs are shape-guarded layer-side).
+        _local_pack_spec_fw = None
+        if (
+            bool(getattr(self, "local_pack_cross_level", False))
+            and base_lo is not None
+            and base_ar_time is not None
+            and str(getattr(self, "graph_geometry_mode", "sequence")).lower() == "sequence"
+        ):
+            _local_pack_spec_fw = self._local_pack_build_spec(base_lo, base_nl, base_ar_time)
+        self._last_local_pack_spec_stats = (
+            {
+                "len": int(_local_pack_spec_fw["num_nodes"]),
+                "queries": int(_local_pack_spec_fw["query_sel"].numel()),
+                "window": int(_local_pack_spec_fw["window"]),
+            }
+            if _local_pack_spec_fw is not None
+            else None
+        )
         for _t in getattr(self, "refinement_transformers", []) or []:
             _mp = getattr(_t, "message_passing", None)
-            if _mp is not None and getattr(_mp, "_hqd_out_query_gate", None) is not None:
+            if _mp is None:
+                continue
+            if getattr(_mp, "_hqd_out_query_gate", None) is not None:
                 _mp._hqd_out_query_gate = None
+            _mp._local_pack_spec = _local_pack_spec_fw
         _xq_nom_layers_used = 0
         _xq_nom_calls = 0
         _xq_last_nom_step = -1
@@ -13544,6 +13686,8 @@ class HierarchicalFlowGAT(nn.Module):
             reasons.append("zipper on")
         if bool(getattr(self, "xq_nominate_enable", False)):
             reasons.append("xq_nominate on")
+        if bool(getattr(self, "local_pack_cross_level", False)):
+            reasons.append("local_pack_cross_level on (packed tail decode not built)")
         if getattr(self, "token_unet", None) is not None:
             reasons.append("token_unet on (length-dependent stem)")
         if str(getattr(self, "autoenc_graph_mode", "off")).lower() not in ("off", "none", ""):
