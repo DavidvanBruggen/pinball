@@ -388,6 +388,7 @@ def build_pinball_model(
         pinball_cross_query_steps=int(getattr(args, "pinball_cross_query_steps", 0)),
         pinball_cross_query_topk=int(getattr(args, "pinball_cross_query_topk", 0)),
         pinball_cross_query_l0_window=int(getattr(args, "pinball_cross_query_l0_window", 0)),
+        pinball_cross_query_memory_window=int(getattr(args, "pinball_cross_query_memory_window", 0)),
         pinball_cross_query_backend=str(getattr(args, "pinball_cross_query_backend", "auto")),
         pinball_cross_query_causal=bool(getattr(args, "pinball_cross_query_causal", True)),
         pinball_cross_query_shared_weights=bool(getattr(args, "pinball_cross_query_shared_weights", True)),

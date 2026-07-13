@@ -11,8 +11,8 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 8196 #16384 #32768 #1024
-batch_size: 4
+block_size: 8196 #8196 #16384 #32768 #65536 #131072 #1024
+batch_size: 20
 val_split: 0.01
 
 # Training
@@ -42,7 +42,10 @@ gradient_checkpointing: false    # trade compute for memory in the refinement st
 # weights/grads/optimizer/loss-head). Loss-equivalent. chunk e.g. 256 (=4 chunks over T=1024).
 # The position-chunk auto-scales UP for small batch (>= ~2048 tokens/chunk = B*chunk), so a long
 # sequence at batch 1 stays a few big chunks instead of hundreds of tiny launch-bound ones.
-train_feature_chunked_ce_enable: false
+# 2026-07-13: enabled — the chunked CE's old [B,V,T] "spatial" cross-entropy kernel was ~7x
+# slower than the flat 2D form (trainer now reshapes; bit-identical, verified). Measured at
+# T=8192, V=50257: chunked 2D = 34.5ms vs 37.8ms full-logits, peak head memory 5.66 -> 2.97 GiB.
+train_feature_chunked_ce_enable: true
 chunked_ce_seq_chunk: 64
 # Long-context diagnostic: every N validations, log next-token PPL bucketed by in-context
 # recurrence distance (never / <128 / 128-511 / 512-2k / >2k). Cheap — reuses the val batches,
@@ -69,7 +72,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_pack_gpt2_nomultirate/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_pack_gpt2_sharedatt/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -107,8 +110,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 768 #192 #768
-num_heads: 12 #3 #12
+hidden_dim: 192 #192 #768
+num_heads: 3 #3 #12
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -268,7 +271,7 @@ gen_frontier_consistent: true
 
 # Attention / hierarchy toggles
 attn_backend: flash        # pyg | flash | sdpa
-qkv_sharing: separate      # shared | separate
+qkv_sharing: shared      # shared | separate
 # Tier-3 packed cross-level backbone attention: a dense/batched fast lane for the
 # cross-level message passing (groups each destination's parents into a padded fixed-K
 # block per level, runs [B,Q,K,H,D] attention instead of gather/segment-softmax/scatter).
@@ -443,9 +446,9 @@ lateral_edge_trace_mode: true_lateral   # windowed_approx | true_scatter | true_
 #                           fewer L0 nodes -> cheaper cycles).   Use token_unet_scale: >1 (pow2).
 token_unet_enable: false
 token_unet_block: cnn          # cnn | hyena
-token_unet_mode: stem            # stem (mode 2) | coarse_tokenize (mode 1)
+token_unet_mode: coarse_tokenize # stem (mode 2) | coarse_tokenize (mode 1)
 token_unet_dim: 1d               # auto | 1d | 2d  (text is 1d)
-token_unet_scale: 1              # power-of-two. 1 for stem; e.g. 4 for coarse_tokenize pooling
+token_unet_scale: 8              # power-of-two. 1 for stem; e.g. 4 for coarse_tokenize pooling
 token_unet_kernel_size: 9        # local conv width (cnn block only; ignored by hyena)
 token_unet_dropout: 0.1
 # Dynamic U-Net: a PROPER causal U-Net (vs the constant-width default). Channels GROW at
@@ -454,7 +457,7 @@ token_unet_dropout: 0.1
 # where multi-token structure lives; recommended over the constant-width path (which underfits).
 # Causal (AR-safe) for cnn AND hyena at fixed length; NOTE hyena's positional filter is length-
 # normalized so it is NOT stable under incremental generation (fine for teacher-forced training).
-token_unet_dynamic: false
+token_unet_dynamic: true
 token_unet_channel_growth: 256   # +channels per downsample level
 token_unet_max_channels: 0       # 0 => 2*hidden_dim
 token_unet_concat_skips: true    # true = concat+fuse (classic); false = additive
@@ -474,7 +477,7 @@ token_unet_lookahead_decode_enable: false
 # runs (scales stuck ~0.01-0.02); upper_refiner was borderline (L3 self-refine 0.04, L2 ~0.002)
 # and is deactivated FOR NOW, not removed — re-enable by raising its steps. steps: 0 skips
 # building the module entirely. Only the downward cross-query pairs below still run here.
-pinball_multirate_enable: false
+pinball_multirate_enable: true
 pinball_multirate_schedule: midpoint   # "midpoint" fires once after midpoint_layer; "after_full_stack" = after ALL layers
 # Placement of the multirate/thinking episode: "auto" = mid-stack (layer 6 of 12).
 # Prelude -> loop -> coda shape: 9 leaves 3 coda layers to locally mix + decode what the
@@ -544,6 +547,13 @@ pinball_cross_query_steps: 2               # master switch; passes per pair (0 =
 # averaged over ALL positions incl. future). With 0 only the per-position causal mask applies.
 pinball_cross_query_topk: 0                # top-k memory nodes per selection; 0 = all
 pinball_cross_query_l0_window: 0           # only used when a pair's memory level is 0 (±ar_time window)
+# Recency cap on the episode read (ar-time units): each query reads only memory that closed
+# within the last W token-times — per-query, inside the causal mask, so leak-free and
+# BIT-IDENTICAL to unlimited while context <= W. 32768 = last 1024 closed L3 windows: inert
+# for training runs at 8k, engages beyond 32k so the per-query read set is bounded (linear
+# scaling; content retrieval past the window is xq_nominate's job, and adding hierarchy
+# levels above L3 extends global reach at geometrically shrinking node counts).
+pinball_cross_query_memory_window: 32768
 pinball_cross_query_backend: auto
 pinball_cross_query_causal: true
 pinball_cross_query_shared_weights: true
@@ -572,7 +582,7 @@ hier_predaux_enable: true  # cleaner-pinball: ON — with the scatter gradient p
 lambda_hier_predaux: 0.05
 hier_predaux_levels: [1, 2, 3]
 hier_predaux_horizon: 0        # windows ahead; 0 = auto (first non-overlapping window)
-hier_predaux_loss_mode: cosine # cosine | mse_norm | mse
+hier_predaux_loss_mode: mse # cosine | mse_norm | mse
 hier_predaux_predictor: mlp    # mlp | linear
 # AR runs: next (forecast only — a "prev" head would be trivially copyable and empty). MASKED
 # runs: both (future is partially visible so "next" alone degrades toward copying; predicting

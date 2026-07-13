@@ -2828,34 +2828,57 @@ class HierarchicalMessagePassing(MessagePassing):
         num_heads = max(1, int(q.size(-2)))
         head_dim = max(1, int(q.size(-1)))
         v_dim = max(1, int(v.size(-1)))  # Fat-V: value head dim (== head_dim when off)
-        out_flat = torch.zeros((int(B) * int(num_nodes), num_heads, v_dim), device=device, dtype=q.dtype)
         chunk = max(1, int(getattr(self, "hqd_packed_witness_chunk_size", 2048)))
         neg = torch.finfo(q.dtype).min
         batch_offsets = torch.arange(int(B), device=device, dtype=torch.long).view(int(B), 1, 1) * int(num_nodes)
         flat_k = k.reshape(int(B) * int(num_nodes), num_heads, head_dim)
         flat_v = v.reshape(int(B) * int(num_nodes), num_heads, v_dim)
+        # xq nomination always targets the full contiguous L0 range: read queries by slice
+        # and write messages by slice (one CopySlices backward) instead of index_select +
+        # index_add_ over [B*N] rows, whose scatter-style backward dominated the read cost.
+        # Non-contiguous dst (HQD witness sets) keeps the index path.
+        d0 = int(dst_nodes[0].item()) if Q > 0 else 0
+        contig = Q > 1 and bool(
+            (dst_nodes == torch.arange(d0, d0 + Q, device=device, dtype=torch.long)).all().item()
+        )
+        msgs: list = []
+        out_flat = None
+        if not contig:
+            out_flat = torch.zeros((int(B) * int(num_nodes), num_heads, v_dim), device=device, dtype=q.dtype)
 
         for start in range(0, Q, chunk):
             end = min(Q, start + chunk)
             cand = candidate_nodes[:, start:end, :]
             valid = cand >= 0
-            if not bool(valid.any()):
+            if not contig and not bool(valid.any()):
                 continue
             safe = cand.clamp(min=0)
             gather_idx = (safe + batch_offsets).reshape(-1)
             k_c = flat_k.index_select(0, gather_idx).view(int(B), end - start, K, num_heads, head_dim)
             v_c = flat_v.index_select(0, gather_idx).view(int(B), end - start, K, num_heads, v_dim)
-            q_c = q.index_select(1, dst_nodes[start:end])  # [B,Qc,H,D]
+            if contig:
+                q_c = q[:, d0 + start : d0 + end]  # [B,Qc,H,D]
+            else:
+                q_c = q.index_select(1, dst_nodes[start:end])  # [B,Qc,H,D]
             scores = (q_c.unsqueeze(2) * k_c).sum(dim=-1) / math.sqrt(float(head_dim))  # [B,Qc,K,H]
             scores = scores.masked_fill(~valid.unsqueeze(-1), neg)
             weights = torch.softmax(scores, dim=2)
             weights = torch.where(valid.unsqueeze(-1), weights, torch.zeros_like(weights))
             msg = (weights.unsqueeze(-1) * v_c).sum(dim=2)  # [B,Qc,H,Dv]
-            msg = msg.to(dtype=out_flat.dtype)
-            groups = (torch.arange(int(B), device=device, dtype=torch.long).view(int(B), 1) * int(num_nodes)) + dst_nodes[start:end].view(1, -1)
-            out_flat.index_add_(0, groups.reshape(-1), msg.reshape(int(B) * (end - start), num_heads, v_dim))
+            msg = msg.to(dtype=q.dtype)
+            if contig:
+                msgs.append(msg)
+            else:
+                groups = (torch.arange(int(B), device=device, dtype=torch.long).view(int(B), 1) * int(num_nodes)) + dst_nodes[start:end].view(1, -1)
+                out_flat.index_add_(0, groups.reshape(-1), msg.reshape(int(B) * (end - start), num_heads, v_dim))
 
-        out = out_flat.view(int(B), int(num_nodes), num_heads, v_dim).reshape(int(B), int(num_nodes), num_heads * v_dim)
+        if contig:
+            m_all = torch.cat(msgs, dim=1) if len(msgs) > 1 else msgs[0]  # [B, Q, H, Dv]
+            out_buf = torch.zeros((int(B), int(num_nodes), num_heads, v_dim), device=device, dtype=q.dtype)
+            out_buf[:, d0 : d0 + Q] = m_all
+            out = out_buf.reshape(int(B), int(num_nodes), num_heads * v_dim)
+        else:
+            out = out_flat.view(int(B), int(num_nodes), num_heads, v_dim).reshape(int(B), int(num_nodes), num_heads * v_dim)
         out = self.sparse_out_proj(out)
         self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
         return out

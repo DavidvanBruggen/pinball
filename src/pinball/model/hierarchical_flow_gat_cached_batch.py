@@ -375,6 +375,7 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
         query_level: int = 3,
         memory_level: int = 2,
         memory_window: int = 0,
+        memory_recency_window: int = 0,
         selection_mode: str = "global_mean",
         write_scale_init: float = 1.0e-2,
         flash_dtype_cast: bool = False,
@@ -393,6 +394,13 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
         self.query_level = int(query_level)
         self.memory_level = int(memory_level)
         self.memory_window = max(0, int(memory_window))
+        # Recency cap on the ATTENTION READ (ar-time units): a query only reads memory
+        # closing within the last `memory_recency_window` time units. Applied inside the
+        # causal mask, so it is per-query and leak-free (only restricts the PAST); with
+        # window >= context length it is bit-identical to off. 0 = unlimited. This bounds
+        # the per-query read set for linear scaling at long context (content retrieval
+        # beyond the window is xq_nominate's job; deeper hierarchy levels extend reach).
+        self.memory_recency_window = max(0, int(memory_recency_window))
         self.selection_mode = str(selection_mode).lower().replace("-", "_")
         if self.selection_mode not in {"global_mean", "per_query"}:
             raise ValueError("pinball cross-query selection_mode must be 'global_mean' or 'per_query'")
@@ -500,6 +508,8 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
             if qt.numel() != int(q_len) or mt.numel() != int(k_len):
                 return None
             allow = mt.view(1, k_len) <= qt.view(q_len, 1)
+            if self.memory_recency_window > 0:
+                allow = allow & ((qt.view(q_len, 1) - mt.view(1, k_len)) <= int(self.memory_recency_window))
             neg = torch.finfo(dtype).min
             bias = torch.full((q_len, k_len), neg, device=device, dtype=dtype)
             return bias.masked_fill(allow, 0.0)
@@ -510,6 +520,10 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
         if qt.dim() != 2 or mt.dim() != 2 or qt.size(1) != int(q_len) or mt.size(1) != int(k_len) or qt.size(0) != mt.size(0):
             return None
         allow = mt.view(mt.size(0), 1, k_len) <= qt.view(qt.size(0), q_len, 1)
+        if self.memory_recency_window > 0:
+            allow = allow & (
+                (qt.view(qt.size(0), q_len, 1) - mt.view(mt.size(0), 1, k_len)) <= int(self.memory_recency_window)
+            )
         neg = torch.finfo(dtype).min
         bias = torch.full((qt.size(0), q_len, k_len), neg, device=device, dtype=dtype)
         return bias.masked_fill(allow, 0.0)
@@ -549,6 +563,8 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
                     mt = None
                 if mt is not None:
                     allow = mt <= qt.unsqueeze(-1)
+                    if self.memory_recency_window > 0:
+                        allow = allow & ((qt.unsqueeze(-1) - mt) <= int(self.memory_recency_window))
                     neg = torch.finfo(qh.dtype).min
                     mask = torch.full((bsz * q_len, 1, 1, k_len), neg, device=h3.device, dtype=qh.dtype)
                     mask = mask.masked_fill(allow.reshape(bsz * q_len, 1, 1, k_len), 0.0)
@@ -2569,6 +2585,11 @@ class HierarchicalFlowGAT(nn.Module):
         pinball_cross_query_steps: int = 0,
         pinball_cross_query_topk: int = 0,
         pinball_cross_query_l0_window: int = 0,
+        # Recency cap (ar-time units) on every cross-query pair's attention read: a query
+        # only reads memory closing within the last W time units. Per-query, inside the
+        # causal mask (leak-free); bit-identical to off while W >= context length. Bounds
+        # the per-query read set so the episode stays linear-scaling at long context.
+        pinball_cross_query_memory_window: int = 0,
         pinball_cross_query_backend: str = "auto",
         pinball_cross_query_causal: bool = True,
         pinball_cross_query_shared_weights: bool = True,
@@ -2845,6 +2866,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.pinball_cross_query_steps = max(0, int(pinball_cross_query_steps))
         self.pinball_cross_query_topk = max(0, int(pinball_cross_query_topk))
         self.pinball_cross_query_l0_window = max(0, int(pinball_cross_query_l0_window))
+        self.pinball_cross_query_memory_window = max(0, int(pinball_cross_query_memory_window))
         self.pinball_cross_query_backend = str(pinball_cross_query_backend).lower()
         if self.pinball_cross_query_backend not in {"auto", "flash", "sdpa"}:
             raise ValueError("pinball_cross_query_backend must be 'auto', 'flash', or 'sdpa'")
@@ -3669,6 +3691,7 @@ class HierarchicalFlowGAT(nn.Module):
                             query_level=int(query_level),
                             memory_level=int(memory_level),
                             memory_window=self.pinball_cross_query_l0_window if int(memory_level) == 0 else 0,
+                            memory_recency_window=self.pinball_cross_query_memory_window,
                             selection_mode=self.pinball_cross_query_selection,
                             write_scale_init=self.pinball_cross_query_write_scale_init,
                             flash_dtype_cast=self.local_attn_flash_dtype_cast,
@@ -5496,16 +5519,26 @@ class HierarchicalFlowGAT(nn.Module):
                     q0f = F.normalize(x0.float(), dim=-1)
                     k0f = q0f
                 pruned = torch.full((B, n0, k0top), -1, device=dev, dtype=src.dtype)
-                CH = 2048  # bound the [B, chunk, C, H*D] gather
+                CH = 2048  # query chunk
+                # Score via chunked GEMM + score-gather: one [B,c,D]x[B,D,n0] matmul per
+                # chunk, then gather the C candidate columns. Same dots as the old
+                # [B,c,C,D] key-gather + einsum, but ~25x less memory traffic (the gather
+                # expansion dominated the nomination round). The GEMM is O(n0^2*D) though,
+                # so past the FLOP crossover fall back to the linear-in-n0 gather path.
+                use_gemm = n0 <= int(getattr(self, "xq_stage3_gemm_max_n0", 16384))
+                k0T = k0f.transpose(1, 2).contiguous() if use_gemm else None
                 for s0 in range(0, n0, CH):
                     e0 = min(n0, s0 + CH)
                     cnd = src[:, s0:e0]                                 # [B, c, C]
                     vld = cnd >= 0
                     safe = cnd.clamp(min=0)
-                    k_g = k0f.gather(
-                        1, safe.reshape(B, -1, 1).expand(-1, -1, k0f.size(-1))
-                    ).view(B, e0 - s0, cnd.size(-1), -1)
-                    s3 = torch.einsum("bqd,bqcd->bqc", q0f[:, s0:e0], k_g)
+                    if use_gemm:
+                        s3 = torch.matmul(q0f[:, s0:e0], k0T).gather(2, safe)
+                    else:
+                        k_g = k0f.gather(
+                            1, safe.reshape(B, -1, 1).expand(-1, -1, k0f.size(-1))
+                        ).view(B, e0 - s0, cnd.size(-1), -1)
+                        s3 = torch.einsum("bqd,bqcd->bqc", q0f[:, s0:e0], k_g)
                     s3 = s3.masked_fill(~vld, float("-inf"))
                     ti = s3.topk(k0top, dim=-1)
                     picked = cnd.gather(2, ti.indices)

@@ -615,13 +615,15 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
             e = min(T, s + chunk)
             logits_slice = logits_btv[:, s:e, :]
             target_slice = targets_bt[:, s:e]
+            # Flattened 2D CE: the [B, V, T] spatial variant dispatches a kernel that is
+            # ~7x slower at LM vocab sizes (measured 256ms vs 34ms per step at T=8192).
             ce_slice = F.cross_entropy(
-                logits_slice.transpose(1, 2),
-                target_slice,
+                logits_slice.reshape(-1, logits_slice.size(-1)),
+                target_slice.reshape(-1),
                 reduction="none",
                 label_smoothing=ce_label_smoothing,
                 ignore_index=(int(ignore_index) if ignore_index is not None else -100),
-            )
+            ).view_as(target_slice)
 
             if mask_bt is not None:
                 valid = mask_bt[:, s:e].to(device=ce_slice.device, dtype=torch.bool)
@@ -687,13 +689,14 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
             e = min(T, s + chunk)
             logits_slice = _project_token_features(features_bth[:, s:e, :])
             target_slice = targets_bt[:, s:e]
+            # Flattened 2D CE (see _chunked_ce_mean): avoids the slow [B, V, T] spatial kernel.
             ce_slice = F.cross_entropy(
-                logits_slice.transpose(1, 2),
-                target_slice,
+                logits_slice.reshape(-1, logits_slice.size(-1)),
+                target_slice.reshape(-1),
                 reduction="none",
                 label_smoothing=ce_label_smoothing,
                 ignore_index=(int(ignore_index) if ignore_index is not None else -100),
-            )
+            ).view_as(target_slice)
             if mask_bt is not None:
                 valid = mask_bt[:, s:e].to(device=ce_slice.device, dtype=torch.bool)
             elif ignore_index is not None:
@@ -928,11 +931,11 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
                             )
                         else:
                             ae_token_loss = F.cross_entropy(
-                                ae_logits.transpose(1, 2),
-                                input_ids,
+                                ae_logits.reshape(-1, ae_logits.size(-1)),
+                                input_ids.reshape(-1),
                                 reduction="none",
                                 label_smoothing=ce_label_smoothing,
-                            )
+                            ).view_as(input_ids)
                             autoenc_token_count = int(ae_mask.sum().item())
                             loss_autoenc = (ae_token_loss * ae_mask.to(ae_token_loss.dtype)).sum() / ae_mask.sum().clamp_min(1)
                     if lambda_autoenc_next > 0.0 and ae_logits.size(1) > 1:
@@ -951,11 +954,11 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
                                 )
                             else:
                                 ae_next_loss = F.cross_entropy(
-                                    ae_next_logits.transpose(1, 2),
-                                    ae_next_targets,
+                                    ae_next_logits.reshape(-1, ae_next_logits.size(-1)),
+                                    ae_next_targets.reshape(-1),
                                     reduction="none",
                                     label_smoothing=ce_label_smoothing,
-                                )
+                                ).view_as(ae_next_targets)
                                 autoenc_next_token_count = int(ae_next_mask.sum().item())
                                 loss_autoenc_next = (
                                     ae_next_loss * ae_next_mask.to(ae_next_loss.dtype)
@@ -981,11 +984,11 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
                             )
                         else:
                             unet_lookahead_token_loss = F.cross_entropy(
-                                unet_lookahead_logits.transpose(1, 2),
-                                input_ids,
+                                unet_lookahead_logits.reshape(-1, unet_lookahead_logits.size(-1)),
+                                input_ids.reshape(-1),
                                 reduction="none",
                                 label_smoothing=ce_label_smoothing,
-                            )
+                            ).view_as(input_ids)
                             token_unet_lookahead_token_count = int(unet_lookahead_mask.sum().item())
                             loss_token_unet_lookahead = (
                                 unet_lookahead_token_loss * unet_lookahead_mask.to(unet_lookahead_token_loss.dtype)
@@ -1033,8 +1036,8 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
                             )
                         else:
                             loss_impute = F.cross_entropy(
-                                logits_for_masked_loss.transpose(1, 2),
-                                target_tokens,
+                                logits_for_masked_loss.reshape(-1, logits_for_masked_loss.size(-1)),
+                                target_tokens.reshape(-1),
                                 ignore_index=-100,
                                 reduction="mean",
                                 label_smoothing=ce_label_smoothing,
@@ -1061,11 +1064,11 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
                         )
                     else:
                         unmasked_token_loss = F.cross_entropy(
-                            logits.transpose(1, 2),
-                            input_ids,
+                            logits.reshape(-1, logits.size(-1)),
+                            input_ids.reshape(-1),
                             reduction="none",
                             label_smoothing=ce_label_smoothing,
-                        )
+                        ).view_as(input_ids)
                         loss_unmasked = (
                             unmasked_token_loss * unmasked_mask.to(unmasked_token_loss.dtype)
                         ).sum() / unmasked_mask.sum().clamp_min(1)
@@ -1657,11 +1660,11 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
                         )
                     else:
                         ae_token_loss = F.cross_entropy(
-                            ae_logits.transpose(1, 2),
-                            input_ids,
+                            ae_logits.reshape(-1, ae_logits.size(-1)),
+                            input_ids.reshape(-1),
                             reduction="none",
                             label_smoothing=ce_label_smoothing,
-                        )
+                        ).view_as(input_ids)
                         autoenc_token_count = int(ae_mask.sum().item())
                         loss_autoenc = (ae_token_loss * ae_mask.to(ae_token_loss.dtype)).sum() / ae_mask.sum().clamp_min(1)
                 if lambda_autoenc_next > 0.0 and ae_logits.size(1) > 1:
@@ -1680,11 +1683,11 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
                             )
                         else:
                             ae_next_loss = F.cross_entropy(
-                                ae_next_logits.transpose(1, 2),
-                                ae_next_targets,
+                                ae_next_logits.reshape(-1, ae_next_logits.size(-1)),
+                                ae_next_targets.reshape(-1),
                                 reduction="none",
                                 label_smoothing=ce_label_smoothing,
-                            )
+                            ).view_as(ae_next_targets)
                             autoenc_next_token_count = int(ae_next_mask.sum().item())
                             loss_autoenc_next = (
                                 ae_next_loss * ae_next_mask.to(ae_next_loss.dtype)
@@ -1710,11 +1713,11 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
                         )
                     else:
                         unet_lookahead_token_loss = F.cross_entropy(
-                            unet_lookahead_logits.transpose(1, 2),
-                            input_ids,
+                            unet_lookahead_logits.reshape(-1, unet_lookahead_logits.size(-1)),
+                            input_ids.reshape(-1),
                             reduction="none",
                             label_smoothing=ce_label_smoothing,
-                        )
+                        ).view_as(input_ids)
                         token_unet_lookahead_token_count = int(unet_lookahead_mask.sum().item())
                         loss_token_unet_lookahead = (
                             unet_lookahead_token_loss * unet_lookahead_mask.to(unet_lookahead_token_loss.dtype)
@@ -1777,11 +1780,11 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
                     )
                 else:
                     unmasked_token_loss = F.cross_entropy(
-                        logits.transpose(1, 2),
-                        input_ids,
+                        logits.reshape(-1, logits.size(-1)),
+                        input_ids.reshape(-1),
                         reduction="none",
                         label_smoothing=ce_label_smoothing,
-                    )
+                    ).view_as(input_ids)
                     loss_unmasked = (
                         unmasked_token_loss * unmasked_mask.to(unmasked_token_loss.dtype)
                     ).sum() / unmasked_mask.sum().clamp_min(1)
@@ -3479,7 +3482,7 @@ class EnhancedHierarchicalTrainer:
         if not bool(mask_fit.any()):
             return logits_fit.new_zeros(())
 
-        token_loss = F.cross_entropy(logits_fit.transpose(1, 2), target_fit, reduction="none", label_smoothing=label_smoothing)
+        token_loss = F.cross_entropy(logits_fit.reshape(-1, logits_fit.size(-1)), target_fit.reshape(-1), reduction="none", label_smoothing=label_smoothing).view_as(target_fit)
         selected = token_loss.masked_select(mask_fit)
         if selected.numel() == 0:
             return logits_fit.new_zeros(())
@@ -4030,7 +4033,7 @@ class EnhancedHierarchicalTrainer:
                 token_ids_fit = token_ids[: logits_fit.size(0), : logits_fit.size(1)]
                 mask_fit = mask[: logits_fit.size(0), : logits_fit.size(1)]
 
-                token_loss = F.cross_entropy(logits_fit.transpose(1, 2), token_ids_fit, reduction="none")
+                token_loss = F.cross_entropy(logits_fit.reshape(-1, logits_fit.size(-1)), token_ids_fit.reshape(-1), reduction="none").view_as(token_ids_fit)
                 masked_loss = token_loss.masked_select(mask_fit)
                 masked_loss_val = float(masked_loss.mean().item()) if masked_loss.numel() > 0 else 0.0
                 loss = masked_loss.mean() if masked_loss.numel() > 0 else logits_fit.new_zeros(())
@@ -6490,10 +6493,10 @@ class EnhancedHierarchicalTrainer:
                 if ae_logits is not None and not autoenc_only_diffusion_mode:
                     ae_logits = ae_logits.to(device=self.device)
                     ae_token_loss = F.cross_entropy(
-                        ae_logits.transpose(1, 2),
-                        input_ids,
+                        ae_logits.reshape(-1, ae_logits.size(-1)),
+                        input_ids.reshape(-1),
                         reduction="none",
-                    )
+                    ).view_as(input_ids)
                     if attention_mask is not None:
                         ae_mask = attention_mask.to(self.device, dtype=torch.bool)
                     else:
@@ -6516,11 +6519,11 @@ class EnhancedHierarchicalTrainer:
                     if bool(ae_next_mask.any()):
                         ae_next_count = int(ae_next_mask.sum().item())
                         ae_next_token_loss = F.cross_entropy(
-                            ae_logits.transpose(1, 2),
-                            labels,
+                            ae_logits.reshape(-1, ae_logits.size(-1)),
+                            labels.reshape(-1),
                             reduction="none",
                             ignore_index=-100,
-                        )
+                        ).view_as(labels)
                         ae_next_loss = (
                             ae_next_token_loss * ae_next_mask.to(ae_next_token_loss.dtype)
                         ).sum() / ae_next_mask.sum().clamp_min(1)
