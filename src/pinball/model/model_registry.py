@@ -159,6 +159,8 @@ def build_pinball_model(
         local_pack_query_levels=(list(getattr(args, "local_pack_query_levels", None))
                                  if getattr(args, "local_pack_query_levels", None) else None),
         local_pack_level_bias=bool(getattr(args, "local_pack_level_bias", False)),
+        local_pack_coarse_lane=bool(getattr(args, "local_pack_coarse_lane", False)),
+        local_pack_coarse_window=int(getattr(args, "local_pack_coarse_window", 512)),
         hier_predaux_enable=bool(getattr(args, "hier_predaux_enable", False)),
         lambda_hier_predaux=float(getattr(args, "lambda_hier_predaux", 0.05)),
         hier_predaux_levels=(list(getattr(args, "hier_predaux_levels", None))

@@ -3423,6 +3423,39 @@ class HierarchicalMessagePassing(MessagePassing):
         if source_gates is not None:
             contrib = source_gates["local"] * contrib
         out.index_add_(1, tgt, contrib.to(dtype=out.dtype))
+
+        # Coarse lane: second packed causal window over ONLY the coarse rows (close-time
+        # order preserved by construction), restoring wide coarse LATERAL reach at coarse
+        # density prices — additive to the coarse queries' main-window read above.
+        lane_perm = spec.get("lane_perm", None)
+        if lane_perm is not None:
+            n_lane = int(lane_perm.numel())
+            ql = q_pre.index_select(1, lane_perm)
+            kl = k_pre.index_select(1, lane_perm)
+            vl = v.index_select(1, lane_perm)
+            lane_pos = spec.get("lane_pos", None)
+            if hasattr(self, "rotary_pos_enc") and lane_pos is not None:
+                lane_pos_rep = lane_pos.view(1, n_lane).expand(B, n_lane).reshape(-1)
+                ql = self.rotary_pos_enc.apply_rotary_pos_emb(
+                    ql.reshape(B * n_lane, self.num_heads, self.head_dim), lane_pos_rep
+                ).view(B, n_lane, self.num_heads, self.head_dim)
+                kl = self.rotary_pos_enc.apply_rotary_pos_emb(
+                    kl.reshape(B * n_lane, self.num_heads, self.head_dim), lane_pos_rep
+                ).view(B, n_lane, self.num_heads, self.head_dim)
+            lane_levels = spec.get("lane_levels", None)
+            if getattr(self, "local_pack_level_bias", False) and lane_levels is not None:
+                kl = kl + self.local_pack_level_k_emb.index_select(0, lane_levels).unsqueeze(0).to(kl.dtype)
+                vl = vl + self.local_pack_level_v_emb.index_select(0, lane_levels).unsqueeze(0).to(vl.dtype)
+            out_lane = self._compute_local_attn_from_qkv(
+                q_lvl=ql, k_lvl=kl, v_lvl=vl,
+                window=int(spec.get("lane_window", 0)), causal=True,
+                backend=str(spec.get("backend", "sdpa")), level=-2,
+            )
+            if out_lane is not None:
+                lane_contrib = out_lane.index_select(1, spec["lane_query_sel"])
+                if source_gates is not None:
+                    lane_contrib = source_gates["local"] * lane_contrib
+                out.index_add_(1, spec["lane_query_nodes"], lane_contrib.to(dtype=out.dtype))
         return query_levels
 
     def _compute_level_local_out_batched(

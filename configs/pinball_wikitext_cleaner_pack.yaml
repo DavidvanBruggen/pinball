@@ -69,7 +69,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_pack/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_pack_gpt2_nomultirate/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -107,8 +107,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 192 #768
-num_heads: 3 #12
+hidden_dim: 768 #192 #768
+num_heads: 12 #3 #12
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -247,6 +247,15 @@ local_pack_query_levels: [0, 1, 2, 3]
 # query-dependent level bias) and to V (output carries its source level). Zero init =
 # exactly the untagged packed call at step 0.
 local_pack_level_bias: true
+# COARSE LANE: second packed causal window over ONLY the L1-L3 rows (close-time order),
+# restoring the wide coarse LATERAL reach the hierarchy's economics lean on — the main
+# mixed window is ~78% tokens, which cuts coarse laterals to ~16 same-level neighbors.
+# Lane slots are all coarse (7 per 32 tokens): 896 slots = 4096 tokens of span = L3's full
+# pre-pack window (128 L3 + 256 L2 + 512 L1 in-window; L1/L2 lateral reach even grows vs
+# their old 1024/2048-token spans). Cost ~ the main packed call again (coarse rows are few).
+# Additive to the coarse queries' main-window read (fine detail stays available there).
+local_pack_coarse_lane: true
+local_pack_coarse_window: 896
 norm_type: layernorm
 dropout: 0.1
 
@@ -465,7 +474,7 @@ token_unet_lookahead_decode_enable: false
 # runs (scales stuck ~0.01-0.02); upper_refiner was borderline (L3 self-refine 0.04, L2 ~0.002)
 # and is deactivated FOR NOW, not removed — re-enable by raising its steps. steps: 0 skips
 # building the module entirely. Only the downward cross-query pairs below still run here.
-pinball_multirate_enable: true
+pinball_multirate_enable: false
 pinball_multirate_schedule: midpoint   # "midpoint" fires once after midpoint_layer; "after_full_stack" = after ALL layers
 # Placement of the multirate/thinking episode: "auto" = mid-stack (layer 6 of 12).
 # Prelude -> loop -> coda shape: 9 leaves 3 coda layers to locally mix + decode what the

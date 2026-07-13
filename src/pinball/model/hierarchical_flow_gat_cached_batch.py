@@ -2356,6 +2356,18 @@ class HierarchicalFlowGAT(nn.Module):
         # q·e_level a query-dependent level bias inside the same softmax (V tag marks the
         # output's source level). Zero init = bit-identical to untagged at start.
         local_pack_level_bias: bool = False,
+        # COARSE LANE: a second packed causal window over ONLY the coarse nodes (L1-L3,
+        # close-time order). The main mixed window denominates reach in mixed slots, which
+        # are ~78% tokens — coarse laterals shrink to ~16 same-level neighbors. The lane's
+        # slots are all coarse (7 per 32 tokens), so a cheap window restores the wide coarse
+        # lateral reach the hierarchy's economics lean on (896 slots = 4096 tokens = L3's
+        # full pre-pack span, for ~the cost of the main call again — coarse rows are few).
+        # Applies to coarse levels IN local_pack_query_levels (additive to their main-window
+        # read); keys are always all coarse rows. Same causality argument as the main pack.
+        local_pack_coarse_lane: bool = False,
+        # Lane window in COARSE slots (L1+L2+L3 rows). 896 ~= 4096 tokens of span at
+        # strides 8/16/32 (128 L3 + 256 L2 + 512 L1 per span).
+        local_pack_coarse_window: int = 512,
         # Predictive coarse aux ("next-concept" prediction): each coarse node predicts the
         # DETACHED pooled child summary of a strictly-future window at its own level — the LM
         # objective one timescale up. Unlike the reconstruction aux (which rewards summarizing
@@ -2698,10 +2710,19 @@ class HierarchicalFlowGAT(nn.Module):
             int(l) for l in (local_pack_query_levels if local_pack_query_levels is not None else [0])
         ]
         self.local_pack_level_bias = bool(local_pack_level_bias)
+        self.local_pack_coarse_lane = bool(local_pack_coarse_lane)
+        self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
         if self.local_pack_cross_level and int(local_attn_head_dim or 0) > 0:
             raise ValueError(
                 "local_pack_cross_level mixes levels in one attention call and requires the "
                 "shared local q/k/v (set local_attn_head_dim: 0)"
+            )
+        if self.local_pack_coarse_lane and not any(
+            int(l) > 0 for l in self.local_pack_query_levels
+        ):
+            logger.warning(
+                "local_pack_coarse_lane is inert: no coarse level in local_pack_query_levels "
+                "(coarse levels then keep their per-level lateral windows)."
             )
         self.lap_pe_k = lap_pe_k
         self.refinement_style = refinement_style
@@ -5237,6 +5258,30 @@ class HierarchicalFlowGAT(nn.Module):
             "window": window,
             "backend": backend,
         }
+        # Coarse lane: same interleave restricted to L1-L3 rows (subselecting the sorted perm
+        # preserves close-time order, so the causality argument carries over unchanged). The
+        # lane window is denominated in COARSE slots — wide lateral reach at coarse density
+        # prices. Queries: coarse levels that are packed-mode (in query_levels); keys: all.
+        lane_q_levels = tuple(l for l in q_levels if int(l) > 0)
+        if (
+            bool(getattr(self, "local_pack_coarse_lane", False))
+            and len(lane_q_levels) > 0
+            and int(getattr(self, "local_pack_coarse_window", 0)) > 0
+        ):
+            lane_rows = torch.nonzero(lvl_packed > 0, as_tuple=False).view(-1)
+            if lane_rows.numel() > 1:
+                lane_levels = lvl_packed.index_select(0, lane_rows).clamp(0, 3).contiguous()
+                lane_sel_mask = torch.zeros_like(lane_levels, dtype=torch.bool)
+                for l in lane_q_levels:
+                    lane_sel_mask |= lane_levels == int(l)
+                lane_sel = torch.nonzero(lane_sel_mask, as_tuple=False).view(-1)
+                lane_perm = perm.index_select(0, lane_rows).contiguous()
+                spec["lane_perm"] = lane_perm
+                spec["lane_pos"] = pos.index_select(0, lane_rows).contiguous()
+                spec["lane_levels"] = lane_levels
+                spec["lane_query_sel"] = lane_sel
+                spec["lane_query_nodes"] = lane_perm.index_select(0, lane_sel)
+                spec["lane_window"] = int(self.local_pack_coarse_window)
         self._local_pack_spec_cache = (key, spec)
         return spec
 
@@ -6319,6 +6364,9 @@ class HierarchicalFlowGAT(nn.Module):
             d["pack.len"] = float(_ps.get("len", 0))
             d["pack.queries"] = float(_ps.get("queries", 0))
             d["pack.window"] = float(_ps.get("window", 0))
+            if _ps.get("lane_len", 0):
+                d["pack.lane_len"] = float(_ps.get("lane_len", 0))
+                d["pack.lane_window"] = float(_ps.get("lane_window", 0))
         return d
 
     def _maybe_log_gate_monitor(self) -> None:
@@ -11762,6 +11810,9 @@ class HierarchicalFlowGAT(nn.Module):
                 "len": int(_local_pack_spec_fw["num_nodes"]),
                 "queries": int(_local_pack_spec_fw["query_sel"].numel()),
                 "window": int(_local_pack_spec_fw["window"]),
+                "lane_len": int(_local_pack_spec_fw["lane_perm"].numel())
+                if "lane_perm" in _local_pack_spec_fw else 0,
+                "lane_window": int(_local_pack_spec_fw.get("lane_window", 0)),
             }
             if _local_pack_spec_fw is not None
             else None

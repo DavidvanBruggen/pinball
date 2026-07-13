@@ -235,6 +235,8 @@ local_pack_window: 0               # mixed slots; 0 = reuse L0's local window (1
 # local_pack_query_levels: [0]
 # local_pack_level_bias: true      # zero-init per-level K/V tags for the mixed softmax (the
 #                                  # flash-eligible stand-in for the scatter level-pair bias)
+# local_pack_coarse_lane: true    # second packed window over ONLY coarse rows: restores wide
+# local_pack_coarse_window: 896   # coarse lateral reach (896 coarse slots ~= 4096 tokens)
 # => the enabled experiment lives in pinball_wikitext_cleaner_pack.yaml
 norm_type: layernorm
 dropout: 0.1
