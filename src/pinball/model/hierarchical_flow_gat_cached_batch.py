@@ -11456,6 +11456,7 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_src_idx: Optional[torch.Tensor] = None,
         hqd_dst_idx: Optional[torch.Tensor] = None,
         active_levels: Optional[List[int]] = None,
+        xq_gate: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         hqd_edges = None
         if hqd_b_idx is not None and hqd_b_idx.numel() > 0:
@@ -11478,22 +11479,36 @@ class HierarchicalFlowGAT(nn.Module):
             hqd_b_idx_in: torch.Tensor,
             hqd_src_idx_in: torch.Tensor,
             hqd_dst_idx_in: torch.Tensor,
+            xq_gate_in: torch.Tensor,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
             hqd_edges_in = None
             if hqd_b_idx_in.numel() > 0:
                 hqd_edges_in = (hqd_b_idx_in, hqd_src_idx_in, hqd_dst_idx_in)
             edge_type_arg = edge_type_work_in if edge_type_work_in.numel() > 0 else None
-            return transformer(
-                x_in,
-                edge_index_in,
-                node_level_in,
-                level_offsets_in,
-                pos_local_in,
-                edge_attr_work_in,
-                hqd_edges_in,
-                active_levels=active_levels,
-                edge_type=edge_type_arg,
-            )
+            # xq per-query relevance gate: MUST enter as an explicit checkpoint arg, not a
+            # closure/module-attr capture — the reentrant path below calls autograd.backward
+            # internally, and a live-graph closure tensor makes that inner backward walk out
+            # into (and free) the main graph -> "backward through the graph a second time".
+            # Setting the hook attr HERE also means backward recompute re-establishes the
+            # correct per-layer gate snapshot (multi-round re-nomination safe).
+            mp_in = getattr(transformer, "message_passing", None)
+            if mp_in is not None:
+                mp_in._hqd_out_query_gate = xq_gate_in if xq_gate_in.numel() > 0 else None
+            try:
+                return transformer(
+                    x_in,
+                    edge_index_in,
+                    node_level_in,
+                    level_offsets_in,
+                    pos_local_in,
+                    edge_attr_work_in,
+                    hqd_edges_in,
+                    active_levels=active_levels,
+                    edge_type=edge_type_arg,
+                )
+            finally:
+                if mp_in is not None:
+                    mp_in._hqd_out_query_gate = None
 
         if self.use_gradient_checkpointing and torch.is_grad_enabled():
             # HQD/PyG and flash local attention have shown non-reentrant replay issues.
@@ -11510,6 +11525,7 @@ class HierarchicalFlowGAT(nn.Module):
                 hqd_b_idx if hqd_b_idx is not None else torch.empty(0, device=x_bnh.device, dtype=torch.long),
                 hqd_src_idx if hqd_src_idx is not None else torch.empty(0, device=x_bnh.device, dtype=torch.long),
                 hqd_dst_idx if hqd_dst_idx is not None else torch.empty(0, device=x_bnh.device, dtype=torch.long),
+                xq_gate if xq_gate is not None else torch.empty(0, device=x_bnh.device, dtype=x_bnh.dtype),
                 use_reentrant=checkpoint_reentrant,
             )
         else:
@@ -11524,6 +11540,7 @@ class HierarchicalFlowGAT(nn.Module):
                 hqd_b_idx if hqd_b_idx is not None else torch.empty(0, device=x_bnh.device, dtype=torch.long),
                 hqd_src_idx if hqd_src_idx is not None else torch.empty(0, device=x_bnh.device, dtype=torch.long),
                 hqd_dst_idx if hqd_dst_idx is not None else torch.empty(0, device=x_bnh.device, dtype=torch.long),
+                xq_gate if xq_gate is not None else torch.empty(0, device=x_bnh.device, dtype=x_bnh.dtype),
             )
         return x_next, new_edge_attr
 
@@ -12316,17 +12333,17 @@ class HierarchicalFlowGAT(nn.Module):
                 # midpoint) feed subsequent layers through the same ephemeral-edge path, up to
                 # the xq_nominate_max_layers budget (the sparse path costs per layer).
                 # v1 HQD, when enabled, takes precedence on layers where it selected.
+                _xq_gate_cur = None
                 if hqd_b_idx is None and getattr(self, "_xq_nom_edges", None) is not None:
                     _xq_budget = int(getattr(self, "xq_nominate_max_layers", 0))
                     if _xq_budget <= 0 or _xq_nom_layers_used < _xq_budget:
                         hqd_b_idx, hqd_src_idx, hqd_dst_idx = self._xq_nom_edges
                         _xq_nom_layers_used += 1
-                        # per-query relevance gate: this layer's read output is scaled by the
-                        # differentiable gate computed at nomination time (hook attr on the
-                        # message passing; cleared after the layer so it can't go stale).
-                        _mp_gate = getattr(transformer, "message_passing", None)
-                        if _mp_gate is not None and self._xq_query_gate_full is not None:
-                            _mp_gate._hqd_out_query_gate = self._xq_query_gate_full
+                        # per-query relevance gate: carried as an EXPLICIT tensor argument
+                        # through the checkpoint boundary (see _forward_with_hqd — the inner
+                        # reentrant checkpoint double-backwards through attr-captured live
+                        # graphs) and snapshotted per layer for re-nomination correctness.
+                        _xq_gate_cur = self._xq_query_gate_full
 
                 # ~~~~ Transformer step (HQD attention fused in, if edges provided) ~~~~
                 self._hqd_inside_mp_active = bool(select_hqd_inside_mp)
@@ -12366,14 +12383,14 @@ class HierarchicalFlowGAT(nn.Module):
                             _t=transformer, _ei=refine_ei, _nl=base_nl, _lo=base_lo,
                             _pl=pos_local, _ea=edge_attr_work, _et=refine_et,
                             _bi=hqd_b_idx, _si=hqd_src_idx, _di=hqd_dst_idx,
-                            _al=active_compute_levels,
+                            _al=active_compute_levels, _gate=_xq_gate_cur,
                         ):
                             return self._refine_step_true_batch_native(
                                 transformer=_t, x_bnh=x_in, edge_index=_ei,
                                 node_level=_nl, level_offsets=_lo, pos_local=_pl,
                                 edge_attr_work=_ea, edge_type_work=_et,
                                 hqd_b_idx=_bi, hqd_src_idx=_si, hqd_dst_idx=_di,
-                                active_levels=_al,
+                                active_levels=_al, xq_gate=_gate,
                             )
                         x, new_edge_attr = torch.utils.checkpoint.checkpoint(
                             _ckpt_refine, x, use_reentrant=False,
@@ -12392,6 +12409,7 @@ class HierarchicalFlowGAT(nn.Module):
                             hqd_src_idx=hqd_src_idx,
                             hqd_dst_idx=hqd_dst_idx,
                             active_levels=active_compute_levels,
+                            xq_gate=_xq_gate_cur,
                         )
                 finally:
                     self._hqd_inside_mp_active = False
