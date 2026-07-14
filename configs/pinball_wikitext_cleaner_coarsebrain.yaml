@@ -9,6 +9,11 @@
 #   xq_nominate_enable + gate true           — NSA selected branch, selector trained via the gate
 #     (gate + gradient_checkpointing is safe as of 2026-07-13 — the reentrant-checkpoint
 #      double-backward through the attr-captured gate was fixed by explicit-arg plumbing)
+#   local_pack_lane_merge true               — mixed window + coarse lane combined as ONE
+#     unified softmax (LSE merge) for coarse queries instead of two added outputs
+#   pinball_cross_query_ffn_dims [0,1152,...] — fat FFN on the episode's coarse-query rows
+#   pinball_multirate_midpoint_repeats 2     — episode cycled twice (weights TIED across
+#     cycles: compute scales at coarse prices, params don't; adaptive settling later)
 # Fresh runs only — do not warm-start from non-pack checkpoints (L0's local attention
 # distribution changes), and the per-level FFN shapes don't match older checkpoints.
 # Friendly toggles (attn_backend / qkv_sharing / train_mode / use_hqd) expand to the
@@ -40,8 +45,8 @@ muon_adjust_lr_fn: match_rms_adamw
 # Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
-num_epochs: 100
-samples_per_epoch: 3125 #25000 #782 #25000
+num_epochs: 20 #100
+samples_per_epoch: 15625 #3125 #25000 #782 #25000
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
@@ -187,7 +192,7 @@ hier_refresh_compile: true
 # layers (v1 HQD's injection path — works with the static edges dropped; children tables come
 # from window arithmetic, not edge lists). This is the DYNAMIC content-addressed read the
 # recency gathers can't do. OFF for the baseline cleaner run; flip on for the retrieval test.
-xq_nominate_enable: true   # COARSE-BRAIN: ON — the selected/content branch, rerun clean
+xq_nominate_enable: false   # COARSE-BRAIN: ON — the selected/content branch, rerun clean
                            # (the 100ep xq numbers came from frozen cross-query projections)
 # RECALL knobs (stage 1/2 shortlist width). Since the stage-3 scored prune fixes the read
 # at topk_l0 sources/query, widening these grows ONLY the nomination scoring cost (~4.5ms/
@@ -222,7 +227,7 @@ xq_nominate_packed_read: true
 # Per-query relevance gate: read output scaled by sigmoid(w*stage1_top_score + b) — a no-op
 # option for queries with nothing to fetch (ungated reads HURT never-recurring tokens by
 # ~1.6%) and a task gradient into the 0:3 selector q/k (NSA-style selector training).
-xq_nominate_gate_enable: true  # COARSE-BRAIN: ON — no-op option for never-recurring tokens
+xq_nominate_gate_enable: false  # COARSE-BRAIN: ON — no-op option for never-recurring tokens
                                # (the -1.6% regression) + the task gradient into the selector
 # Stage-2 (L1 descent) scoring: local_qk = the layer's trained per-level q/k (the raw-cosine
 # default was a speed placeholder). No new params.
@@ -270,6 +275,20 @@ local_pack_level_bias: true
 # Additive to the coarse queries' main-window read (fine detail stays available there).
 local_pack_coarse_lane: true
 local_pack_coarse_window: 896
+# LSE MERGE: combine the mixed window + coarse lane for coarse queries as ONE unified
+# softmax over the union of both key sets (log-sum-exp merge of the two flash calls)
+# instead of adding two independently-normalized outputs. Parameter-free, per-key
+# context-selective arbitration (each branch weighted by its attention mass); keys in
+# both windows (~28 most recent coarse rows) count twice = +ln2 logit bias, which the
+# level-bias tags can learn against. false = additive (previous behavior, bit-identical).
+local_pack_lane_merge: false   # fallback if flex is unavailable at runtime
+# FLEX UNION: ONE flex_attention call (block-sparse mask over a [coarse|tokens] block-
+# coherent layout) IS the unified softmax over both windows — exact dedup (no +ln2
+# double count), no LSE recompute, still flash-style tiled online softmax (Triton).
+# Microbenched 19ms vs 38ms/step for pair+merge at b4@8196. Supersedes lane_merge when
+# it runs; falls back to merge -> additive on any compile/runtime failure. No
+# attention-prob dropout on this path.
+local_pack_flex_union: false
 norm_type: layernorm
 dropout: 0.1
 
@@ -282,7 +301,7 @@ gen_frontier_consistent: true
 
 # Attention / hierarchy toggles
 attn_backend: flash        # pyg | flash | sdpa
-qkv_sharing: separate      # shared | separate
+qkv_sharing: shared      # shared | separate
 # Tier-3 packed cross-level backbone attention: a dense/batched fast lane for the
 # cross-level message passing (groups each destination's parents into a padded fixed-K
 # block per level, runs [B,Q,K,H,D] attention instead of gather/segment-softmax/scatter).
@@ -497,6 +516,11 @@ pinball_multirate_schedule: midpoint   # "midpoint" fires once after midpoint_la
 # episode wrote into L0/L1 (thinking against a MATURE hierarchy, but not so late that the
 # head reads unintegrated gated residuals). Old runs trained with auto (=6).
 pinball_multirate_midpoint_layer: 9
+# COARSE-BRAIN: cycle the midpoint episode twice. Cycles re-run the SAME refiner weights
+# (tied recurrence) — with the fat per-query-level episode FFNs below, this is iterated
+# coarse computation: compute scales with cycle count at coarse-density prices, params
+# don't. Raise via the adaptive settling block below once a trained run gives tau stats.
+pinball_multirate_midpoint_repeats: 2
 
 # --- Energy-gated adaptive multirate cycling ---------------------------------------------
 # Instead of a fixed number of multirate passes, iterate the block until each node's own
@@ -570,6 +594,11 @@ pinball_cross_query_memory_window: 32768
 pinball_cross_query_backend: auto
 pinball_cross_query_causal: true
 pinball_cross_query_shared_weights: false  # COARSE-BRAIN: unshared episode steps (params 2x, FLOPs =)
+# COARSE-BRAIN: fat FFN on the episode refiners' QUERY rows, indexed by query level (same
+# "processing dim" semantics as per_level_ffn_dims). The 1:3 refiner's FFN runs on the few
+# L1 rows -> 1152; the 0:3 refiner's FFN runs on ALL L0 rows -> 0 keeps it at work_dim
+# (cheap). These weights are what midpoint_repeats re-runs, tied across cycles.
+pinball_cross_query_ffn_dims: [0, 1152, 1152, 1536]
 pinball_cross_query_update_memory_enable: false  # keep L3 read-only in the forward (no abstraction drift)
 pinball_cross_query_selection: global_mean # global_mean (shared top-k) | per_query (per-query top-k, heavier)
 # Residual write scale into the query level. Last run this COLLAPSED 0.01 -> 1e-4 (model gated the

@@ -31,8 +31,8 @@ muon_adjust_lr_fn: match_rms_adamw
 # Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
-num_epochs: 20
-samples_per_epoch: 15625 #3125 #25000 #782 #25000
+num_epochs: 100
+samples_per_epoch: 3125 #15625 #3125 #25000 #782 #25000
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
@@ -72,7 +72,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_hqd/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_pack_deepthink/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -178,7 +178,7 @@ hier_refresh_compile: true
 # layers (v1 HQD's injection path — works with the static edges dropped; children tables come
 # from window arithmetic, not edge lists). This is the DYNAMIC content-addressed read the
 # recency gathers can't do. OFF for the baseline cleaner run; flip on for the retrieval test.
-xq_nominate_enable: true
+xq_nominate_enable: false
 # RECALL knobs (stage 1/2 shortlist width). Since the stage-3 scored prune fixes the read
 # at topk_l0 sources/query, widening these grows ONLY the nomination scoring cost (~4.5ms/
 # round, roughly linear) — NOT the per-layer read. 8 L3 windows ~= 700 tokens of candidate
@@ -212,7 +212,7 @@ xq_nominate_packed_read: true
 # Per-query relevance gate: read output scaled by sigmoid(w*stage1_top_score + b) — a no-op
 # option for queries with nothing to fetch (ungated reads HURT never-recurring tokens by
 # ~1.6%) and a task gradient into the 0:3 selector q/k (NSA-style selector training).
-xq_nominate_gate_enable: true
+xq_nominate_gate_enable: false
 # Stage-2 (L1 descent) scoring: local_qk = the layer's trained per-level q/k (the raw-cosine
 # default was a speed placeholder). No new params.
 xq_nominate_stage2: local_qk
@@ -507,16 +507,16 @@ pinball_multirate_midpoint_layer: 9
 # _last_pinball_multirate_stats: adaptive_cycles / adaptive_energy / adaptive_frozen_frac.
 pinball_multirate_adaptive: false   # default off = existing fixed-repeats behavior
 pinball_multirate_energy_tau: 0.05  # relative-update threshold; lower = more cycles
-pinball_multirate_max_cycles: 1     # hard cap on settling iterations per invocation
+pinball_multirate_max_cycles: 4     # hard cap on settling iterations per invocation
 pinball_multirate_active_rows: true # cycles 2+ only compute unfrozen query rows in the
                                     # cross-query pairs (exact, verified). Eval fwd ~wash
                                     # (launch-bound) but TRAIN step +4.9% and -1.17 GiB
                                     # peak @8k (frozen rows leave the autograd graph)
-pinball_upper_refine_steps: 0     # was 8; deactivated for now (the borderline one)
-pinball_top_refine_steps: 0        # was 16; dead in both monitored runs
-pinball_upper_cross_attn_steps: 0  # was 4; dead in both monitored runs
-pinball_upper_refine_shared_weights: true   # weight-tied = recurrence, tiny param cost
-pinball_top_refine_shared_weights: true
+pinball_upper_refine_steps: 8     # was 8; deactivated for now (the borderline one)
+pinball_top_refine_steps: 4        # was 16; dead in both monitored runs
+pinball_upper_cross_attn_steps: 4  # was 4; dead in both monitored runs
+pinball_upper_refine_shared_weights: false   # weight-tied = recurrence, tiny param cost
+pinball_top_refine_shared_weights: false
 pinball_upper_refine_causal: true
 pinball_top_refine_causal: true
 pinball_upper_refine_window: 128    # 0 = full attention within the (short) level
@@ -532,11 +532,11 @@ pinball_l3_workspace_tokens: 8    # optional: small learned global register on L
 # NOTE: with causal: true + ar_time these run on SDPA (flash is refused when a mask is needed).
 #
 # (1) Upper cross refiner — hardcoded L3 queries <- L2 memory.
-pinball_upper_cross_attn_steps: 0          # master switch; N cross-attn+FFN passes (0 = off; dead in both runs)
+pinball_upper_cross_attn_steps: 4         # master switch; N cross-attn+FFN passes (0 = off; dead in both runs)
 pinball_upper_query_topk_l2: 0             # top-k L2 memory per query; 0 = all L2 (few nodes, fine)
 pinball_upper_cross_attn_backend: auto     # auto | flash | sdpa (auto -> sdpa when causal-masked)
 pinball_upper_cross_attn_causal: true      # mask L2 with ar_time > query ar_time
-pinball_upper_cross_attn_shared_weights: true   # weight-tie across steps (recurrence)
+pinball_upper_cross_attn_shared_weights: false   # weight-tie across steps (recurrence)
 pinball_upper_update_l2_enable: false      # also write gated updates back into L2 (bidirectional)
 pinball_upper_update_l2_scale_init: 0.01
 pinball_upper_cross_write_scale_init: 0.01 # L3 residual write scale (starts ~identity)
@@ -568,7 +568,7 @@ pinball_cross_query_l0_window: 0           # only used when a pair's memory leve
 pinball_cross_query_memory_window: 32768
 pinball_cross_query_backend: auto
 pinball_cross_query_causal: true
-pinball_cross_query_shared_weights: true
+pinball_cross_query_shared_weights: false  # weight-tie across steps (recurrence)
 pinball_cross_query_update_memory_enable: false  # keep L3 read-only in the forward (no abstraction drift)
 pinball_cross_query_selection: global_mean # global_mean (shared top-k) | per_query (per-query top-k, heavier)
 # Residual write scale into the query level. Last run this COLLAPSED 0.01 -> 1e-4 (model gated the

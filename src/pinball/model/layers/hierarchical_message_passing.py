@@ -235,6 +235,18 @@ def attention_forward(
 
 
 
+_FLEX_COMPILED = None
+
+
+def _flex_compiled_singleton():
+    """torch.compile(flex_attention) once per process (shared across layers/models)."""
+    global _FLEX_COMPILED
+    if _FLEX_COMPILED is None:
+        from torch.nn.attention.flex_attention import flex_attention
+        _FLEX_COMPILED = torch.compile(flex_attention, dynamic=False)
+    return _FLEX_COMPILED
+
+
 class EdgeConditioner(nn.Module):
     """Lightweight edge context -> attention bias and value gate."""
 
@@ -405,6 +417,12 @@ class HierarchicalMessagePassing(MessagePassing):
         per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
+        # Unified-softmax combination of the mixed window and the coarse lane for coarse
+        # queries (LSE merge of the two calls) instead of adding the two attention outputs;
+        # see _apply_local_pack_out. False = additive combine (previous behavior).
+        local_pack_lane_merge: bool = False,
+        # ONE flex_attention call with the block-sparse union mask (see model spec builder).
+        local_pack_flex_union: bool = False,
         rope_level_axis_enable: bool = False,
         rope_level_axis_scale: float = 32.0,
         norm_type: str = "rmsnorm",
@@ -489,6 +507,8 @@ class HierarchicalMessagePassing(MessagePassing):
         # q·e_level a query-dependent level bias inside the same softmax (and the V tag lets
         # the output carry its source level). Zero init = bit-identical to untagged at start.
         self.local_pack_level_bias = bool(local_pack_level_bias)
+        self.local_pack_lane_merge = bool(local_pack_lane_merge)
+        self.local_pack_flex_union = bool(local_pack_flex_union)
         if self.local_pack_level_bias:
             self.local_pack_level_k_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
             self.local_pack_level_v_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
@@ -3200,6 +3220,7 @@ class HierarchicalMessagePassing(MessagePassing):
         level: int,
         attn_bias: Optional[torch.Tensor] = None,
         force_sdpa: bool = False,
+        skip_out_proj: bool = False,  # return per-head [B,T,H,D] BEFORE out_proj (for LSE merge)
     ) -> Optional[torch.Tensor]:
         B, T, Hh, Dh = q_lvl.shape
         if T <= 1:
@@ -3216,6 +3237,8 @@ class HierarchicalMessagePassing(MessagePassing):
                 attn_bias=attn_bias,
             )
             if traced_out is not None:
+                if skip_out_proj:
+                    return traced_out.reshape(B, T, Hh, Dh)
                 out_lvl = traced_out.reshape(B, T, Hh * Dh)
                 out_lvl = self.out_proj(out_lvl)
                 return out_lvl
@@ -3306,6 +3329,8 @@ class HierarchicalMessagePassing(MessagePassing):
                 )
             out_lvl = out_h.transpose(1, 2)
 
+        if skip_out_proj:
+            return out_lvl.reshape(B, T, Hh, Dh)
         out_lvl = out_lvl.reshape(B, T, Hh * Dh)
         out_lvl = self.out_proj(out_lvl)
         return out_lvl
@@ -3372,6 +3397,121 @@ class HierarchicalMessagePassing(MessagePassing):
             logger.warning("[HMP:PACK] %s", msg)
             seen.add(msg)
 
+    @staticmethod
+    def _lse_chunk_eager(
+        qc: torch.Tensor, ks: torch.Tensor, pos_v: torch.Tensor, col: torch.Tensor,
+        window: int, scale: float,
+    ) -> torch.Tensor:
+        logits = torch.einsum("bqhd,bshd->bqhs", qc, ks).float() * scale
+        valid = (col <= pos_v) & (col >= pos_v - window)  # [cq, S]
+        logits = logits.masked_fill(~valid.view(1, qc.size(1), 1, ks.size(1)), float("-inf"))
+        return torch.logsumexp(logits, dim=-1)  # [B, cq, H]
+
+    def _lse_chunk_fn(self, device: torch.device):
+        """CUDA: torch.compile the chunk kernel (fuses mask+logsumexp, rematerializes the
+        fp32 logits in backward instead of saving them). Shapes are skeleton-static, so
+        only a handful of graphs compile. Any compile/runtime failure falls back to eager
+        permanently (same pattern as hier_refresh_compile)."""
+        if device.type != "cuda" or getattr(self, "_lse_compile_failed", False):
+            return self._lse_chunk_eager
+        fn = getattr(self, "_lse_chunk_compiled", None)
+        if fn is None:
+            try:
+                fn = torch.compile(self._lse_chunk_eager, dynamic=False)
+            except Exception as exc:  # pragma: no cover - env-dependent
+                self._local_pack_log_once(f"lse compile unavailable ({exc}); eager fallback")
+                self._lse_compile_failed = True
+                return self._lse_chunk_eager
+            self._lse_chunk_compiled = fn
+        return fn
+
+    def _packed_window_lse(
+        self,
+        q_sel: torch.Tensor,   # [B, nq, H, D] queries (post-RoPE), ascending positions
+        k_all: torch.Tensor,   # [B, Nk, H, D] keys (post-RoPE, post level-tag)
+        q_pos: torch.Tensor,   # [nq] long, query positions in k_all row coordinates (ascending)
+        window: int,           # causal sliding window: keys j with q_pos - window <= j <= q_pos
+        chunk: int = 256,
+        pos_host: Optional[List[int]] = None,  # host copy of q_pos (skeleton-static; avoids syncs)
+    ) -> torch.Tensor:
+        """Differentiable per-query softmax log-normalizer of a causal sliding-window
+        attention call (same key range as flash window_size=(window, 0): W+1 keys incl.
+        self). Used by the lane LSE merge; flash's returned LSE is non-differentiable, so
+        the merge weights are recomputed here — chunks of consecutive queries share one
+        contiguous key SLICE (no gathers), logits in fp32 for a stable logsumexp. Returns
+        [B, nq, H]. NOTE: ignores attention-prob dropout (merge weights are computed
+        dropout-free; the merged outputs themselves still carry dropout)."""
+        B, nq, H, D = q_sel.shape
+        scale = 1.0 / math.sqrt(D)
+        w = int(window)
+        if pos_host is None:
+            pos_host = q_pos.tolist()
+        chunk_fn = self._lse_chunk_fn(q_sel.device)
+        pieces: List[torch.Tensor] = []
+        for c0 in range(0, nq, int(chunk)):
+            c1 = min(nq, c0 + int(chunk))
+            k0 = max(0, int(pos_host[c0]) - w)
+            k1 = int(pos_host[c1 - 1]) + 1
+            ks = k_all[:, k0:k1]                       # [B, S, H, D] contiguous slice
+            col = torch.arange(k0, k1, device=k_all.device).view(1, -1)
+            pos_v = q_pos[c0:c1].view(-1, 1)
+            try:
+                pieces.append(chunk_fn(q_sel[:, c0:c1], ks, pos_v, col, w, scale))
+            except Exception as exc:  # pragma: no cover - env-dependent (triton etc.)
+                if chunk_fn is self._lse_chunk_eager:
+                    raise
+                self._local_pack_log_once(f"lse compiled kernel failed ({exc}); eager fallback")
+                self._lse_compile_failed = True
+                chunk_fn = self._lse_chunk_eager
+                pieces.append(chunk_fn(q_sel[:, c0:c1], ks, pos_v, col, w, scale))
+        return torch.cat(pieces, dim=1)
+
+    def _flex_union_attn(
+        self, qp: torch.Tensor, kp: torch.Tensor, vp: torch.Tensor, spec: Dict
+    ) -> torch.Tensor:
+        """One flex_attention call over the [coarse | tokens] split layout with the
+        block-sparse union mask. Inputs are the mixed-order RoPE'd/tagged q/k/v
+        [B, N, H, D]; returns split-order per-head outputs [B, N, H, D] (rows map to
+        nodes via spec["flex_query_nodes"]). The BlockMask is content-independent and
+        cached in the spec (once per skeleton); the compiled kernel is shared."""
+        from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+        perm = spec["flex_perm"]
+        bm = spec.get("flex_block_mask")
+        if bm is None:
+            r = spec["flex_r_mixed"]
+            lane = spec["flex_lane_rank"]
+            isc = spec["flex_is_coarse"]
+            w_mix = int(spec["window"])
+            w_lane = int(spec["lane_window"])
+
+            def mask_mod(b, h, qi, ki):
+                dr = r[qi] - r[ki]
+                band = (dr >= 0) & (dr <= w_mix)
+                dl = lane[qi] - lane[ki]
+                coarse = isc[qi] & isc[ki] & (dl >= 0) & (dl <= w_lane) & (dr >= 0)
+                return band | coarse
+
+            n = int(perm.numel())
+            bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n,
+                                   device=str(perm.device))
+            spec["flex_block_mask"] = bm
+
+        q_s = qp.index_select(1, perm).transpose(1, 2)  # [B, H, N, D]
+        k_s = kp.index_select(1, perm).transpose(1, 2)
+        v_s = vp.index_select(1, perm).transpose(1, 2)
+        # Compiled kernel only for real graphs: the inductor lowering asserts on tiny
+        # sequences (< one mask block, e.g. generation-prefix graphs), and eager flex
+        # (math composite, O(n^2) but n is tiny there) is fine for those.
+        if q_s.is_cuda and int(perm.numel()) >= 512:
+            fn = _flex_compiled_singleton()
+            # Default tiles exceed the workstation Blackwell's 101KB shared memory.
+            out = fn(q_s, k_s, v_s, block_mask=bm,
+                     kernel_options={"BLOCK_M": 64, "BLOCK_N": 64})
+        else:
+            out = flex_attention(q_s, k_s, v_s, block_mask=bm)
+        return out.transpose(1, 2)  # [B, N, H, D] split order
+
     def _apply_local_pack_out(
         self,
         out: torch.Tensor,
@@ -3435,13 +3575,64 @@ class HierarchicalMessagePassing(MessagePassing):
         if getattr(self, "local_pack_level_bias", False) and lvl_packed is not None:
             kp = kp + self.local_pack_level_k_emb.index_select(0, lvl_packed).unsqueeze(0).to(kp.dtype)
             vp = vp + self.local_pack_level_v_emb.index_select(0, lvl_packed).unsqueeze(0).to(vp.dtype)
-        out_pack = self._compute_local_attn_from_qkv(
-            q_lvl=qp, k_lvl=kp, v_lvl=vp,
-            window=window, causal=True,
-            backend=str(spec.get("backend", "sdpa")), level=-1,
-        )
-        if out_pack is None:
-            return set()
+        # FLEX UNION (local_pack_flex_union): ONE flex_attention call over the block-
+        # coherent split layout replaces the mixed call + lane + merge — the block-sparse
+        # mask ("within W mixed slots OR both-coarse within lane_window coarse slots") IS
+        # the union softmax, with exact dedup (OR semantics, no +ln2 double count) and no
+        # LSE recompute. Same flash-style tiled online softmax, Triton-codegen'd. No
+        # attention-prob dropout on this path (flex has no dropout_p). Falls back to the
+        # merge/additive flow below on any failure (permanently, log-once).
+        if (
+            bool(getattr(self, "local_pack_flex_union", False))
+            and "flex_perm" in spec
+            and not getattr(self, "_flex_union_failed", False)
+        ):
+            if set(int(l) for l in spec.get("query_levels", ())) >= {0, 1, 2, 3}:
+                try:
+                    out_flex = self._flex_union_attn(qp, kp, vp, spec)
+                    contrib = self.out_proj(out_flex.reshape(B, out_flex.size(1), -1))
+                    if source_gates is not None:
+                        contrib = source_gates["local"] * contrib
+                    out.index_add_(1, spec["flex_query_nodes"], contrib.to(dtype=out.dtype))
+                    return query_levels
+                except Exception as exc:  # pragma: no cover - env-dependent (triton etc.)
+                    self._local_pack_log_once(f"flex union failed ({exc}); merge/additive fallback")
+                    # Permanent opt-out only for real-graph failures; a tiny-graph hiccup
+                    # (generation prefixes) must not poison the training path.
+                    if int(spec["flex_perm"].numel()) >= 512:
+                        self._flex_union_failed = True
+            else:
+                self._local_pack_log_once("flex union needs all levels queried; merge/additive fallback")
+
+        # LSE merge (local_pack_lane_merge): combine the mixed window and the coarse lane
+        # for coarse queries as ONE softmax over the union of both key sets, instead of
+        # adding two independently-normalized outputs. With Z = exp(lse) per query/head:
+        #   merged = (Z_mixed*attn_mixed + Z_lane*attn_lane) / (Z_mixed + Z_lane)
+        # which is exactly the softmax over the concatenated key lists (keys in both
+        # windows are counted twice — a fixed +ln2 logit bias on the most recent coarse
+        # rows). Weights apply per head BEFORE out_proj, so both calls return raw per-head
+        # outputs here and the mixed projection is applied explicitly (same ops as inside
+        # the helper — bit-identical math).
+        lane_merge = bool(getattr(self, "local_pack_lane_merge", False)) and "lane_perm" in spec
+        out_pack_raw = None
+        if lane_merge:
+            out_pack_raw = self._compute_local_attn_from_qkv(
+                q_lvl=qp, k_lvl=kp, v_lvl=vp,
+                window=window, causal=True,
+                backend=str(spec.get("backend", "sdpa")), level=-1,
+                skip_out_proj=True,
+            )
+            if out_pack_raw is None:
+                return set()
+            out_pack = self.out_proj(out_pack_raw.reshape(B, num_nodes, -1))
+        else:
+            out_pack = self._compute_local_attn_from_qkv(
+                q_lvl=qp, k_lvl=kp, v_lvl=vp,
+                window=window, causal=True,
+                backend=str(spec.get("backend", "sdpa")), level=-1,
+            )
+            if out_pack is None:
+                return set()
         contrib = out_pack.index_select(1, sel)
         if source_gates is not None:
             contrib = source_gates["local"] * contrib
@@ -3469,12 +3660,41 @@ class HierarchicalMessagePassing(MessagePassing):
             if getattr(self, "local_pack_level_bias", False) and lane_levels is not None:
                 kl = kl + self.local_pack_level_k_emb.index_select(0, lane_levels).unsqueeze(0).to(kl.dtype)
                 vl = vl + self.local_pack_level_v_emb.index_select(0, lane_levels).unsqueeze(0).to(vl.dtype)
+            lane_window = int(spec.get("lane_window", 0))
             out_lane = self._compute_local_attn_from_qkv(
                 q_lvl=ql, k_lvl=kl, v_lvl=vl,
-                window=int(spec.get("lane_window", 0)), causal=True,
+                window=lane_window, causal=True,
                 backend=str(spec.get("backend", "sdpa")), level=-2,
+                skip_out_proj=lane_merge,
             )
-            if out_lane is not None:
+            if out_lane is not None and lane_merge:
+                # out already holds the mixed contribution for the lane queries, so write
+                # the DELTA to the merged result: merged - mixed = (1-w)*(attn_lane -
+                # attn_mixed) with w = Z_mixed/(Z_mixed+Z_lane) = sigmoid(lse_m - lse_l).
+                # out_proj's bias cancels in the difference -> bias-free linear.
+                lane_q_packed = spec["lane_query_packed_rows"]  # lane queries' rows in the MIXED packing
+                lane_q_sel = spec["lane_query_sel"]             # lane queries' rows in the LANE packing
+                raw_m = out_pack_raw.index_select(1, lane_q_packed)   # [B, nq, H, D]
+                raw_l = out_lane.index_select(1, lane_q_sel)          # [B, nq, H, D]
+                # Chunk size trades slice overcompute (S ~ stride*chunk + W grows with
+                # chunk) against kernel launches (chunks = nq/chunk). Measured on the
+                # Blackwell at 8196 (tok/s): 64=79.9 256=101.2 512=108.1 1024=108.8
+                # 4096=104.3 — launch-bound until ~1k slices, then overcompute bites.
+                lse_m = self._packed_window_lse(
+                    qp.index_select(1, lane_q_packed), kp, lane_q_packed, window,
+                    chunk=1024, pos_host=spec.get("lane_query_packed_rows_host"),
+                )
+                lse_l = self._packed_window_lse(
+                    ql.index_select(1, lane_q_sel), kl, lane_q_sel, lane_window,
+                    chunk=1024, pos_host=spec.get("lane_query_sel_host"),
+                )
+                w_m = torch.sigmoid(lse_m - lse_l).unsqueeze(-1).to(raw_m.dtype)  # [B,nq,H,1]
+                delta = ((1.0 - w_m) * (raw_l - raw_m)).reshape(B, int(lane_q_sel.numel()), -1)
+                delta = F.linear(delta, self.out_proj.weight)
+                if source_gates is not None:
+                    delta = source_gates["local"] * delta
+                out.index_add_(1, spec["lane_query_nodes"], delta.to(dtype=out.dtype))
+            elif out_lane is not None:
                 lane_contrib = out_lane.index_select(1, spec["lane_query_sel"])
                 if source_gates is not None:
                     lane_contrib = source_gates["local"] * lane_contrib
@@ -4067,6 +4287,8 @@ class HierarchicalTransformerLayer(nn.Module):
         per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
+        local_pack_lane_merge: bool = False,  # LSE-merge the mixed window + coarse lane (unified softmax)
+        local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
         per_level_ffn_dims: Optional[List[int]] = None,  # per-level FFN "processing dim" (inner ~ mult*dim); [] => uniform
         norm_type: str = "layernorm",
         norm_eps: float = 1e-6,
@@ -4146,6 +4368,8 @@ class HierarchicalTransformerLayer(nn.Module):
             per_level_attn_mult=per_level_attn_mult,
             local_attn_head_dim=local_attn_head_dim,
             local_pack_level_bias=local_pack_level_bias,
+            local_pack_lane_merge=local_pack_lane_merge,
+            local_pack_flex_union=local_pack_flex_union,
             norm_type=norm_type,
             norm_eps=norm_eps,
             rope_level_axis_enable=rope_level_axis_enable,

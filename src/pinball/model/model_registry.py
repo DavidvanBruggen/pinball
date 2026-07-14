@@ -161,6 +161,8 @@ def build_pinball_model(
         local_pack_level_bias=bool(getattr(args, "local_pack_level_bias", False)),
         local_pack_coarse_lane=bool(getattr(args, "local_pack_coarse_lane", False)),
         local_pack_coarse_window=int(getattr(args, "local_pack_coarse_window", 512)),
+        local_pack_lane_merge=bool(getattr(args, "local_pack_lane_merge", False)),
+        local_pack_flex_union=bool(getattr(args, "local_pack_flex_union", False)),
         hier_predaux_enable=bool(getattr(args, "hier_predaux_enable", False)),
         lambda_hier_predaux=float(getattr(args, "lambda_hier_predaux", 0.05)),
         hier_predaux_levels=(list(getattr(args, "hier_predaux_levels", None))
@@ -392,6 +394,8 @@ def build_pinball_model(
         pinball_cross_query_backend=str(getattr(args, "pinball_cross_query_backend", "auto")),
         pinball_cross_query_causal=bool(getattr(args, "pinball_cross_query_causal", True)),
         pinball_cross_query_shared_weights=bool(getattr(args, "pinball_cross_query_shared_weights", True)),
+        pinball_cross_query_ffn_dims=(list(getattr(args, "pinball_cross_query_ffn_dims", None))
+                                      if getattr(args, "pinball_cross_query_ffn_dims", None) else None),
         pinball_cross_query_update_memory_enable=bool(getattr(args, "pinball_cross_query_update_memory_enable", False)),
         pinball_cross_query_selection=str(getattr(args, "pinball_cross_query_selection", "global_mean")),
         pinball_cross_query_write_scale_init=float(getattr(args, "pinball_cross_query_write_scale_init", 1.0e-2)),

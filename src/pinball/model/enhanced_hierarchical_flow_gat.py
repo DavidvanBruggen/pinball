@@ -2179,6 +2179,9 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 # cross-entropies in seq-chunks, never materializing the full logits (+ its
                 # softmax/CE backward) -> ~3.3GB saved at B8/T1024/V50257. Not for generation
                 # (logits_last_only), hierarchical-feature returns, or the AE decode head.
+                # (monitor sits before this return: the chunked-CE training forward is the
+                # common case, and returning here would otherwise skip the gate log.)
+                self._maybe_log_gate_monitor()
                 if (bool(getattr(self, "return_token_features", False))
                         and not logits_last_only and not return_hierarchical_features
                         and getattr(self, "_force_decode_head", None) != "ae"):
@@ -2197,7 +2200,6 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                     ae_logits = getattr(self, "_last_autoenc_logits", None)
                     if ae_logits is not None and tuple(ae_logits.shape[:2]) == tuple(logits.shape[:2]):
                         logits = ae_logits.to(device=logits.device, dtype=logits.dtype)
-                self._maybe_log_gate_monitor()
                 #print(logits.shape, " logits shape after projection")
                 if not getattr(self, "_fp_log_once", False):
                     logger.info(

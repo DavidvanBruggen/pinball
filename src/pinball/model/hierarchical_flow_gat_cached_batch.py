@@ -147,10 +147,12 @@ class LowRankAdapter(nn.Module):
 
 
 class PackedSwiGLUFFN(nn.Module):
-    def __init__(self, hidden_dim: int, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int, dropout: float = 0.0, ffn_dim: int = 0):
         super().__init__()
-        # LLaMA-style SwiGLU uses 2/3 of a 4x FFN, i.e. 8/3 * hidden.
-        inner = int((8.0 / 3.0) * int(hidden_dim))
+        # LLaMA-style SwiGLU uses 2/3 of a 4x FFN, i.e. 8/3 * hidden. ffn_dim > 0 overrides
+        # the "processing dim" (same semantics as per_level_ffn_dims: inner ~ 8/3 * ffn_dim),
+        # so coarse-query refiners can carry a fat FFN; 0 = width from hidden_dim (unchanged).
+        inner = int((8.0 / 3.0) * (int(ffn_dim) if int(ffn_dim) > 0 else int(hidden_dim)))
         inner = max(256, ((inner + 255) // 256) * 256)
         self.gate_proj = nn.Linear(hidden_dim, inner, bias=False)
         self.up_proj = nn.Linear(hidden_dim, inner, bias=False)
@@ -379,6 +381,7 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
         selection_mode: str = "global_mean",
         write_scale_init: float = 1.0e-2,
         flash_dtype_cast: bool = False,
+        ffn_dim: int = 0,  # FFN "processing dim" for the query-row FFN (0 = work_dim width)
     ):
         super().__init__()
         work_dim = int(work_dim)
@@ -418,7 +421,10 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
         self.kv_projs = nn.ModuleList([nn.Linear(work_dim, 2 * work_dim, bias=False) for _ in range(block_count)])
         self.out_projs = nn.ModuleList([nn.Linear(work_dim, work_dim, bias=False) for _ in range(block_count)])
         self.ffn_norms = nn.ModuleList([make_norm(work_dim, norm_type=norm_type, eps=norm_eps) for _ in range(block_count)])
-        self.ffns = nn.ModuleList([PackedSwiGLUFFN(work_dim, dropout=dropout) for _ in range(block_count)])
+        # The FFN processes the QUERY rows (the level this refiner writes), so a per-query-
+        # level fat width puts episode capacity where nodes are geometrically few — and
+        # cycling re-runs these same weights (tied across cycles), scaling compute not params.
+        self.ffns = nn.ModuleList([PackedSwiGLUFFN(work_dim, dropout=dropout, ffn_dim=int(ffn_dim)) for _ in range(block_count)])
         self.dropout = nn.Dropout(dropout)
         self.write_scale = nn.Parameter(torch.tensor(float(write_scale_init)))
         self.l2_update_scale = nn.Parameter(torch.tensor(float(update_l2_scale_init)))
@@ -2384,6 +2390,20 @@ class HierarchicalFlowGAT(nn.Module):
         # Lane window in COARSE slots (L1+L2+L3 rows). 896 ~= 4096 tokens of span at
         # strides 8/16/32 (128 L3 + 256 L2 + 512 L1 per span).
         local_pack_coarse_window: int = 512,
+        # Combine the mixed window + coarse lane for coarse queries as ONE unified softmax
+        # over the union of both key sets (log-sum-exp merge of the two flash calls),
+        # instead of adding two independently-normalized outputs. Parameter-free and
+        # context-selective per key: each branch's weight is its share of total attention
+        # mass, so a single relevant lane key can outvote a full mixed window. Keys in both
+        # windows (the ~most recent coarse rows) are counted twice (+ln2 logit bias).
+        # False = additive combine (previous behavior, bit-identical).
+        local_pack_lane_merge: bool = False,
+        # ONE flex_attention call with a block-sparse union mask replaces the mixed call +
+        # lane + merge (exact-dedup unified softmax, no LSE recompute). Needs torch>=2.5,
+        # all levels in query_levels, and the coarse lane on. Falls back to merge/additive
+        # on any failure. NOTE: flex has no attention-prob dropout (residual/FFN dropout
+        # unaffected).
+        local_pack_flex_union: bool = False,
         # Predictive coarse aux ("next-concept" prediction): each coarse node predicts the
         # DETACHED pooled child summary of a strictly-future window at its own level — the LM
         # objective one timescale up. Unlike the reconstruction aux (which rewards summarizing
@@ -2593,6 +2613,13 @@ class HierarchicalFlowGAT(nn.Module):
         pinball_cross_query_backend: str = "auto",
         pinball_cross_query_causal: bool = True,
         pinball_cross_query_shared_weights: bool = True,
+        # Per-QUERY-LEVEL FFN "processing dim" for the episode refiners (index = the
+        # refiner's query_level; 0 or missing = default work_dim width). Same semantics as
+        # per_level_ffn_dims — e.g. [0, 1152, 1152, 1536] fattens the 1:3 refiner's FFN
+        # while the 0:3 refiner (whose FFN runs on the many L0 rows) stays cheap. Cycling
+        # (multirate repeats / adaptive settling) re-runs these weights tied, so extra
+        # cycles scale coarse compute without scaling params.
+        pinball_cross_query_ffn_dims: Optional[List[int]] = None,
         pinball_cross_query_update_memory_enable: bool = False,
         pinball_cross_query_selection: str = "global_mean",
         pinball_cross_query_write_scale_init: float = 1.0e-2,
@@ -2733,6 +2760,8 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_level_bias = bool(local_pack_level_bias)
         self.local_pack_coarse_lane = bool(local_pack_coarse_lane)
         self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
+        self.local_pack_lane_merge = bool(local_pack_lane_merge)
+        self.local_pack_flex_union = bool(local_pack_flex_union)
         if self.local_pack_cross_level and int(local_attn_head_dim or 0) > 0:
             raise ValueError(
                 "local_pack_cross_level mixes levels in one attention call and requires the "
@@ -2872,6 +2901,7 @@ class HierarchicalFlowGAT(nn.Module):
             raise ValueError("pinball_cross_query_backend must be 'auto', 'flash', or 'sdpa'")
         self.pinball_cross_query_causal = bool(pinball_cross_query_causal)
         self.pinball_cross_query_shared_weights = bool(pinball_cross_query_shared_weights)
+        self.pinball_cross_query_ffn_dims = [int(d) for d in (pinball_cross_query_ffn_dims or [])]
         self.pinball_cross_query_update_memory_enable = bool(pinball_cross_query_update_memory_enable)
         self.pinball_cross_query_selection = str(pinball_cross_query_selection).lower().replace("-", "_")
         if self.pinball_cross_query_selection not in {"global_mean", "per_query"}:
@@ -3509,6 +3539,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_level_role_bias_scale=self.local_attn_level_role_bias_scale,
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
+                        local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
+                        local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         cross_level_packed=self.cross_level_packed,
                         cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
@@ -3589,6 +3621,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_level_role_bias_scale=self.local_attn_level_role_bias_scale,
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
+                        local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
+                        local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         cross_level_packed=self.cross_level_packed,
                         cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
@@ -3671,6 +3705,8 @@ class HierarchicalFlowGAT(nn.Module):
                     selection_mode="global_mean",
                     write_scale_init=self.pinball_upper_cross_write_scale_init,
                     flash_dtype_cast=self.local_attn_flash_dtype_cast,
+                    ffn_dim=(self.pinball_cross_query_ffn_dims[3]
+                             if len(self.pinball_cross_query_ffn_dims) > 3 else 0),
                 )
             if self.pinball_cross_query_steps > 0 and self.pinball_cross_query_pairs:
                 for query_level, memory_level in self.pinball_cross_query_pairs:
@@ -3695,6 +3731,8 @@ class HierarchicalFlowGAT(nn.Module):
                             selection_mode=self.pinball_cross_query_selection,
                             write_scale_init=self.pinball_cross_query_write_scale_init,
                             flash_dtype_cast=self.local_attn_flash_dtype_cast,
+                            ffn_dim=(self.pinball_cross_query_ffn_dims[int(query_level)]
+                                     if int(query_level) < len(self.pinball_cross_query_ffn_dims) else 0),
                         )
                     )
             if self.pinball_upper_refine_steps > 0:
@@ -5305,6 +5343,33 @@ class HierarchicalFlowGAT(nn.Module):
                 spec["lane_query_sel"] = lane_sel
                 spec["lane_query_nodes"] = lane_perm.index_select(0, lane_sel)
                 spec["lane_window"] = int(self.local_pack_coarse_window)
+                # For the LSE merge: lane queries' row positions in the MIXED packing (to
+                # fetch their mixed-window output/LSE), plus host copies of both position
+                # arrays so the LSE recompute can slice keys without device syncs.
+                lane_q_packed = lane_rows.index_select(0, lane_sel).contiguous()
+                spec["lane_query_packed_rows"] = lane_q_packed
+                spec["lane_query_packed_rows_host"] = lane_q_packed.tolist()
+                spec["lane_query_sel_host"] = lane_sel.tolist()
+                # FLEX UNION (local_pack_flex_union): ONE flex_attention call replaces the
+                # mixed call + lane + LSE merge — a block-sparse mask expresses the union
+                # key set ("within W mixed slots OR both-coarse within lane_window coarse
+                # slots") as ONE softmax with exact dedup. Block sparsity needs a
+                # block-COHERENT layout: [all coarse rows | all tokens] (each in close
+                # order; the naive interleave scatters coarse at ~22% density and defeats
+                # tile skipping — measured 11x slower). Same key sets via static rank
+                # arrays: r = rank in the mixed packing, lane = rank in the coarse region.
+                # Requires all levels queried (guarded at the consumer).
+                if bool(getattr(self, "local_pack_flex_union", False)):
+                    flex_perm_local = torch.cat([lane_rows, torch.nonzero(lvl_packed == 0, as_tuple=False).view(-1)])
+                    spec["flex_perm"] = flex_perm_local.contiguous()          # split pos -> mixed row
+                    spec["flex_r_mixed"] = flex_perm_local.contiguous()      # mixed rank per split pos
+                    n_lane_rows = int(lane_rows.numel())
+                    ar_split = torch.arange(flex_perm_local.numel(), device=perm.device)
+                    spec["flex_lane_rank"] = torch.where(
+                        ar_split < n_lane_rows, ar_split, torch.zeros_like(ar_split))
+                    spec["flex_is_coarse"] = ar_split < n_lane_rows
+                    spec["flex_query_nodes"] = perm.index_select(0, flex_perm_local)
+                    spec["flex_n_lane"] = n_lane_rows
         self._local_pack_spec_cache = (key, spec)
         return spec
 
