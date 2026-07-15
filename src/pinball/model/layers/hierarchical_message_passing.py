@@ -423,6 +423,13 @@ class HierarchicalMessagePassing(MessagePassing):
         local_pack_lane_merge: bool = False,
         # ONE flex_attention call with the block-sparse union mask (see model spec builder).
         local_pack_flex_union: bool = False,
+        # xq/HQD packed-read fixes: score+read the fetched far tokens with the PRE-RoPE
+        # shared q/k (content-only matching — the RoPE'd L0<->L0 geometry is only trained
+        # inside the local window, so far relative angles are out-of-distribution noise),
+        # and give the read softmax a learned zero-value sink key so a query with no
+        # useful candidates can no-op instead of emitting a forced weighted average.
+        hqd_read_prerope: bool = False,
+        hqd_read_sink: bool = False,
         rope_level_axis_enable: bool = False,
         rope_level_axis_scale: float = 32.0,
         norm_type: str = "rmsnorm",
@@ -512,6 +519,13 @@ class HierarchicalMessagePassing(MessagePassing):
         if self.local_pack_level_bias:
             self.local_pack_level_k_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
             self.local_pack_level_v_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
+        self.hqd_read_prerope = bool(hqd_read_prerope)
+        # Zero-value sink key for the packed fetch read: zero init = sink logit 0 for every
+        # query (a neutral extra softmax slot), so the model learns per-head/per-query how
+        # much fetched content to discard. Value side is implicitly zero (no v param).
+        self.hqd_read_sink_k = (
+            nn.Parameter(torch.zeros(self.num_heads, self.head_dim)) if bool(hqd_read_sink) else None
+        )
         self.l0_local_backend = str(l0_local_backend).lower()
         if self.l0_local_backend not in {"pyg", "flash", "xformers", "sdpa"}:
             self.l0_local_backend = "pyg"
@@ -2019,7 +2033,7 @@ class HierarchicalMessagePassing(MessagePassing):
         if _pack_spec is not None and int(_pack_spec.get("num_nodes", -1)) != int(num_nodes):
             _pack_spec = None
         q_prerope = k_prerope = None
-        if _pack_spec is not None:
+        if _pack_spec is not None or bool(getattr(self, "hqd_read_prerope", False)):
             q_prerope, k_prerope = q, k
 
         pos_rep = None
@@ -2283,6 +2297,13 @@ class HierarchicalMessagePassing(MessagePassing):
         else:
             v_hqd = v
 
+        # Fetch reads span 100s-1000s of tokens; the RoPE'd L0<->L0 geometry is only trained
+        # inside the local window, so with hqd_read_prerope the read matches on content
+        # (pre-RoPE q/k) instead of out-of-distribution far rotations.
+        q_hqd, k_hqd = q, k
+        if bool(getattr(self, "hqd_read_prerope", False)) and q_prerope is not None:
+            q_hqd, k_hqd = q_prerope, k_prerope
+
         if hqd_edges is not None:
             hqd_b_idx, hqd_src_idx, hqd_dst_idx = hqd_edges
             if hqd_src_idx is not None and hqd_src_idx.dim() == 3:
@@ -2290,20 +2311,20 @@ class HierarchicalMessagePassing(MessagePassing):
                 # fixed-K dense read — same math as the per-edge scatter, but GEMM-shaped and
                 # without materializing per-edge q/k/v gathers in autograd.
                 hqd_out = self._compute_hqd_packed_l0_attn(
-                    q=q, k=k, v=v_hqd,
+                    q=q_hqd, k=k_hqd, v=v_hqd,
                     dst_nodes=hqd_dst_idx, candidate_nodes=hqd_src_idx,
                     num_nodes=num_nodes, B=B,
                 )
             elif str(getattr(self, "hqd_attn_impl", "scatter")).lower() == "dense":
                 hqd_out = self._compute_hqd_dense_attn(
-                    q=q, k=k, v=v_hqd,
+                    q=q_hqd, k=k_hqd, v=v_hqd,
                     b_idx=hqd_b_idx, src_idx=hqd_src_idx, dst_idx=hqd_dst_idx,
                     num_nodes=num_nodes, B=B,
                     backend=str(getattr(self, "hqd_dense_backend", "sdpa")).lower(),
                 )
             else:
                 hqd_out = self._compute_hqd_sparse_attn(
-                    q=q, k=k, v=v_hqd,
+                    q=q_hqd, k=k_hqd, v=v_hqd,
                     b_idx=hqd_b_idx, src_idx=hqd_src_idx, dst_idx=hqd_dst_idx,
                     num_nodes=num_nodes, B=B,
                 )
@@ -2320,7 +2341,7 @@ class HierarchicalMessagePassing(MessagePassing):
         if hqd_packed_l0 is not None:
             packed_dst, packed_candidates = hqd_packed_l0
             hqd_out = self._compute_hqd_packed_l0_attn(
-                q=q, k=k, v=v_hqd,
+                q=q_hqd, k=k_hqd, v=v_hqd,
                 dst_nodes=packed_dst, candidate_nodes=packed_candidates,
                 num_nodes=num_nodes, B=B,
             )
@@ -2882,7 +2903,17 @@ class HierarchicalMessagePassing(MessagePassing):
                 q_c = q.index_select(1, dst_nodes[start:end])  # [B,Qc,H,D]
             scores = (q_c.unsqueeze(2) * k_c).sum(dim=-1) / math.sqrt(float(head_dim))  # [B,Qc,K,H]
             scores = scores.masked_fill(~valid.unsqueeze(-1), neg)
+            sink_k = getattr(self, "hqd_read_sink_k", None)
+            if sink_k is not None:
+                # Zero-value sink slot: lets a query dump softmax mass when no candidate is
+                # relevant (a forced read over junk fetches is pure noise otherwise). The
+                # sink logit competes per query/head; its value contribution is zero, so
+                # mass on the sink shrinks the message instead of averaging irrelevant v's.
+                sink_logit = (q_c * sink_k.view(1, 1, num_heads, head_dim).to(dtype=q_c.dtype)).sum(-1)
+                scores = torch.cat([scores, (sink_logit / math.sqrt(float(head_dim))).unsqueeze(2)], dim=2)
             weights = torch.softmax(scores, dim=2)
+            if sink_k is not None:
+                weights = weights[:, :, :K, :]
             weights = torch.where(valid.unsqueeze(-1), weights, torch.zeros_like(weights))
             msg = (weights.unsqueeze(-1) * v_c).sum(dim=2)  # [B,Qc,H,Dv]
             msg = msg.to(dtype=q.dtype)
@@ -4289,6 +4320,8 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
         local_pack_lane_merge: bool = False,  # LSE-merge the mixed window + coarse lane (unified softmax)
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
+        hqd_read_prerope: bool = False,   # xq/HQD fetch read + stage-3 score on PRE-RoPE q/k (content-only)
+        hqd_read_sink: bool = False,      # learned zero-value sink slot in the packed fetch read softmax
         per_level_ffn_dims: Optional[List[int]] = None,  # per-level FFN "processing dim" (inner ~ mult*dim); [] => uniform
         norm_type: str = "layernorm",
         norm_eps: float = 1e-6,
@@ -4370,6 +4403,8 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_level_bias=local_pack_level_bias,
             local_pack_lane_merge=local_pack_lane_merge,
             local_pack_flex_union=local_pack_flex_union,
+            hqd_read_prerope=hqd_read_prerope,
+            hqd_read_sink=hqd_read_sink,
             norm_type=norm_type,
             norm_eps=norm_eps,
             rope_level_axis_enable=rope_level_axis_enable,

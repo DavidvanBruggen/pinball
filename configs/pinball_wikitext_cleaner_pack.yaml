@@ -11,13 +11,13 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 8196 #8196 #16384 #32768 #65536 #131072 #1024
-batch_size: 4
+block_size: 196704 #8196 #16384 #32768 #65536 #131072 #262144 #196704 #1024
+batch_size: 1
 val_split: 0.01
 
 # Training
 train_mode: ar            # ar | masked_diffusion
-learning_rate: 0.0001
+learning_rate: 1e-3 #0.0001
 weight_decay: 0.1
 warmup_steps: 1000
 #max_steps: 20000
@@ -32,7 +32,7 @@ muon_adjust_lr_fn: match_rms_adamw
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
 num_epochs: 20
-samples_per_epoch: 15625 #3125 #25000 #782 #25000
+samples_per_epoch: 651 #15625 #3125 #25000 #782 #25000
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
@@ -72,7 +72,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_hqd/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_ultracontext/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -178,7 +178,7 @@ hier_refresh_compile: true
 # layers (v1 HQD's injection path — works with the static edges dropped; children tables come
 # from window arithmetic, not edge lists). This is the DYNAMIC content-addressed read the
 # recency gathers can't do. OFF for the baseline cleaner run; flip on for the retrieval test.
-xq_nominate_enable: true
+xq_nominate_enable: false
 # RECALL knobs (stage 1/2 shortlist width). Since the stage-3 scored prune fixes the read
 # at topk_l0 sources/query, widening these grows ONLY the nomination scoring cost (~4.5ms/
 # round, roughly linear) — NOT the per-layer read. 8 L3 windows ~= 700 tokens of candidate
@@ -212,10 +212,18 @@ xq_nominate_packed_read: true
 # Per-query relevance gate: read output scaled by sigmoid(w*stage1_top_score + b) — a no-op
 # option for queries with nothing to fetch (ungated reads HURT never-recurring tokens by
 # ~1.6%) and a task gradient into the 0:3 selector q/k (NSA-style selector training).
-xq_nominate_gate_enable: true
+xq_nominate_gate_enable: false
 # Stage-2 (L1 descent) scoring: local_qk = the layer's trained per-level q/k (the raw-cosine
 # default was a speed placeholder). No new params.
 xq_nominate_stage2: local_qk
+# 2026-07-15 far-fetch fixes. prerope: the RoPE'd L0<->L0 geometry is only trained inside the
+# ~128-token local window, so scoring/reading fetches at true far rotations is OOD noise ->
+# the selector retreats near (mean_dist collapsed 2k -> 990 over the last run). Pre-RoPE q/k
+# = content-only matching for the stage-3 prune + the packed read. sink: learned zero-value
+# slot in the read softmax so a query with no useful candidates can no-op (the forced read is
+# why first-occurrence tokens measured WORSE with xq on). Fresh-run knobs for the read path.
+xq_nominate_read_prerope: true
+xq_nominate_read_sink: true
 # NOTE (2026-07-10): the pre-v2.1 nomination projected the 0:3 refiner q/k inside no_grad
 # UNDER AUTOCAST — the first-call bf16 weight-cast cache then fed a DETACHED cast to the
 # multirate episode's grad-mode call, so the cross-query projections received NO gradient
@@ -243,7 +251,7 @@ xq_nominate_stage2: local_qk
 # the open question is whether the coarse-lateral repositioning hurts or helps quality.
 # Fall back to query_levels [0] to keep coarse laterals untouched (+2% cost instead).
 local_pack_cross_level: true
-local_pack_window: 156             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const)
+local_pack_window: 1248             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const) # 156 624 1248
 local_pack_query_levels: [0, 1, 2, 3]
 # Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
 # bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
@@ -489,7 +497,7 @@ token_unet_lookahead_decode_enable: false
 # runs (scales stuck ~0.01-0.02); upper_refiner was borderline (L3 self-refine 0.04, L2 ~0.002)
 # and is deactivated FOR NOW, not removed — re-enable by raising its steps. steps: 0 skips
 # building the module entirely. Only the downward cross-query pairs below still run here.
-pinball_multirate_enable: true
+pinball_multirate_enable: false
 pinball_multirate_schedule: midpoint   # "midpoint" fires once after midpoint_layer; "after_full_stack" = after ALL layers
 # Placement of the multirate/thinking episode: "auto" = mid-stack (layer 6 of 12).
 # Prelude -> loop -> coda shape: 9 leaves 3 coda layers to locally mix + decode what the

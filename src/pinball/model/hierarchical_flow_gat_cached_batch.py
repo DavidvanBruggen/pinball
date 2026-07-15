@@ -2404,6 +2404,12 @@ class HierarchicalFlowGAT(nn.Module):
         # on any failure. NOTE: flex has no attention-prob dropout (residual/FFN dropout
         # unaffected).
         local_pack_flex_union: bool = False,
+        # xq/HQD fetch-read fixes (see mp layer): score+read fetched far tokens with the
+        # PRE-RoPE q/k (the RoPE'd L0<->L0 geometry is untrained past the local window ->
+        # far fetches read as noise, the selector learns to stay near), and a learned
+        # zero-value sink slot so junk fetches can no-op inside the read softmax.
+        xq_nominate_read_prerope: bool = False,
+        xq_nominate_read_sink: bool = False,
         # Predictive coarse aux ("next-concept" prediction): each coarse node predicts the
         # DETACHED pooled child summary of a strictly-future window at its own level — the LM
         # objective one timescale up. Unlike the reconstruction aux (which rewards summarizing
@@ -2762,6 +2768,8 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.local_pack_flex_union = bool(local_pack_flex_union)
+        self.xq_nominate_read_prerope = bool(xq_nominate_read_prerope)
+        self.xq_nominate_read_sink = bool(xq_nominate_read_sink)
         if self.local_pack_cross_level and int(local_attn_head_dim or 0) > 0:
             raise ValueError(
                 "local_pack_cross_level mixes levels in one attention call and requires the "
@@ -3541,6 +3549,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
+                        hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
+                        hqd_read_sink=bool(getattr(self, "xq_nominate_read_sink", False)),
                         cross_level_packed=self.cross_level_packed,
                         cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
@@ -3623,6 +3633,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
+                        hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
+                        hqd_read_sink=bool(getattr(self, "xq_nominate_read_sink", False)),
                         cross_level_packed=self.cross_level_packed,
                         cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
@@ -5570,7 +5582,12 @@ class HierarchicalFlowGAT(nn.Module):
                     x0n = norm1(x0)
                     q0r = mp.q_proj(x0n).view(B, n0, mp.num_heads, mp.head_dim)
                     k0r = mp.k_proj(x0n).view(B, n0, mp.num_heads, mp.head_dim)
-                    if hasattr(mp, "rotary_pos_enc"):
+                    # read_prerope: the read matches on content (pre-RoPE), so score the
+                    # prune the same way — RoPE'd far dots decay with distance and would
+                    # bias stage 3 toward near candidates the read then disagrees with.
+                    if hasattr(mp, "rotary_pos_enc") and not bool(
+                        getattr(self, "xq_nominate_read_prerope", False)
+                    ):
                         pos0 = torch.arange(n0, device=dev).view(1, -1).expand(B, -1).reshape(-1)
                         q0r = mp.rotary_pos_enc.apply_rotary_pos_emb(
                             q0r.reshape(B * n0, mp.num_heads, mp.head_dim), pos0

@@ -6,14 +6,19 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt #./data/wikitext_combined.txt
-block_size: 8196 #16384 #32768 #1024
-batch_size: 2
+block_size: 262144 #8196 #16384 #32768 #65536 #131072 #262144 #1024
+batch_size: 1
 val_split: 0.01
 
-num_epochs: 100
-samples_per_epoch: 3125 #25000 #782 #25000
-gradient_accumulation_steps: 2  # accumulate grads over N batches before an optimizer step
+num_epochs: 20
+samples_per_epoch: 15625 #3125 #25000 #782 #25000
+gradient_accumulation_steps: 1  # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
+# Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
+# in seq-chunks of `chunked_ce_seq_chunk`, never materializing the full [B,T,vocab] logits (+ its
+# softmax/CE backward). 
+train_feature_chunked_ce_enable: true
+chunked_ce_seq_chunk: 64
 # Long-context diagnostic: every N validations, log next-token PPL bucketed by in-context
 # recurrence distance (never / <128 / 128-511 / 512-2k / >2k). Cheap — reuses the val batches,
 # no extra forward. The split that matters: <128 (inside local window) vs >=128 (needs the
@@ -26,10 +31,10 @@ longctx_diag_every: 1
 gen_prompt_tokens: 512
 gen_max_new_tokens: 512
 save_every: 0
-checkpoint_dir: ./transformer/checkpoints_gpt2_longcontext_test_small
+checkpoint_dir: ./transformer/checkpoints_superlong_context_test
 
 train_mode: ar
-learning_rate: 0.0003
+learning_rate: 1e-3 #0.0001
 weight_decay: 0.1
 #max_steps: 20000
 warmup_steps: 1000
