@@ -2404,6 +2404,9 @@ class HierarchicalFlowGAT(nn.Module):
         # on any failure. NOTE: flex has no attention-prob dropout (residual/FFN dropout
         # unaffected).
         local_pack_flex_union: bool = False,
+        # Bidi pack (MaskGIT/diffusion): when the runtime causal flags are off, run the packed
+        # windows two-sided instead of skipping pack. flex_union/lane_merge -> additive in bidi.
+        local_pack_bidirectional: bool = False,
         # xq/HQD fetch-read fixes (see mp layer): score+read fetched far tokens with the
         # PRE-RoPE q/k (the RoPE'd L0<->L0 geometry is untrained past the local window ->
         # far fetches read as noise, the selector learns to stay near), and a learned
@@ -2768,6 +2771,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.local_pack_flex_union = bool(local_pack_flex_union)
+        self.local_pack_bidirectional = bool(local_pack_bidirectional)
         self.xq_nominate_read_prerope = bool(xq_nominate_read_prerope)
         self.xq_nominate_read_sink = bool(xq_nominate_read_sink)
         if self.local_pack_cross_level and int(local_attn_head_dim or 0) > 0:
@@ -3549,6 +3553,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
+                        local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
                         hqd_read_sink=bool(getattr(self, "xq_nominate_read_sink", False)),
                         cross_level_packed=self.cross_level_packed,
@@ -3633,6 +3638,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
+                        local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
                         hqd_read_sink=bool(getattr(self, "xq_nominate_read_sink", False)),
                         cross_level_packed=self.cross_level_packed,

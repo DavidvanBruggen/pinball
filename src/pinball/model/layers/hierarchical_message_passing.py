@@ -423,6 +423,14 @@ class HierarchicalMessagePassing(MessagePassing):
         local_pack_lane_merge: bool = False,
         # ONE flex_attention call with the block-sparse union mask (see model spec builder).
         local_pack_flex_union: bool = False,
+        # Bidirectional pack (MaskGIT/diffusion): when the runtime causal flags are OFF,
+        # run the packed mixed window + coarse lane as symmetric two-sided windows instead
+        # of skipping pack entirely. Bidi has no AR order to leak, so the "closed window"
+        # staggering is unnecessary — a node reads past AND future neighbors/coarse
+        # summaries (incl. its own open parent). Reach becomes +-window slots per side.
+        # flex_union/lane_merge stay causal-only (their masks/LSE recompute assume the
+        # causal window) -> the additive combine is used.
+        local_pack_bidirectional: bool = False,
         # xq/HQD packed-read fixes: score+read the fetched far tokens with the PRE-RoPE
         # shared q/k (content-only matching — the RoPE'd L0<->L0 geometry is only trained
         # inside the local window, so far relative angles are out-of-distribution noise),
@@ -516,6 +524,7 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_level_bias = bool(local_pack_level_bias)
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.local_pack_flex_union = bool(local_pack_flex_union)
+        self.local_pack_bidirectional = bool(local_pack_bidirectional)
         if self.local_pack_level_bias:
             self.local_pack_level_k_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
             self.local_pack_level_v_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
@@ -3568,9 +3577,22 @@ class HierarchicalMessagePassing(MessagePassing):
         # falls back to the per-level path (never silently wrong).
         global_causal_gate = bool(getattr(self, "local_attn_runtime_causal_gate", True))
         l0_causal = bool(getattr(self, "l0_local_runtime_causal", self.l0_local_causal_default))
+        pack_causal = True
         if not (global_causal_gate and l0_causal):
-            self._local_pack_log_once("non-causal runtime flags; packed cross-level local skipped")
-            return set()
+            if bool(getattr(self, "local_pack_bidirectional", False)):
+                # Bidirectional (MaskGIT/diffusion): nothing to leak, so the packed windows
+                # simply become symmetric two-sided (+-window slots) — a node reads past AND
+                # future neighbors/coarse summaries, including its own open parent.
+                pack_causal = False
+                if bool(getattr(self, "local_pack_flex_union", False)) or bool(
+                    getattr(self, "local_pack_lane_merge", False)
+                ):
+                    self._local_pack_log_once(
+                        "bidirectional pack: flex_union/lane_merge are causal-only; additive combine"
+                    )
+            else:
+                self._local_pack_log_once("non-causal runtime flags; packed cross-level local skipped")
+                return set()
         if getattr(self, "local_attn_runtime_group", None) is not None or bool(
             getattr(self, "local_attn_runtime_sampled", False)
         ):
@@ -3616,6 +3638,7 @@ class HierarchicalMessagePassing(MessagePassing):
         if (
             bool(getattr(self, "local_pack_flex_union", False))
             and "flex_perm" in spec
+            and pack_causal  # flex mask encodes the causal window; bidi -> additive path
             and not getattr(self, "_flex_union_failed", False)
         ):
             if set(int(l) for l in spec.get("query_levels", ())) >= {0, 1, 2, 3}:
@@ -3644,12 +3667,14 @@ class HierarchicalMessagePassing(MessagePassing):
         # rows). Weights apply per head BEFORE out_proj, so both calls return raw per-head
         # outputs here and the mixed projection is applied explicitly (same ops as inside
         # the helper — bit-identical math).
-        lane_merge = bool(getattr(self, "local_pack_lane_merge", False)) and "lane_perm" in spec
+        lane_merge = (
+            bool(getattr(self, "local_pack_lane_merge", False)) and "lane_perm" in spec and pack_causal
+        )
         out_pack_raw = None
         if lane_merge:
             out_pack_raw = self._compute_local_attn_from_qkv(
                 q_lvl=qp, k_lvl=kp, v_lvl=vp,
-                window=window, causal=True,
+                window=window, causal=pack_causal,
                 backend=str(spec.get("backend", "sdpa")), level=-1,
                 skip_out_proj=True,
             )
@@ -3659,7 +3684,7 @@ class HierarchicalMessagePassing(MessagePassing):
         else:
             out_pack = self._compute_local_attn_from_qkv(
                 q_lvl=qp, k_lvl=kp, v_lvl=vp,
-                window=window, causal=True,
+                window=window, causal=pack_causal,
                 backend=str(spec.get("backend", "sdpa")), level=-1,
             )
             if out_pack is None:
@@ -3669,9 +3694,9 @@ class HierarchicalMessagePassing(MessagePassing):
             contrib = source_gates["local"] * contrib
         out.index_add_(1, tgt, contrib.to(dtype=out.dtype))
 
-        # Coarse lane: second packed causal window over ONLY the coarse rows (close-time
-        # order preserved by construction), restoring wide coarse LATERAL reach at coarse
-        # density prices — additive to the coarse queries' main-window read above.
+        # Coarse lane: second packed window (causal in AR mode, two-sided in bidi) over ONLY
+        # the coarse rows (close-time order preserved by construction), restoring wide coarse
+        # LATERAL reach at coarse density prices — additive to the main-window read above.
         lane_perm = spec.get("lane_perm", None)
         if lane_perm is not None:
             n_lane = int(lane_perm.numel())
@@ -3694,7 +3719,7 @@ class HierarchicalMessagePassing(MessagePassing):
             lane_window = int(spec.get("lane_window", 0))
             out_lane = self._compute_local_attn_from_qkv(
                 q_lvl=ql, k_lvl=kl, v_lvl=vl,
-                window=lane_window, causal=True,
+                window=lane_window, causal=pack_causal,
                 backend=str(spec.get("backend", "sdpa")), level=-2,
                 skip_out_proj=lane_merge,
             )
@@ -4320,6 +4345,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
         local_pack_lane_merge: bool = False,  # LSE-merge the mixed window + coarse lane (unified softmax)
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
+        local_pack_bidirectional: bool = False,  # bidi (MaskGIT/diffusion): two-sided packed windows
         hqd_read_prerope: bool = False,   # xq/HQD fetch read + stage-3 score on PRE-RoPE q/k (content-only)
         hqd_read_sink: bool = False,      # learned zero-value sink slot in the packed fetch read softmax
         per_level_ffn_dims: Optional[List[int]] = None,  # per-level FFN "processing dim" (inner ~ mult*dim); [] => uniform
@@ -4403,6 +4429,7 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_level_bias=local_pack_level_bias,
             local_pack_lane_merge=local_pack_lane_merge,
             local_pack_flex_union=local_pack_flex_union,
+            local_pack_bidirectional=local_pack_bidirectional,
             hqd_read_prerope=hqd_read_prerope,
             hqd_read_sink=hqd_read_sink,
             norm_type=norm_type,

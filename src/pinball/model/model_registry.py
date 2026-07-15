@@ -163,6 +163,7 @@ def build_pinball_model(
         local_pack_coarse_window=int(getattr(args, "local_pack_coarse_window", 512)),
         local_pack_lane_merge=bool(getattr(args, "local_pack_lane_merge", False)),
         local_pack_flex_union=bool(getattr(args, "local_pack_flex_union", False)),
+        local_pack_bidirectional=bool(getattr(args, "local_pack_bidirectional", False)),
         xq_nominate_read_prerope=bool(getattr(args, "xq_nominate_read_prerope", False)),
         xq_nominate_read_sink=bool(getattr(args, "xq_nominate_read_sink", False)),
         hier_predaux_enable=bool(getattr(args, "hier_predaux_enable", False)),
