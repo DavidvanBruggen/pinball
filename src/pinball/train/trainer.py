@@ -3382,7 +3382,7 @@ class EnhancedHierarchicalTrainer:
             vq_model_name = str(getattr(self, "image_maskgit_vq_model_name", "")).strip()
             if not vq_model_name:
                 raise ValueError("image_maskgit_vq_model_name is required for image_maskgit_variant=discrete")
-            from model.image_maskgit_vq import ImageMaskGITVQTokenizer
+            from pinball.model.image_maskgit_vq import ImageMaskGITVQTokenizer
 
             tok = ImageMaskGITVQTokenizer.from_pretrained(vq_model_name, device=target_device)
             self._image_maskgit_vq_tokenizer = tok

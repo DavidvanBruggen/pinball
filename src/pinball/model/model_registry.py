@@ -164,6 +164,11 @@ def build_pinball_model(
         local_pack_lane_merge=bool(getattr(args, "local_pack_lane_merge", False)),
         local_pack_flex_union=bool(getattr(args, "local_pack_flex_union", False)),
         local_pack_bidirectional=bool(getattr(args, "local_pack_bidirectional", False)),
+        spatial_curve=str(getattr(args, "spatial_curve", "none")),
+        spatial_dims=(list(getattr(args, "spatial_dims", None))
+                      if getattr(args, "spatial_dims", None) else None),
+        local_pack_rope_axial=bool(getattr(args, "local_pack_rope_axial", False)),
+        hier_downward_bidi_parent=bool(getattr(args, "hier_downward_bidi_parent", False)),
         xq_nominate_read_prerope=bool(getattr(args, "xq_nominate_read_prerope", False)),
         xq_nominate_read_sink=bool(getattr(args, "xq_nominate_read_sink", False)),
         hier_predaux_enable=bool(getattr(args, "hier_predaux_enable", False)),

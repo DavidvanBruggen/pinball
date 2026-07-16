@@ -2559,6 +2559,20 @@ class HierarchicalFlowGAT(nn.Module):
         graph_geometry_mode: str = "sequence",  # "sequence" | "grid2d"
         graph_grid_height: int = 0,
         graph_grid_width: int = 0,
+        # Curve mode: reorder L0 tokens ONCE by a space-filling curve after the stem (inverse
+        # at output). Sequence-mode 1D windows then pool contiguous curve ranges = compact
+        # spatial blocks (exact quadtree at comp 4 / overlap 0 / pow2 grids). Geometry stays
+        # "sequence" so pack/skeleton/refresh all run. See layers/spatial_curve.py.
+        spatial_curve: str = "none",            # "none" | "hilbert" | "morton" | "raster"
+        spatial_dims: Optional[List[int]] = None,  # e.g. [32, 32]; fallback graph_grid_h/w, then sqrt
+        # Axial ND RoPE for the packed cross-level local path: spec carries true ND coords
+        # (L0 = curve coords, coarse = child-window centroid) so pack attention scores use
+        # exact spatial offsets instead of 1D curve-index rotations. Needs spatial_curve on.
+        local_pack_rope_axial: bool = False,
+        # Bidi downward refresh: gather each fine node's CONTAINING parent (nearest window
+        # center) instead of "most recent closed" — the spatially-correct variant for
+        # MaskGIT/diffusion. LEAKS under AR (own parent's window contains the token).
+        hier_downward_bidi_parent: bool = False,
         graph_spatial_metric: str = "chebyshev",  # "chebyshev" | "manhattan"
         graph_downsample_factor: int = 2,
         class_cond_enable: bool = False,
@@ -2798,6 +2812,19 @@ class HierarchicalFlowGAT(nn.Module):
         self.graph_geometry_mode = geom_mode
         self.graph_grid_height = max(0, int(graph_grid_height))
         self.graph_grid_width = max(0, int(graph_grid_width))
+        self.spatial_curve = str(spatial_curve or "none").lower()
+        self.spatial_dims = tuple(int(d) for d in spatial_dims) if spatial_dims else None
+        self.local_pack_rope_axial = bool(local_pack_rope_axial)
+        self.hier_downward_bidi_parent = bool(hier_downward_bidi_parent)
+        self._spatial_curve_dev_cache: Dict = {}   # (dims, curve, device) -> (perm, inv, coords)
+        self._active_spatial_curve = None           # set per forward: (perm, inv, coords) or None
+        self._spatial_curve_coords_l0 = None        # [T, ndim] coords in CURVE order (this forward)
+        self._spatial_curve_warned = False
+        if self.hier_downward_bidi_parent and bool(hier_ar_enable):
+            logger.warning(
+                "hier_downward_bidi_parent with hier_ar_enable: the containing parent's window "
+                "includes the token itself — this LEAKS under AR training. Bidi/MaskGIT only."
+            )
         metric = str(graph_spatial_metric).lower()
         if metric not in {"chebyshev", "manhattan"}:
             logger.warning("Unknown graph_spatial_metric='%s'; falling back to 'chebyshev'", metric)
@@ -3554,6 +3581,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
+                        local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
                         hqd_read_sink=bool(getattr(self, "xq_nominate_read_sink", False)),
                         cross_level_packed=self.cross_level_packed,
@@ -3639,6 +3667,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
+                        local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
                         hqd_read_sink=bool(getattr(self, "xq_nominate_read_sink", False)),
                         cross_level_packed=self.cross_level_packed,
@@ -4144,7 +4173,60 @@ class HierarchicalFlowGAT(nn.Module):
         if side * side == token_len:
             return (side, side)
         return None
-    
+
+    def _resolve_spatial_curve(self, seq_len_graph: int, device) -> Optional[tuple]:
+        """(perm, inv_perm, coords) on `device` for curve mode, or None (raster passthrough).
+
+        Deliberately separate from _resolve_l0_grid_shape_for_tokens: that helper is the
+        grid2d-machinery gate; curve mode runs with graph_geometry_mode == "sequence".
+        Dims priority: spatial_dims (prod must equal seq_len_graph) -> (graph_grid_height,
+        graph_grid_width) -> exact square sqrt -> warn-once + None.
+        """
+        curve = str(getattr(self, "spatial_curve", "none")).lower()
+        if curve in ("", "none"):
+            return None
+        T = int(seq_len_graph)
+        if T <= 1:
+            return None
+        dims = None
+        sd = getattr(self, "spatial_dims", None)
+        if sd:
+            prod = 1
+            for d in sd:
+                prod *= int(d)
+            if prod == T:
+                dims = tuple(int(d) for d in sd)
+        if dims is None:
+            gh = int(getattr(self, "graph_grid_height", 0))
+            gw = int(getattr(self, "graph_grid_width", 0))
+            if gh > 0 and gw > 0 and gh * gw == T:
+                dims = (gh, gw)
+        if dims is None:
+            side = int(round(math.sqrt(T)))
+            if side * side == T:
+                dims = (side, side)
+        if dims is None:
+            if not getattr(self, "_spatial_curve_warned", False):
+                logger.warning(
+                    "spatial_curve='%s': cannot resolve grid dims for seq_len %d "
+                    "(spatial_dims=%s, grid %dx%d); raster passthrough.",
+                    curve, T, sd,
+                    int(getattr(self, "graph_grid_height", 0)),
+                    int(getattr(self, "graph_grid_width", 0)),
+                )
+                self._spatial_curve_warned = True
+            return None
+        key = (dims, curve, str(device))
+        hit = self._spatial_curve_dev_cache.get(key)
+        if hit is None:
+            from .layers.spatial_curve import build_curve
+            perm, inv_perm, coords = build_curve(dims, curve)
+            hit = (perm.to(device), inv_perm.to(device), coords.to(device))
+            if len(self._spatial_curve_dev_cache) > 16:
+                self._spatial_curve_dev_cache.clear()
+            self._spatial_curve_dev_cache[key] = hit
+        return hit
+
     def _get_embeddings(self, input_ids, position_ids=None, max_seq_len=None):
         """
         Get token embeddings with rotary positional encoding.
@@ -5261,6 +5343,7 @@ class HierarchicalFlowGAT(nn.Module):
         offsets = self._level_offsets_list(level_offsets)
         num_levels = len(offsets) - 1
         allow_same = bool(getattr(self, "hier_ar_allow_same_time", True))
+        bidi_parent = bool(getattr(self, "hier_downward_bidi_parent", False))
         t = node_ar_time.to(torch.long)
         plan: Dict[str, tuple] = {}
         for q in range(num_levels - 1):
@@ -5272,6 +5355,26 @@ class HierarchicalFlowGAT(nn.Module):
                 m_time = t[offsets[m] : offsets[m + 1]]
                 if q_time.numel() == 0 or m_time.numel() == 0:
                     continue
+                if bidi_parent:
+                    # Bidi (MaskGIT/diffusion) variant: each fine node reads its CONTAINING
+                    # parent (nearest window center under the same 1D rule as
+                    # _pooled_seed_indices, chained q -> m so "my L3 = parent of my L2 =
+                    # parent of my L1"), not the last-closed-along-the-sequence node. In
+                    # curve mode this is the spatial ancestor. LEAKS under AR (the parent
+                    # window contains the token) — ctor warns on that combination.
+                    n_q = int(offsets[q + 1] - offsets[q])
+                    idx = torch.arange(n_q, device=t.device, dtype=torch.float32)
+                    for l in range(q + 1, m + 1):
+                        comp = int(self.compression_ratios[l - 1])
+                        stride = max(1, int(comp * (1 - self.overlap_ratios[l - 1])))
+                        n_parent = int(offsets[l + 1] - offsets[l])
+                        idx = torch.round((idx - (comp - 1) / 2.0) / stride).clamp_(
+                            0, max(0, n_parent - 1)
+                        )
+                    chosen = idx.long()
+                    valid = torch.ones((1, n_q, 1), dtype=torch.bool, device=t.device)
+                    plan[pair] = (chosen, valid)
+                    continue
                 sorted_t, sidx = torch.sort(m_time)
                 pos = torch.searchsorted(sorted_t, q_time, right=allow_same) - 1
                 valid = (pos >= 0).view(1, -1, 1)
@@ -5279,6 +5382,45 @@ class HierarchicalFlowGAT(nn.Module):
                 plan[pair] = (chosen, valid)
         self._downward_gather_plan_cache = (key, plan)
         return plan
+
+    def _local_pack_node_coords(
+        self, level_offsets: torch.Tensor, n_total: int
+    ) -> Optional[torch.Tensor]:
+        """[n_total, ndim] float32 per-node ND coords for the packed-local axial RoPE
+        (local_pack_rope_axial). L0 rows = the curve-mode coords (CURVE order, one per L0
+        node); level l>=1 rows = centroid of the child window's coords under the SAME 1D
+        window rule (reusing _pooled_seed_indices tables), chained bottom-up so an L2
+        centroid averages L1 centroids. Returns None when no curve is active or when
+        n_total != level_offsets[-1] (appended AE-decoder L0' nodes — don't guess tail
+        coords; the consumer falls back to 1D close-time RoPE)."""
+        coords0 = getattr(self, "_spatial_curve_coords_l0", None)
+        if coords0 is None:
+            return None
+        offsets = self._level_offsets_list(level_offsets)
+        if int(offsets[-1]) != int(n_total):
+            if not getattr(self, "_pack_axial_tail_warned", False):
+                logger.info(
+                    "local_pack_rope_axial: %d extra non-hierarchy nodes present; "
+                    "1D close-time RoPE fallback for this graph shape.",
+                    int(n_total) - int(offsets[-1]),
+                )
+                self._pack_axial_tail_warned = True
+            return None
+        level_sizes = [int(offsets[i + 1] - offsets[i]) for i in range(len(offsets) - 1)]
+        if level_sizes[0] != int(coords0.size(0)):
+            return None
+        device = coords0.device
+        cur = coords0.to(torch.float32)
+        parts = [cur]
+        tables = self._pooled_seed_indices(level_sizes, device)
+        for lvl in range(1, len(level_sizes)):
+            child_idx, parent_idx, counts = tables[lvl - 1]
+            cent = torch.zeros(level_sizes[lvl], cur.size(1), device=device, dtype=torch.float32)
+            cent.index_add_(0, parent_idx, cur.index_select(0, child_idx))
+            cent = cent / counts.to(torch.float32).unsqueeze(-1)
+            parts.append(cent)
+            cur = cent
+        return torch.cat(parts, dim=0)
 
     def _local_pack_build_spec(
         self,
@@ -5337,6 +5479,13 @@ class HierarchicalFlowGAT(nn.Module):
             "window": window,
             "backend": backend,
         }
+        # Axial ND RoPE (local_pack_rope_axial): true ND coords per packed row (curve mode).
+        # The layer re-RoPEs q/k with exact spatial offsets instead of 1D close-time index;
+        # missing pos_nd (text runs, AE-extended graphs) keeps the 1D behavior.
+        if bool(getattr(self, "local_pack_rope_axial", False)):
+            pos_nd_all = self._local_pack_node_coords(level_offsets, n_total)
+            if pos_nd_all is not None:
+                spec["pos_nd"] = pos_nd_all.index_select(0, perm).contiguous()
         # Coarse lane: same interleave restricted to L1-L3 rows (subselecting the sorted perm
         # preserves close-time order, so the causality argument carries over unchanged). The
         # lane window is denominated in COARSE slots — wide lateral reach at coarse density
@@ -5357,6 +5506,8 @@ class HierarchicalFlowGAT(nn.Module):
                 lane_perm = perm.index_select(0, lane_rows).contiguous()
                 spec["lane_perm"] = lane_perm
                 spec["lane_pos"] = pos.index_select(0, lane_rows).contiguous()
+                if "pos_nd" in spec:
+                    spec["lane_pos_nd"] = spec["pos_nd"].index_select(0, lane_rows).contiguous()
                 spec["lane_levels"] = lane_levels
                 spec["lane_query_sel"] = lane_sel
                 spec["lane_query_nodes"] = lane_perm.index_select(0, lane_sel)

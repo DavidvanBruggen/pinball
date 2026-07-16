@@ -431,6 +431,10 @@ class HierarchicalMessagePassing(MessagePassing):
         # flex_union/lane_merge stay causal-only (their masks/LSE recompute assume the
         # causal window) -> the additive combine is used.
         local_pack_bidirectional: bool = False,
+        # Axial ND RoPE for the packed local path: when the spec carries pos_nd (true ND
+        # coords from curve mode), re-RoPE q/k with exact spatial offsets instead of the
+        # 1D close-time positions. No-op unless the model attaches pos_nd to the spec.
+        local_pack_rope_axial: bool = False,
         # xq/HQD packed-read fixes: score+read the fetched far tokens with the PRE-RoPE
         # shared q/k (content-only matching — the RoPE'd L0<->L0 geometry is only trained
         # inside the local window, so far relative angles are out-of-distribution noise),
@@ -525,6 +529,7 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.local_pack_flex_union = bool(local_pack_flex_union)
         self.local_pack_bidirectional = bool(local_pack_bidirectional)
+        self.local_pack_rope_axial = bool(local_pack_rope_axial)
         if self.local_pack_level_bias:
             self.local_pack_level_k_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
             self.local_pack_level_v_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
@@ -3614,7 +3619,20 @@ class HierarchicalMessagePassing(MessagePassing):
         qp = q_pre.index_select(1, perm)
         kp = k_pre.index_select(1, perm)
         vp = v.index_select(1, perm)
-        if hasattr(self, "rotary_pos_enc") and pos is not None:
+        pos_nd = spec.get("pos_nd", None) if bool(getattr(self, "local_pack_rope_axial", False)) else None
+        if hasattr(self, "rotary_pos_enc") and pos_nd is not None:
+            # Axial ND RoPE (curve mode): rotate with TRUE spatial coords — exact (dy, dx)
+            # relative offsets in every packed score, direction-aware and block-invariant.
+            # apply_rotary_pos_emb dispatches axial on [N, nd] positions automatically.
+            nd = int(pos_nd.size(-1))
+            pos_rep = pos_nd.view(1, num_nodes, nd).expand(B, num_nodes, nd).reshape(B * num_nodes, nd)
+            qp = self.rotary_pos_enc.apply_rotary_pos_emb(
+                qp.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep
+            ).view(B, num_nodes, self.num_heads, self.head_dim)
+            kp = self.rotary_pos_enc.apply_rotary_pos_emb(
+                kp.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep
+            ).view(B, num_nodes, self.num_heads, self.head_dim)
+        elif hasattr(self, "rotary_pos_enc") and pos is not None:
             pos_rep = pos.view(1, num_nodes).expand(B, num_nodes).reshape(-1)
             qp = self.rotary_pos_enc.apply_rotary_pos_emb(
                 qp.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep
@@ -3704,7 +3722,17 @@ class HierarchicalMessagePassing(MessagePassing):
             kl = k_pre.index_select(1, lane_perm)
             vl = v.index_select(1, lane_perm)
             lane_pos = spec.get("lane_pos", None)
-            if hasattr(self, "rotary_pos_enc") and lane_pos is not None:
+            lane_pos_nd = spec.get("lane_pos_nd", None) if pos_nd is not None else None
+            if hasattr(self, "rotary_pos_enc") and lane_pos_nd is not None:
+                nd = int(lane_pos_nd.size(-1))
+                lane_pos_rep = lane_pos_nd.view(1, n_lane, nd).expand(B, n_lane, nd).reshape(B * n_lane, nd)
+                ql = self.rotary_pos_enc.apply_rotary_pos_emb(
+                    ql.reshape(B * n_lane, self.num_heads, self.head_dim), lane_pos_rep
+                ).view(B, n_lane, self.num_heads, self.head_dim)
+                kl = self.rotary_pos_enc.apply_rotary_pos_emb(
+                    kl.reshape(B * n_lane, self.num_heads, self.head_dim), lane_pos_rep
+                ).view(B, n_lane, self.num_heads, self.head_dim)
+            elif hasattr(self, "rotary_pos_enc") and lane_pos is not None:
                 lane_pos_rep = lane_pos.view(1, n_lane).expand(B, n_lane).reshape(-1)
                 ql = self.rotary_pos_enc.apply_rotary_pos_emb(
                     ql.reshape(B * n_lane, self.num_heads, self.head_dim), lane_pos_rep
@@ -4346,6 +4374,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_lane_merge: bool = False,  # LSE-merge the mixed window + coarse lane (unified softmax)
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
         local_pack_bidirectional: bool = False,  # bidi (MaskGIT/diffusion): two-sided packed windows
+        local_pack_rope_axial: bool = False,  # axial ND RoPE on the packed path (curve-mode coords)
         hqd_read_prerope: bool = False,   # xq/HQD fetch read + stage-3 score on PRE-RoPE q/k (content-only)
         hqd_read_sink: bool = False,      # learned zero-value sink slot in the packed fetch read softmax
         per_level_ffn_dims: Optional[List[int]] = None,  # per-level FFN "processing dim" (inner ~ mult*dim); [] => uniform
@@ -4430,6 +4459,7 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_lane_merge=local_pack_lane_merge,
             local_pack_flex_union=local_pack_flex_union,
             local_pack_bidirectional=local_pack_bidirectional,
+            local_pack_rope_axial=local_pack_rope_axial,
             hqd_read_prerope=hqd_read_prerope,
             hqd_read_sink=hqd_read_sink,
             norm_type=norm_type,

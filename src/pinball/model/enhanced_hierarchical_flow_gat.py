@@ -1945,6 +1945,18 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
             )
             self._last_forward_graph_log_key = forward_graph_key
 
+        # Curve mode: reorder the graph-resolution L0 tokens by the space-filling curve
+        # (spatial_curve knob). Everything downstream (1D windows, pack, refresh) then
+        # operates on spatially compact contiguous blocks; outputs are inverse-permuted
+        # back to raster before any consumer sees them (see the inversion below the
+        # refinement call). Applied at GRAPH resolution so it composes with a coarse-
+        # tokenize U-Net (curve over the coarse grid).
+        _curve = self._resolve_spatial_curve(int(seq_len_graph), token_embeddings_bt.device)
+        self._active_spatial_curve = _curve
+        self._spatial_curve_coords_l0 = _curve[2] if _curve is not None else None
+        if _curve is not None:
+            token_embeddings_bt = token_embeddings_bt.index_select(1, _curve[0])
+
         reveal_target_ids_graph = reveal_target_ids
         reveal_mask_graph = reveal_mask
         if token_unet_decode_context is not None:
@@ -1953,6 +1965,12 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 reveal_mask=reveal_mask,
                 coarse_len=seq_len_graph,
             )
+        # Reveal tensors are per-L0-position and arrive raster-ordered from the trainer:
+        # map to coarse FIRST (raster contiguity), then into curve order to match L0.
+        if _curve is not None and reveal_target_ids_graph is not None:
+            reveal_target_ids_graph = reveal_target_ids_graph.index_select(1, _curve[0])
+            if reveal_mask_graph is not None:
+                reveal_mask_graph = reveal_mask_graph.index_select(1, _curve[0])
 
         #print(token_embeddings_bt.shape, " shape of token embeddings")
         # Flatten for graph processing (legacy/slow path expects this shape)
@@ -2115,6 +2133,13 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                         getattr(refined_graph, "node_ar_time", None),
                         int(seq_len_graph),
                     )
+                # Curve mode: back to RASTER here — after _copredict_inject (which gathers by
+                # node_ar_time and must see curve order) and before the token-unet decode
+                # (whose encoder skips are raster). This single inversion makes every
+                # downstream consumer raster-correct: the return_token_features early return,
+                # logits_last_only/_index, the full-logits return, and the lookahead logits.
+                if _curve is not None:
+                    token_features = token_features.index_select(1, _curve[1])
                 token_unet_lookahead_features = None
                 need_token_unet_lookahead_logits = bool(getattr(self, "_token_unet_emit_lookahead_logits", False))
                 if token_unet_decode_context is not None:
@@ -2133,6 +2158,18 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                     ds, de = int(ae_slice[0]), int(ae_slice[1])
                     if de > ds:
                         dec_feats = x_final[:, ds:de, :].to(self.output_projection.weight.device, non_blocking=True)
+                        # Curve mode: the AE-decoder L0' mirror is curve-ordered like L0; its
+                        # logits are consumed against raster targets (and can become the MAIN
+                        # logits via _force_decode_head == "ae").
+                        if _curve is not None:
+                            if int(de - ds) == int(seq_len_graph):
+                                dec_feats = dec_feats.index_select(1, _curve[1])
+                            elif not getattr(self, "_curve_ae_len_warned", False):
+                                logger.warning(
+                                    "spatial_curve: AE decode slice len %d != seq_len_graph %d; "
+                                    "skipping raster inversion for it.", int(de - ds), int(seq_len_graph),
+                                )
+                                self._curve_ae_len_warned = True
                         if token_unet_decode_context is not None:
                             dec_feats, _ = self._token_unet_decode_from_graph(dec_feats, token_unet_decode_context)
                         dec_len = int(dec_feats.size(1))
@@ -2223,6 +2260,14 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                             feats.append(x_final[s:e])
                     else:
                         feats = [x_final[:seq_len_graph]]
+                    # Curve mode: raster-invert the L0 slice only; coarse levels are curve-
+                    # range blobs with no raster analogue (left in curve/close order).
+                    if _curve is not None and len(feats) > 0:
+                        f0 = feats[0]
+                        if f0.dim() >= 2 and int(f0.size(1)) == int(seq_len_graph):
+                            feats[0] = f0.index_select(1, _curve[1])
+                        elif int(f0.size(0)) == int(seq_len_graph):
+                            feats[0] = f0.index_select(0, _curve[1])
                     return logits, feats
 
                 return logits
