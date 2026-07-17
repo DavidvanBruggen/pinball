@@ -2307,6 +2307,14 @@ class HierarchicalFlowGAT(nn.Module):
         # generation varies lengths every step and would trigger recompile storms; eval/gen
         # stay eager (numerics differ ~1e-6 from fusion, training-side only).
         hier_refresh_compile: bool = False,
+        # Compile each refinement LAYER's forward (the whole per-layer step: qkv, pack spec
+        # consumption, local flash, FFN, gates) — the widest compileable region below the
+        # model-level forward (whose cache bookkeeping/timing side effects break dynamo).
+        # Targets the launch-bound regime (short sequences, e.g. image grids: profiling at
+        # T=64 showed ~15k tiny kernels/step vs ~10ms of GEMM). Training mode only, lazy,
+        # probation fallback to eager on first runtime failure (same policy as
+        # hier_refresh_compile; both knobs compose — the refreshes live outside the layers).
+        hier_layer_compile: bool = False,
         # HQD v2 — cross-query-guided nomination (NSA-style selective sparse attention). At the
         # multirate midpoint, each L0 query scores the CLOSED L3 windows using the 0:3
         # cross-query refiner's TRAINED q/k (per-query, causal — never global_mean), descends
@@ -3944,6 +3952,7 @@ class HierarchicalFlowGAT(nn.Module):
             logger.info("Per-layer downward refresh enabled for pairs %s (every %d layer(s), gate init %.3g).",
                         pair_keys, self.hier_downward_refresh_every, float(hier_downward_refresh_gate_init))
         self.hier_refresh_compile = bool(hier_refresh_compile)
+        self.hier_layer_compile = bool(hier_layer_compile)
 
         # --- HQD v2: cross-query-guided nomination (see _cross_query_nominate) ---
         self.xq_nominate_enable = bool(xq_nominate_enable)
@@ -5327,6 +5336,53 @@ class HierarchicalFlowGAT(nn.Module):
 
             fn = _probation
             setattr(self, cache_attr, fn)
+        return fn
+
+    def _layer_callable(self, transformer):
+        """torch.compile'd refinement-layer forward in training mode when hier_layer_compile
+        is on (fixed train shapes -> one compile per layer; fuses the eager orchestration
+        around the flash/pack calls — the launch-bound cost at short sequences). Same lazy +
+        probation policy as _refresh_callable: first runtime failure logs once and falls back
+        to eager permanently. Eval/generation always eager (varying shapes would recompile).
+
+        The 12 layers share one forward code object, so dynamo needs a cache slot per module
+        instance — bump cache_size_limit once so late layers don't silently stay eager."""
+        if not (getattr(self, "hier_layer_compile", False) and self.training):
+            return transformer
+        fn = getattr(transformer, "_pinball_compiled_forward", None)
+        if fn is None:
+            try:
+                import torch._dynamo as _dynamo
+                _dynamo.config.cache_size_limit = max(int(_dynamo.config.cache_size_limit), 64)
+                # Warm the backend-resolution dict EAGERLY so dynamo traces the constant
+                # dict-hit path instead of the get_device_name miss branch (a break per call).
+                try:
+                    from .layers.hierarchical_message_passing import pick_attention_backend
+                    pick_attention_backend(next(transformer.parameters()).device)
+                except Exception:
+                    pass
+                compiled = torch.compile(transformer.forward, dynamic=False)
+            except Exception as e:
+                logger.warning("hier_layer_compile: torch.compile unavailable (%s); staying eager.", e)
+                transformer._pinball_compiled_forward = transformer.forward
+                return transformer.forward
+
+            def _probation(*args, _c=compiled, _t=transformer, **kwargs):
+                try:
+                    out = _c(*args, **kwargs)
+                except Exception as err:
+                    logger.warning(
+                        "hier_layer_compile: compiled layer failed at runtime (%s: %s); "
+                        "falling back to eager permanently.",
+                        type(err).__name__, err,
+                    )
+                    _t._pinball_compiled_forward = _t.forward
+                    return _t.forward(*args, **kwargs)
+                _t._pinball_compiled_forward = _c  # first success -> cache the raw compiled fn
+                return out
+
+            fn = _probation
+            transformer._pinball_compiled_forward = fn
         return fn
 
     def _downward_gather_plan(self, level_offsets: torch.Tensor, node_ar_time: torch.Tensor) -> Dict[str, tuple]:
@@ -11734,7 +11790,8 @@ class HierarchicalFlowGAT(nn.Module):
             if mp_in is not None:
                 mp_in._hqd_out_query_gate = xq_gate_in if xq_gate_in.numel() > 0 else None
             try:
-                return transformer(
+                layer_fn = self._layer_callable(transformer)
+                return layer_fn(
                     x_in,
                     edge_index_in,
                     node_level_in,

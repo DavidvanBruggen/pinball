@@ -4529,28 +4529,29 @@ class EnhancedHierarchicalTrainer:
                         x0_rgb = self._rgb_to_centered(pixel_values) if bool(self.image_rgb_centered_diffusion) else pixel_values
                         noise_rgb = torch.randn_like(x0_rgb)
                         x_t_rgb = torch.sqrt(ab) * x0_rgb + torch.sqrt(1.0 - ab) * noise_rgb
-                        x_t_tokens, decode_context = self._encode_pixels_rgb_unet_tokens(
-                            x_t_rgb,
-                            model_ref=model_to_use,
-                            class_labels=class_labels,
-                            timesteps=t,
-                        )
-                        tok = int(x_t_tokens.size(1))
-                        attn = torch.ones((bsz, tok), device=x_t_tokens.device, dtype=torch.long)
-                        pred_tokens = model_to_use(x_t_tokens, attention_mask=attn, class_labels=class_labels, timesteps=t)
-                        pred_tokens_fit = self._fit_pred_to_target(
-                            pred_tokens,
-                            x_t_tokens,
-                            context="val/rgb_unet_rgb_epsilon_tokens",
-                        )
-                        pred_eps_rgb = self._decode_rgb_unet_tokens_to_pixels(
-                            pred_tokens_fit,
-                            decode_context,
-                            model_ref=model_to_use,
-                            class_labels=class_labels,
-                            timesteps=t,
-                        )
-                        pr = pred_eps_rgb
+                        with self._image_sampling_amp_ctx():
+                            x_t_tokens, decode_context = self._encode_pixels_rgb_unet_tokens(
+                                x_t_rgb,
+                                model_ref=model_to_use,
+                                class_labels=class_labels,
+                                timesteps=t,
+                            )
+                            tok = int(x_t_tokens.size(1))
+                            attn = torch.ones((bsz, tok), device=x_t_tokens.device, dtype=torch.long)
+                            pred_tokens = model_to_use(x_t_tokens, attention_mask=attn, class_labels=class_labels, timesteps=t)
+                            pred_tokens_fit = self._fit_pred_to_target(
+                                pred_tokens,
+                                x_t_tokens,
+                                context="val/rgb_unet_rgb_epsilon_tokens",
+                            )
+                            pred_eps_rgb = self._decode_rgb_unet_tokens_to_pixels(
+                                pred_tokens_fit,
+                                decode_context,
+                                model_ref=model_to_use,
+                                class_labels=class_labels,
+                                timesteps=t,
+                            )
+                        pr = pred_eps_rgb.float()
                         tg = self._diffusion_target_from_x0_noise(x0=x0_rgb, noise=noise_rgb, alpha_bar_t=ab.view(bsz))
                         if pr.shape != tg.shape:
                             msg = f"val/rgb_unet_rgb_epsilon_pixels shape mismatch: pred={tuple(pr.shape)} target={tuple(tg.shape)}"
@@ -4566,7 +4567,9 @@ class EnhancedHierarchicalTrainer:
                         self._record_image_debug_stats(pr, tg, t)
                         loss = self._weighted_mse_loss(pr, tg, alpha_bar_t=ab.view(bsz))
                     else:
-                        x0, _ = self._encode_pixels_rgb_unet_tokens(pixel_values, model_ref=model_to_use)
+                        with self._image_sampling_amp_ctx():
+                            x0, _ = self._encode_pixels_rgb_unet_tokens(pixel_values, model_ref=model_to_use)
+                        x0 = x0.float()
                         bsz, tok, _ = x0.shape
                         sched = self._get_image_diffusion_params(device=x0.device)
                         alpha_bars = sched["alpha_bars"]
@@ -4575,7 +4578,9 @@ class EnhancedHierarchicalTrainer:
                         noise = torch.randn_like(x0)
                         x_t = torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
                         attn = torch.ones((bsz, tok), device=x0.device, dtype=torch.long)
-                        pred = model_to_use(x_t, attention_mask=attn, class_labels=class_labels, timesteps=t)
+                        with self._image_sampling_amp_ctx():
+                            pred = model_to_use(x_t, attention_mask=attn, class_labels=class_labels, timesteps=t)
+                        pred = pred.float()
                         target = self._diffusion_target_from_x0_noise(x0=x0, noise=noise, alpha_bar_t=ab.view(bsz))
                         pred_fit = self._fit_pred_to_target(
                             pred,
@@ -4595,7 +4600,9 @@ class EnhancedHierarchicalTrainer:
                     noise = torch.randn_like(x0)
                     x_t = torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
                     attn = torch.ones((bsz, tok), device=x0.device, dtype=torch.long)
-                    pred = model_to_use(x_t, attention_mask=attn, class_labels=class_labels, timesteps=t)
+                    with self._image_sampling_amp_ctx():
+                        pred = model_to_use(x_t, attention_mask=attn, class_labels=class_labels, timesteps=t)
+                    pred = pred.float()
                     target = self._diffusion_target_from_x0_noise(x0=x0, noise=noise, alpha_bar_t=ab.view(bsz))
                     pred_fit = self._fit_pred_to_target(
                         pred,

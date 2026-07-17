@@ -39,6 +39,10 @@ class TransformerConfig:
     class_cond_enable: bool = False
     num_classes: int = 0
     class_cond_drop_prob: float = 0.1
+    # torch.compile each block's forward in training mode (parity knob with pinball's
+    # hier_layer_compile so speed comparisons stay fair). Lazy, probation fallback to
+    # eager on first runtime failure; eval/generation stay eager (shape-varying).
+    compile_blocks: bool = False
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -73,6 +77,26 @@ class RotaryEmbedding(nn.Module):
             return q, k
 
         bsz, _, seq_len, _ = q.shape
+        if torch.compiler.is_compiling():
+            # Traceable path: the cached-table sizing below needs position_ids.max().item()
+            # (graph break + sync per layer). Compute cos/sin directly from the positions —
+            # the same float32 outer product _build_cache uses, so values are identical.
+            if position_ids is None:
+                pos = torch.arange(seq_len, device=q.device, dtype=torch.float32).view(1, seq_len)
+            else:
+                pos = position_ids.to(device=q.device, dtype=torch.long).clamp_min(0).float()
+            freqs = pos.unsqueeze(-1) * self.inv_freq.to(device=q.device, dtype=torch.float32).view(1, 1, -1)
+            emb = torch.repeat_interleave(freqs, repeats=2, dim=-1)
+            cos = emb.cos().to(dtype=q.dtype).view(pos.size(0), 1, seq_len, self.rotary_dim)
+            sin = emb.sin().to(dtype=q.dtype).view(pos.size(0), 1, seq_len, self.rotary_dim)
+            q_rot = q[..., : self.rotary_dim]
+            k_rot = k[..., : self.rotary_dim]
+            q_pass = q[..., self.rotary_dim :]
+            k_pass = k[..., self.rotary_dim :]
+            q_rot = (q_rot * cos) + (_rotate_half(q_rot) * sin)
+            k_rot = (k_rot * cos) + (_rotate_half(k_rot) * sin)
+            return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
+
         needed_len = int(seq_len)
         if position_ids is not None and position_ids.numel() > 0:
             needed_len = max(needed_len, int(position_ids.max().item()) + 1)
@@ -278,7 +302,44 @@ class TransformerLM(nn.Module):
         self._last_copy_dst_token_count = 0
         self._last_objective_loss = None
         self._last_transformer_attn_backend = "unknown"
+        self.compile_blocks = bool(config.compile_blocks)
         self.apply(self._init_weights)
+
+    def _block_callable(self, block: nn.Module):
+        """torch.compile'd block forward in training mode when compile_blocks is on —
+        the parity knob for pinball's hier_layer_compile (same lazy + probation policy:
+        first runtime failure logs once and falls back to eager permanently). Eval and
+        generation stay eager (varying shapes would recompile every step)."""
+        if not (self.compile_blocks and self.training):
+            return block
+        fn = getattr(block, "_compiled_forward", None)
+        if fn is None:
+            try:
+                import torch._dynamo as _dynamo
+                _dynamo.config.cache_size_limit = max(int(_dynamo.config.cache_size_limit), 64)
+                compiled = torch.compile(block.forward, dynamic=False)
+            except Exception as e:
+                logger.warning("transformer_compile: torch.compile unavailable (%s); staying eager.", e)
+                block._compiled_forward = block.forward
+                return block
+
+            def _probation(*args, _c=compiled, _b=block, **kwargs):
+                try:
+                    out = _c(*args, **kwargs)
+                except Exception as err:
+                    logger.warning(
+                        "transformer_compile: compiled block failed at runtime (%s: %s); "
+                        "falling back to eager permanently.",
+                        type(err).__name__, err,
+                    )
+                    _b._compiled_forward = _b.forward
+                    return _b.forward(*args, **kwargs)
+                _b._compiled_forward = _c
+                return out
+
+            fn = _probation
+            block._compiled_forward = fn
+        return fn
 
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -335,11 +396,17 @@ class TransformerLM(nn.Module):
             x = x * (1.0 + torch.sigmoid(gamma).unsqueeze(1)) + beta.unsqueeze(1)
         x = self.drop(x)
 
+        # Resolve the "mask is all-ones" shortcut ONCE here (eager, outside the compiled
+        # blocks) instead of per-layer inside attention: passing None down lets every block
+        # take the fast is_causal SDPA path with no .item() sync/graph break per layer.
+        if attention_mask is not None and bool(attention_mask.to(dtype=torch.bool).all().item()):
+            attention_mask = None
+
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
                 x = checkpoint(block, x, attention_mask, position_ids, use_reentrant=False)
             else:
-                x = block(x, attention_mask=attention_mask, position_ids=position_ids)
+                x = self._block_callable(block)(x, attention_mask=attention_mask, position_ids=position_ids)
 
         x = self.ln_f(x)
         logits = self.output_projection(x)

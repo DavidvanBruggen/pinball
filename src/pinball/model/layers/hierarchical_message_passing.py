@@ -171,6 +171,12 @@ def _pick_attention_backend_cached(device_index: int, cap_major: int, cap_minor:
     return "sdpa", None
 
 
+# Plain per-device-index resolution cache. The lru_cache above is opaque to dynamo (it
+# inlines into the body -> get_device_name graph-breaks in every compiled layer); a warm
+# dict hit here is constant-folded instead. Warmed eagerly by _layer_callable before compile.
+_BACKEND_RESOLVED: Dict[int, Tuple[str, Optional[Callable[..., Any]]]] = {}
+
+
 def pick_attention_backend(device: Optional[torch.device] = None) -> Tuple[str, Optional[Callable[..., Any]]]:
     """Select the best available attention backend for the requested CUDA device."""
     if not torch.cuda.is_available():
@@ -183,8 +189,13 @@ def pick_attention_backend(device: Optional[torch.device] = None) -> Tuple[str, 
         return "sdpa", None
 
     device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+    hit = _BACKEND_RESOLVED.get(device_index)
+    if hit is not None:
+        return hit
     cap_major, cap_minor = torch.cuda.get_device_capability(device_index)
-    return _pick_attention_backend_cached(device_index, int(cap_major), int(cap_minor))
+    out = _pick_attention_backend_cached(device_index, int(cap_major), int(cap_minor))
+    _BACKEND_RESOLVED[device_index] = out
+    return out
 
 
 def attention_forward(
@@ -1022,6 +1033,11 @@ class HierarchicalMessagePassing(MessagePassing):
         return start, end
 
     def _batched_dst_index_flat(self, dst: torch.Tensor, batch_size: int, num_nodes: int) -> torch.Tensor:
+        if torch.compiler.is_compiling():
+            # Traceable path: the identity cache below keys on data_ptr(), which dynamo
+            # can't trace (graph break per layer). Just compute — inductor CSEs it.
+            batch_offsets = (torch.arange(int(batch_size), device=dst.device, dtype=torch.long) * int(num_nodes)).view(int(batch_size), 1)
+            return (dst.view(1, -1) + batch_offsets).reshape(-1)
         cache = getattr(self, "_batched_dst_index_cache", {})
         key = (int(dst.data_ptr()), int(batch_size), int(num_nodes), str(dst.device))
         cached = cache.get(key)
@@ -1298,7 +1314,8 @@ class HierarchicalMessagePassing(MessagePassing):
                     if has_edge_attr:
                         logits = self._add_edge_attr_to_chunk_logits(logits, edge_attr_in, edge_ids_block, B, num_edges, q_i)
                     idx_flat = (dst_inverse_block.view(1, -1) + (torch.arange(B, device=device, dtype=torch.long) * unique_count_block).view(B, 1)).reshape(-1)
-                    weights = softmax(logits.reshape(B * edge_count_block, self.num_heads), idx_flat)
+                    weights = softmax(logits.reshape(B * edge_count_block, self.num_heads), idx_flat,
+                                      num_nodes=int(B) * int(unique_count_block))
                     if dropout_p > 0.0:
                         weights = F.dropout(weights, p=dropout_p, training=True)
                     messages = v_j * weights.view(B, edge_count_block, self.num_heads).unsqueeze(-1)
@@ -1881,7 +1898,9 @@ class HierarchicalMessagePassing(MessagePassing):
             index_flat = (dst_inverse.view(1, -1) + batch_offsets).reshape(-1)
             if active_level_set is None:
                 attn = self._apply_graph_trace_bias(attn, num_edges)
-            attn_flat = softmax(attn.reshape(B * num_edges, self.num_heads), index_flat)
+            # num_nodes passed explicitly (avoids maybe_num_nodes' index.max() sync/graph break)
+            attn_flat = softmax(attn.reshape(B * num_edges, self.num_heads), index_flat,
+                                num_nodes=int(B) * int(dst_nodes.numel()))
             self._capture_graph_witnesses(attn_flat.view(B, num_edges, self.num_heads), src, dst, node_level, int(num_nodes))
             if active_level_set is None:
                 self._update_graph_edge_trace(attn_flat.view(B, num_edges, self.num_heads), dst, int(num_nodes))
@@ -2181,7 +2200,9 @@ class HierarchicalMessagePassing(MessagePassing):
 
             attn = self._apply_graph_trace_bias(attn, num_edges)
             attn_flat = attn.reshape(B * num_edges, self.num_heads)
-            attn_flat = softmax(attn_flat, index_flat)
+            # Pass num_nodes explicitly: PyG's maybe_num_nodes otherwise computes
+            # int(index.max()) — a GPU sync and a graph break under hier_layer_compile.
+            attn_flat = softmax(attn_flat, index_flat, num_nodes=int(B) * int(num_nodes))
             self._capture_graph_witnesses(attn_flat.view(B, num_edges, self.num_heads), src, dst, node_level, int(num_nodes))
             self._update_graph_edge_trace(attn_flat.view(B, num_edges, self.num_heads), dst, int(num_nodes))
 
@@ -2763,7 +2784,7 @@ class HierarchicalMessagePassing(MessagePassing):
         scores = (q_dst * k_src).sum(dim=-1) / math.sqrt(float(head_dim))
 
         group_idx = b_idx * num_nodes + dst_idx
-        weights = softmax(scores, group_idx)
+        weights = softmax(scores, group_idx, num_nodes=int(B) * int(num_nodes))
 
         v_src = v[b_idx, src_idx]
         msg = v_src * weights.unsqueeze(-1)

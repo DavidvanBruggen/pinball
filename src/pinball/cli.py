@@ -235,6 +235,21 @@ def main(argv=None) -> None:
             else:  # latent
                 vocab_size = int(getattr(cfg, "image_latent_channels", 4))
             input_mode, tie_weights = "features", False
+            # Grid sync (the discrete branch gets this from the VQ tokenizer): the token grid
+            # side comes from the mode's downsample factor, and feeds spatial_dims (curve mode)
+            # + the block_size sync below.
+            if image_tok_mode == "raw_rgb_patches":
+                ds = int(getattr(cfg, "image_patch_size", 16))
+            elif image_tok_mode == "rgb_unet":
+                ds = int(getattr(cfg, "image_rgb_unet_downsample", 16))
+            else:
+                ds = int(getattr(cfg, "image_latent_downsample", 8))
+            side = max(1, int(getattr(cfg, "image_size", 256)) // max(1, ds))
+            cfg.graph_grid_height, cfg.graph_grid_width = side, side
+            if not getattr(cfg, "spatial_dims", None):
+                cfg.spatial_dims = [side, side]
+            logger.info("Continuous image mode: token_mode=%s grid=%dx%d feature_dim=%d",
+                        image_tok_mode, side, side, int(vocab_size))
         expected_tokens = int(cfg.graph_grid_height or 0) * int(cfg.graph_grid_width or 0)
         if expected_tokens > 0 and expected_tokens != block_size:
             logger.info("Image modality: block_size %d -> %d (grid %dx%d)",
@@ -376,6 +391,15 @@ def main(argv=None) -> None:
             "image_maskgit_use_timestep_cond", "image_maskgit_temperature_anneal",
             "image_maskgit_temperature_start", "image_maskgit_temperature_end",
             "image_num_classes", "image_roundtrip_check",
+            "image_rgb_unet_token_dim", "image_rgb_unet_downsample",
+            "image_rgb_unet_base_channels", "image_rgb_unet_kernel_size",
+            "image_rgb_unet_decode_kernel_size", "image_rgb_unet_decode_separable",
+            "image_rgb_unet_max_channels",
+            "image_diffusion_target", "image_diffusion_schedule",
+            "image_diffusion_prediction", "image_rgb_centered_diffusion",
+            "image_diffusion_min_snr_gamma", "image_diffusion_steps",
+            "image_diffusion_beta_start", "image_diffusion_beta_end",
+            "image_sampling_respace_timesteps",
             "image_preview_enable", "image_preview_num_samples",
             "image_preview_guidance_scale", "image_preview_diffusion_steps",
             "image_preview_examples_dir",

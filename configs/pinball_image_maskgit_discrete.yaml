@@ -171,6 +171,12 @@ hier_downward_refresh_gate_init: 0.1
 # measured ~14% whole-step win at seq 8196. Training mode only (fixed seq len = one compile);
 # eval/generation stay eager. Additional lever if needed: *_refresh_every: 2 (~12% win, stacks).
 hier_refresh_compile: true
+# Compile each refinement layer's forward (widest region below the model-level forward,
+# whose cache bookkeeping breaks dynamo). Fuses the launch-bound eager orchestration —
+# measured +14% at T=64 and +26% at T=1024 alone; 1.8x combined with refresh compile at
+# T=1024 (2026-07-17, 4090 under contention). Training-only, probation fallback to eager.
+# OFF here: flipping it mid-experiment changes step numerics slightly vs your running curve.
+hier_layer_compile: false
 # HQD v2 — cross-query-guided nomination (NSA-style selective sparse attention). At the
 # multirate midpoint each L0 query scores the CLOSED L3 windows with the 0:3 refiner's TRAINED
 # q/k (per-query, causal), descends into the top-k winners' L1 children (cosine), and

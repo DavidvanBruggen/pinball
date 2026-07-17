@@ -35,6 +35,10 @@ transformer_n_layer: 12
 transformer_ffn_type: swiglu
 transformer_use_rope: true
 transformer_attn_backend: auto   # auto | flash | sdpa
+# Compile each block's forward in training (parity with pinball's hier_layer_compile so the
+# speed comparison stays fair). Measured +37% @T=64 / +33% @T=1024 on the 4090. Training-only,
+# eager fallback on failure. Same caveat: numerics shift slightly — don't flip mid-comparison.
+transformer_compile: true
 dropout: 0.1
 norm_type: layernorm
 # MaskGIT is bidirectional: no causal mask. (ar_graph_causal: false would imply the same,

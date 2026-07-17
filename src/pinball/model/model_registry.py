@@ -74,6 +74,7 @@ def build_transformer_model(
         class_cond_enable=bool(class_cond_enable),
         num_classes=int(getattr(args, "image_num_classes", 1000)) if class_cond_enable else 0,
         class_cond_drop_prob=float(getattr(args, "image_class_cond_drop_prob", 0.1)),
+        compile_blocks=bool(getattr(args, "transformer_compile", False)),
     )
     model = TransformerLM(config, tokenizer=tokenizer)
     logger.info(
@@ -161,6 +162,7 @@ def build_pinball_model(
         hier_downward_refresh_gate_init=float(getattr(args, "hier_downward_refresh_gate_init", 0.0)),
         drop_static_cross_level_edges=bool(getattr(args, "drop_static_cross_level_edges", False)),
         hier_refresh_compile=bool(getattr(args, "hier_refresh_compile", False)),
+        hier_layer_compile=bool(getattr(args, "hier_layer_compile", False)),
         xq_nominate_enable=bool(getattr(args, "xq_nominate_enable", False)),
         xq_nominate_topk_l3=int(getattr(args, "xq_nominate_topk_l3", 2)),
         xq_nominate_topk_l1=int(getattr(args, "xq_nominate_topk_l1", 2)),

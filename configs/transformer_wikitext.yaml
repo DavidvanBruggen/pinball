@@ -6,7 +6,7 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt #./data/wikitext_combined.txt
-block_size: 262144 #8196 #16384 #32768 #65536 #131072 #262144 #1024
+block_size: 131072 #8196 #16384 #32768 #65536 #131072 #262144 #1024
 batch_size: 1
 val_split: 0.01
 
@@ -48,4 +48,8 @@ transformer_n_layer: 12
 transformer_ffn_type: swiglu
 transformer_use_rope: true
 transformer_attn_backend: auto   # auto | flash | sdpa
+# Compile each block's forward in training (parity with pinball's hier_layer_compile so the
+# speed comparison stays fair; +33-37% measured on image shapes). Training-only, eager
+# fallback on failure. Numerics shift slightly under fusion — don't flip mid-comparison.
+transformer_compile: true
 dropout: 0.1

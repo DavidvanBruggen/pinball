@@ -57,16 +57,27 @@ class RotaryPositionalEncoding(nn.Module):
 
     def _apply_rotary_pos_emb_1d(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         num_nodes, num_heads, head_dim = x.shape
-        max_pos_needed = int(positions.max().item()) + 1
-        if (self.cos_cached is None or
-            max_pos_needed > self.cos_cached.size(0) or
-            self.cos_cached.device != x.device):
-            self._precompute_sincos(max_pos_needed, x.device)
+        if torch.compiler.is_compiling():
+            # Traceable path for torch.compile: the cached-table sizing below needs
+            # positions.max().item(), which graph-breaks (GPU->CPU sync) inside every
+            # compiled layer. Compute cos/sin directly from the positions instead — the
+            # same float32 product the table build uses, so the values are identical;
+            # inductor fuses it with the rotation. Clamp mirrors the table's max_seq_len cap.
+            pos_f = positions.clamp(0, self.max_seq_len - 1).float()
+            enc = pos_f.unsqueeze(1) * self.inv_freq.to(device=x.device).unsqueeze(0)
+            cos = torch.cos(enc).to(dtype=x.dtype).unsqueeze(1)
+            sin = torch.sin(enc).to(dtype=x.dtype).unsqueeze(1)
+        else:
+            max_pos_needed = int(positions.max().item()) + 1
+            if (self.cos_cached is None or
+                max_pos_needed > self.cos_cached.size(0) or
+                self.cos_cached.device != x.device):
+                self._precompute_sincos(max_pos_needed, x.device)
 
-        cached_len = self.cos_cached.size(0)
-        clamped_positions = positions.clamp(0, cached_len - 1)
-        cos = self.cos_cached[clamped_positions].to(dtype=x.dtype).unsqueeze(1)
-        sin = self.sin_cached[clamped_positions].to(dtype=x.dtype).unsqueeze(1)
+            cached_len = self.cos_cached.size(0)
+            clamped_positions = positions.clamp(0, cached_len - 1)
+            cos = self.cos_cached[clamped_positions].to(dtype=x.dtype).unsqueeze(1)
+            sin = self.sin_cached[clamped_positions].to(dtype=x.dtype).unsqueeze(1)
 
         dim_rotary = self.dim
         x_rotated = x.clone()
