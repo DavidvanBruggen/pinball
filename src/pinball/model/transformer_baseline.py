@@ -35,6 +35,10 @@ class TransformerConfig:
     gradient_checkpointing: bool = False
     tie_weights: bool = True
     ffn_type: str = "swiglu"
+    causal: bool = True
+    class_cond_enable: bool = False
+    num_classes: int = 0
+    class_cond_drop_prob: float = 0.1
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -108,6 +112,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = int(config.n_head)
         self.n_embd = int(config.n_embd)
         self.head_dim = int(config.n_embd // config.n_head)
+        self.causal = bool(config.causal)
         self.dropout = float(config.dropout)
         self.attn_backend = str(config.attn_backend).lower()
         if self.attn_backend not in {"auto", "flash", "sdpa", "eager"}:
@@ -122,8 +127,9 @@ class CausalSelfAttention(nn.Module):
     def _manual_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
         bsz, _, seq_len, _ = q.shape
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        causal = torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool).tril().view(1, 1, seq_len, seq_len)
-        att = att.masked_fill(~causal, torch.finfo(att.dtype).min)
+        if self.causal:
+            causal = torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool).tril().view(1, 1, seq_len, seq_len)
+            att = att.masked_fill(~causal, torch.finfo(att.dtype).min)
         if attention_mask is not None:
             key_mask = attention_mask.to(device=q.device, dtype=torch.bool).view(bsz, 1, 1, seq_len)
             att = att.masked_fill(~key_mask, torch.finfo(att.dtype).min)
@@ -152,11 +158,13 @@ class CausalSelfAttention(nn.Module):
             dropout_p = self.dropout if self.training else 0.0
             try:
                 if attention_mask is None or bool(attention_mask.to(dtype=torch.bool).all().item()):
-                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True)
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=self.causal)
                 else:
                     key_mask = attention_mask.to(device=x.device, dtype=torch.bool).view(bsz, 1, 1, seq_len)
-                    causal = torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool).tril().view(1, 1, seq_len, seq_len)
-                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=(key_mask & causal), dropout_p=dropout_p, is_causal=False)
+                    if self.causal:
+                        causal = torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool).tril().view(1, 1, seq_len, seq_len)
+                        key_mask = key_mask & causal
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=key_mask, dropout_p=dropout_p, is_causal=False)
                 self.backend_used = "sdpa"
             except Exception as exc:
                 if self.attn_backend in {"flash", "sdpa"}:
@@ -245,6 +253,17 @@ class TransformerLM(nn.Module):
         self.use_rope = bool(config.use_rope)
         self.use_abs_pos_emb = bool(config.use_abs_pos_emb)
 
+        # Class conditioning (image MaskGIT): FiLM on the token embeddings, mirroring the
+        # pinball model's _apply_film_conditioning (same null-index/CFG-drop semantics).
+        self.num_classes = int(config.num_classes)
+        self.class_cond_drop_prob = max(0.0, min(1.0, float(config.class_cond_drop_prob)))
+        self.class_null_index = int(self.num_classes)
+        self.class_embedding: Optional[nn.Embedding] = None
+        self.cond_film: Optional[nn.Linear] = None
+        if bool(config.class_cond_enable) and self.num_classes > 0:
+            self.class_embedding = nn.Embedding(self.num_classes + 1, config.n_embd)
+            self.cond_film = nn.Linear(config.n_embd, 2 * config.n_embd)
+
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=self.pad_token_id)
         self.position_embedding = nn.Embedding(config.block_size, config.n_embd) if config.use_abs_pos_emb else None
         self.drop = nn.Dropout(config.dropout)
@@ -275,6 +294,7 @@ class TransformerLM(nn.Module):
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
         reveal_target_ids: Optional[torch.Tensor] = None,
         reveal_mask: Optional[torch.Tensor] = None,
         **kwargs,
@@ -298,6 +318,21 @@ class TransformerLM(nn.Module):
         if self.position_embedding is not None:
             pos = position_ids.clamp_min(0).clamp_max(self.block_size - 1)
             x = x + self.position_embedding(pos)
+        if self.class_embedding is not None:
+            if class_labels is None:
+                cls = torch.full((bsz,), int(self.class_null_index), dtype=torch.long, device=x.device)
+            else:
+                cls = class_labels.to(device=x.device, dtype=torch.long).view(-1)
+                if int(cls.numel()) != int(bsz):
+                    cls = cls.expand(int(bsz)) if int(cls.numel()) == 1 else cls[: int(bsz)]
+                cls = cls.clamp(min=0, max=max(0, int(self.num_classes)))
+                if self.training and self.class_cond_drop_prob > 0.0:
+                    drop_mask = torch.rand(int(bsz), device=x.device) < float(self.class_cond_drop_prob)
+                    if bool(drop_mask.any()):
+                        cls = cls.clone()
+                        cls[drop_mask] = int(self.class_null_index)
+            gamma, beta = self.cond_film(self.class_embedding(cls)).chunk(2, dim=-1)
+            x = x * (1.0 + torch.sigmoid(gamma).unsqueeze(1)) + beta.unsqueeze(1)
         x = self.drop(x)
 
         for block in self.blocks:

@@ -10,14 +10,14 @@ modality: text
 tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
-text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
+text_file: "" #/home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
 block_size: 1024                  # = 32*32 VQ/latent grid (H*W); cli syncs to the real grid
-batch_size: 32
+batch_size: 256
 val_split: 0.01
 
 # Training
 train_mode: ar            # ar | masked_diffusion
-learning_rate: 1e-3 #0.0001
+learning_rate: 1e-4 #0.0001
 weight_decay: 0.1
 warmup_steps: 1000
 #max_steps: 20000
@@ -31,8 +31,8 @@ muon_adjust_lr_fn: match_rms_adamw
 # Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
-num_epochs: 20
-samples_per_epoch: 651 #15625 #3125 #25000 #782 #25000
+num_epochs: 100
+samples_per_epoch: 1024000 #25600          # 800 steps/epoch at b32 -> 20k steps total (~0.5 ImageNet epochs)
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
@@ -110,8 +110,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 192 #192 #768
-num_heads: 3 #3 #12
+hidden_dim: 1536 #512                   # 68M @ 512/8: the 16385-way VQ head needs width (192 is rank-starved);
+num_heads: 24                      # head_dim stays 64 (flash sweet spot). 270ms/step b32@1024 Blackwell.
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -251,7 +251,7 @@ xq_nominate_read_sink: true
 # the open question is whether the coarse-lateral repositioning hurts or helps quality.
 # Fall back to query_levels [0] to keep coarse laterals untouched (+2% cost instead).
 local_pack_cross_level: true
-local_pack_window: 156            # ~128-token spatial blob reach at 1024-token grids (1248 would be near-global)
+local_pack_window: 624            # ~128-token spatial blob reach at 1024-token grids (1248 would be near-global) # 156 624 1248
 local_pack_query_levels: [0, 1, 2, 3]
 # Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
 # bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
@@ -266,7 +266,7 @@ local_pack_level_bias: true
 # their old 1024/2048-token spans). Cost ~ the main packed call again (coarse rows are few).
 # Additive to the coarse queries' main-window read (fine detail stays available there).
 local_pack_coarse_lane: true
-local_pack_coarse_window: 128     # covers most coarse laterals at 1024-token grids (L1 128 / L2 64 / L3 32 rows)
+local_pack_coarse_window: 896    # covers most coarse laterals at 1024-token grids (L1 128 / L2 64 / L3 32 rows)
 # UNIFIED SOFTMAX over both windows (2026-07-13): coarse queries read the mixed window and
 # the lane as ONE softmax over the union of both key sets, instead of adding two
 # independently-normalized outputs (per-key context-selective arbitration; kills the
@@ -607,7 +607,7 @@ hier_predaux_predictor: mlp    # mlp | linear
 # AR runs: next (forecast only — a "prev" head would be trivially copyable and empty). MASKED
 # runs: both (future is partially visible so "next" alone degrades toward copying; predicting
 # both non-overlapping neighbours = masked-window summary prediction, the bidirectional analogue).
-hier_predaux_directions: next  # next | both
+hier_predaux_directions: both  # next | both
 # By default the aux loss uses each level's features as a STOP-GRAD (detached) target (JEPA
 # anti-collapse): the coarse levels are trained to predict L0, but no aux gradient flows back
 # into L0. With coarse_tokenize, L0 IS the Hyena-pooled output — so this directly links the aux
@@ -637,7 +637,7 @@ hier_copredict_gate_init: 0.0      # per-level gate init; 0.0 = identity warm st
 # the full pack/refresh recipe runs. spatial_dims is auto-set from the VQ grid
 # by the cli for discrete runs.
 modality: image
-spatial_curve: hilbert
+spatial_curve: hilbert #none #hilbert
 spatial_dims: [32, 32]
 # Axial ND RoPE on the packed path: attention scores use TRUE (dy,dx) offsets
 # (L0 = pixel coords, coarse = child-blob centroid) instead of 1D curve-index
@@ -651,23 +651,48 @@ hier_downward_bidi_parent: true
 # NOTE: rope_mode must NOT be "1d" (axial coords need the ND dispatch); the
 # default "auto" is correct. xq_nominate stays OFF (causal machinery).
 
-image_dataset_root: ./data/imagenet   # ImageFolder layout: train/ + val/ class dirs
-image_size: 256
-image_num_classes: 1000
+image_dataset_root: /media/david/SSD_Data/Datasets/tiny-imagenet  # /media/david/SSD_Data/Datasets/tiny-imagenet # /media/david/SSD_Data/Datasets/imagenet1k_hf  # ImageFolder layout: train/ + val/ class dirs
+image_size: 64 #64 #256
+image_num_classes: 200 # 1000
 image_objective: maskgit
 image_roundtrip_check: true
 image_num_workers: 4
-image_cache_mode: off                 # off | read | write | readwrite (latent/token shard cache)
-# image_auto_prepare: true            # build ImageFolder from HF (ILSVRC/imagenet-1k) if missing
+image_cache_mode: readwrite                 # off | read | write | readwrite (latent/token shard cache)
+# Auto-prepare: build the ImageFolder from a HF dataset if the root is missing/empty.
+image_auto_prepare: true
+image_hf_dataset_id: zh-plus/tiny-imagenet #zh-plus/tiny-imagenet #ILSVRC/imagenet-1k
+image_prepare_streaming: true
+image_prepare_max_train: 0            # 0 = all samples
+image_prepare_max_val: 0
+image_prepare_overwrite: false
 
 # --- discrete variant: VQ codebook tokens, masked cross-entropy (closest analog
 # to the text NLL head-to-heads). vocab/grid/mask id come from the VQ tokenizer.
 image_maskgit_variant: discrete
-image_maskgit_vq_model_name: ""       # REQUIRED: hf id or local path of the VQGAN (e.g. llamagen vq16)
-image_maskgit_train_mask_min: 0.0
+image_maskgit_vq_model_name: "./llamavae/vq_ds8_c2i.pt"   #"./llamavae/vq_ds16_c2i.pt"    # REQUIRED: hf id or local path of the VQGAN (e.g. llamagen vq16)
+image_maskgit_train_mask_min: 0.1  # near-zero-mask batches carry ~no gradient
 image_maskgit_train_mask_max: 1.0
 image_maskgit_val_mask_ratio: 0.5
 image_maskgit_steps: 12
 image_maskgit_schedule: cosine
 image_maskgit_confidence: stability
 image_maskgit_use_timestep_cond: true
+
+# EMA shadow weights: updated every optimizer step (decay ramps 0.95 -> 0.995); the
+# MaskGIT sampling/preview paths prefer the EMA model. Saved as pinball_<tag>_ema.pt
+# next to each checkpoint and auto-restored on --resume.
+use_ema: true
+# Classifier-free guidance training: drop the class label with this probability so the
+# unconditional branch is trained (needed for preview/FID guidance_scale > 1).
+image_class_cond_drop_prob: 0.1
+
+# Per-epoch sample-grid previews (fake|real pairs under <checkpoint_dir>/preview_examples).
+image_preview_enable: true
+image_preview_eval_interval: 1        # every N epochs (0 = off)
+image_preview_num_samples: 8
+image_preview_guidance_scale: 1.0
+# FID against the val set (needs torchmetrics[image]); expensive — off by default.
+image_fid_enable: false
+image_fid_eval_interval: 0            # every N epochs (0 = off)
+image_fid_num_samples: 2048
+image_fid_guidance_scale: 3.0

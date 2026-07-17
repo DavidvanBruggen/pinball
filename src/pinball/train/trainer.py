@@ -3731,23 +3731,35 @@ class EnhancedHierarchicalTrainer:
             mask_max = mask_min
 
         progress = torch.rand((bsz,), device=token_ids.device)
-        mask_ratios = torch.tensor(
-            [self._maskgit_gamma(p.item()) for p in progress],
-            device=token_ids.device,
-        )
+        if str(self.image_maskgit_schedule).lower() == "linear":
+            mask_ratios = (1.0 - progress).clamp(min=0.0)
+        else:
+            mask_ratios = torch.cos(0.5 * math.pi * progress).clamp(min=0.0)
         mask_ratios = mask_ratios.clamp(min=mask_min, max=mask_max)
 
-        masks = []
-        for ratio in mask_ratios.tolist():
-            m = self._sample_image_feature_mask(
-                token_count=tok,
-                grid_shape=grid_shape,
-                mask_ratio=float(ratio),
-                batch_size=1,
-                device=token_ids.device,
-            )[0]
-            masks.append(m)
-        mask = torch.stack(masks, dim=0)
+        mode = str(getattr(self, "diffusion_mask_mode", "random")).lower()
+        if mode in {"block", "path"}:
+            # Structured masks take one scalar ratio per call -> per-sample loop.
+            masks = []
+            for ratio in mask_ratios.tolist():
+                m = self._sample_image_feature_mask(
+                    token_count=tok,
+                    grid_shape=grid_shape,
+                    mask_ratio=float(ratio),
+                    batch_size=1,
+                    device=token_ids.device,
+                )[0]
+                masks.append(m)
+            mask = torch.stack(masks, dim=0)
+        else:
+            # Vectorized per-sample-ratio Bernoulli masks. The per-sample loop above
+            # costs ~95ms/step in Python/sync overhead at B=2048 (0.1ms vectorized);
+            # same distribution: Bernoulli(ratio_b) per token + >=1 masked per row.
+            mask = torch.rand((bsz, tok), device=token_ids.device) < mask_ratios.unsqueeze(1)
+            rows = torch.arange(bsz, device=token_ids.device)
+            fill_cols = torch.randint(0, tok, (bsz,), device=token_ids.device)
+            empty = ~mask.any(dim=1)
+            mask[rows, fill_cols] = mask[rows, fill_cols] | empty
 
         mask_token_id = int(getattr(self, "image_maskgit_mask_token_id", -1))
         if mask_token_id < 0:
@@ -4101,6 +4113,20 @@ class EnhancedHierarchicalTrainer:
         return float(avg), metrics
 
     @torch.no_grad()
+    def _image_sampling_amp_ctx(self):
+        """Autocast context for image sampling forwards.
+
+        Sampling must run under the SAME mixed-precision autocast as training:
+        the packed local-attention path hard-requires fp16/bf16 inputs and
+        raises on a bare fp32 forward. Fresh context per call (the autocast
+        weight-cast cache is cleared on exit, so no_grad casts cannot leak
+        into later grad-mode training calls).
+        """
+        if bool(self.mixed_precision) and torch.cuda.is_available() and self.device.type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=amp_dtype("cuda"))
+        return nullcontext()
+
+    @torch.no_grad()
     def _sample_image_tokens_maskgit_discrete(
         self,
         batch_size: int,
@@ -4129,12 +4155,14 @@ class EnhancedHierarchicalTrainer:
         mask = torch.ones((int(batch_size), n_tok), device=self.device, dtype=torch.bool)
 
         for step in range(steps):
-            logits_cond = model_for_gen(x, attention_mask=attn, class_labels=cls)
-            logits_cond = self._fit_logits_to_target_ids(logits_cond, x, context="sample/image_maskgit_discrete_cond")
+            with self._image_sampling_amp_ctx():
+                logits_cond = model_for_gen(x, attention_mask=attn, class_labels=cls)
+            logits_cond = self._fit_logits_to_target_ids(logits_cond, x, context="sample/image_maskgit_discrete_cond").float()
             if cls is not None and guidance_scale > 0.0:
                 null_cls = torch.full_like(cls, int(getattr(model_for_gen, "class_null_index", self.image_num_classes)))
-                logits_null = model_for_gen(x, attention_mask=attn, class_labels=null_cls)
-                logits_null = self._fit_logits_to_target_ids(logits_null, x, context="sample/image_maskgit_discrete_null")
+                with self._image_sampling_amp_ctx():
+                    logits_null = model_for_gen(x, attention_mask=attn, class_labels=null_cls)
+                logits_null = self._fit_logits_to_target_ids(logits_null, x, context="sample/image_maskgit_discrete_null").float()
                 logits = logits_null + float(guidance_scale) * (logits_cond - logits_null)
             else:
                 logits = logits_cond
@@ -4210,12 +4238,13 @@ class EnhancedHierarchicalTrainer:
         for idx_pos in range(int(t_indices.numel())):
             t_idx = int(t_indices[idx_pos].item())
             t = torch.full((int(x.size(0)),), int(t_idx), device=self.device, dtype=torch.long)
-            pred_cond = model_for_gen(x, attention_mask=attn, class_labels=cls, timesteps=t)
+            with self._image_sampling_amp_ctx():
+                pred_cond = model_for_gen(x, attention_mask=attn, class_labels=cls, timesteps=t)
             pred_cond = self._fit_pred_to_target(
                 pred_cond,
                 x,
                 context="sample/image_tokens_cond",
-            )
+            ).float()
             if pred_cond.shape != x.shape:
                 x = x[: pred_cond.size(0), : pred_cond.size(1), : pred_cond.size(2)]
                 attn = attn[: pred_cond.size(0), : pred_cond.size(1)]
@@ -4225,12 +4254,13 @@ class EnhancedHierarchicalTrainer:
                     t = t[: pred_cond.size(0)]
             if cls is not None and guidance_scale > 0.0:
                 null_cls = torch.full_like(cls, int(self.image_num_classes))
-                pred_null = model_for_gen(x, attention_mask=attn, class_labels=null_cls, timesteps=t)
+                with self._image_sampling_amp_ctx():
+                    pred_null = model_for_gen(x, attention_mask=attn, class_labels=null_cls, timesteps=t)
                 pred_null = self._fit_pred_to_target(
                     pred_null,
                     x,
                     context="sample/image_tokens_null",
-                )
+                ).float()
                 pred = pred_null + float(guidance_scale) * (pred_cond - pred_null)
             else:
                 pred = pred_cond
@@ -4285,8 +4315,9 @@ class EnhancedHierarchicalTrainer:
             current_mask_ratio = float(mask.float().mean().item()) if mask.numel() > 0 else 0.0
             t = self._maskgit_time_condition(mask_ratio=current_mask_ratio, batch_size=int(batch_size), device=self.device)
 
-            pred_cond = model_for_gen(x, attention_mask=attn, class_labels=cls, timesteps=t)
-            pred_cond = self._fit_pred_to_target(pred_cond, x, context="sample/image_maskgit_cond")
+            with self._image_sampling_amp_ctx():
+                pred_cond = model_for_gen(x, attention_mask=attn, class_labels=cls, timesteps=t)
+            pred_cond = self._fit_pred_to_target(pred_cond, x, context="sample/image_maskgit_cond").float()
             if pred_cond.shape != x.shape:
                 x = x[: pred_cond.size(0), : pred_cond.size(1), : pred_cond.size(2)]
                 attn = attn[: pred_cond.size(0), : pred_cond.size(1)]
@@ -4300,8 +4331,9 @@ class EnhancedHierarchicalTrainer:
 
             if cls is not None and guidance_scale > 0.0:
                 null_cls = torch.full_like(cls, int(getattr(model_for_gen, "class_null_index", self.image_num_classes)))
-                pred_null = model_for_gen(x, attention_mask=attn, class_labels=null_cls, timesteps=t)
-                pred_null = self._fit_pred_to_target(pred_null, x, context="sample/image_maskgit_null")
+                with self._image_sampling_amp_ctx():
+                    pred_null = model_for_gen(x, attention_mask=attn, class_labels=null_cls, timesteps=t)
+                pred_null = self._fit_pred_to_target(pred_null, x, context="sample/image_maskgit_null").float()
                 pred = pred_null + float(guidance_scale) * (pred_cond - pred_null)
             else:
                 pred = pred_cond
@@ -4377,49 +4409,53 @@ class EnhancedHierarchicalTrainer:
         for idx_pos in range(int(t_indices.numel())):
             t_idx = int(t_indices[idx_pos].item())
             t = torch.full((int(x.size(0)),), int(t_idx), device=self.device, dtype=torch.long)
-            tok_cond, dec_ctx = self._encode_pixels_rgb_unet_tokens(
-                x,
-                model_ref=model_for_gen,
-                class_labels=cls,
-                timesteps=t,
-            )
-            attn = torch.ones((int(tok_cond.size(0)), int(tok_cond.size(1))), device=tok_cond.device, dtype=torch.long)
-            pred_tok_cond = model_for_gen(tok_cond, attention_mask=attn, class_labels=cls, timesteps=t)
-            pred_tok_cond = self._fit_pred_to_target(
-                pred_tok_cond,
-                tok_cond,
-                context="sample/rgb_unet_cond_tokens",
-            )
-            pred_rgb_cond = self._decode_rgb_unet_tokens_to_pixels(
-                pred_tok_cond,
-                dec_ctx,
-                model_ref=model_for_gen,
-                class_labels=cls,
-                timesteps=t,
-            )
+            with self._image_sampling_amp_ctx():
+                tok_cond, dec_ctx = self._encode_pixels_rgb_unet_tokens(
+                    x,
+                    model_ref=model_for_gen,
+                    class_labels=cls,
+                    timesteps=t,
+                )
+                attn = torch.ones((int(tok_cond.size(0)), int(tok_cond.size(1))), device=tok_cond.device, dtype=torch.long)
+                pred_tok_cond = model_for_gen(tok_cond, attention_mask=attn, class_labels=cls, timesteps=t)
+                pred_tok_cond = self._fit_pred_to_target(
+                    pred_tok_cond,
+                    tok_cond,
+                    context="sample/rgb_unet_cond_tokens",
+                )
+                pred_rgb_cond = self._decode_rgb_unet_tokens_to_pixels(
+                    pred_tok_cond,
+                    dec_ctx,
+                    model_ref=model_for_gen,
+                    class_labels=cls,
+                    timesteps=t,
+                )
+            pred_rgb_cond = pred_rgb_cond.float()
 
             if cls is not None and guidance_scale > 0.0:
                 null_cls = torch.full_like(cls, int(self.image_num_classes))
-                tok_null, dec_ctx_null = self._encode_pixels_rgb_unet_tokens(
-                    x,
-                    model_ref=model_for_gen,
-                    class_labels=null_cls,
-                    timesteps=t,
-                )
-                attn_null = torch.ones((int(tok_null.size(0)), int(tok_null.size(1))), device=tok_null.device, dtype=torch.long)
-                pred_tok_null = model_for_gen(tok_null, attention_mask=attn_null, class_labels=null_cls, timesteps=t)
-                pred_tok_null = self._fit_pred_to_target(
-                    pred_tok_null,
-                    tok_null,
-                    context="sample/rgb_unet_null_tokens",
-                )
-                pred_rgb_null = self._decode_rgb_unet_tokens_to_pixels(
-                    pred_tok_null,
-                    dec_ctx_null,
-                    model_ref=model_for_gen,
-                    class_labels=null_cls,
-                    timesteps=t,
-                )
+                with self._image_sampling_amp_ctx():
+                    tok_null, dec_ctx_null = self._encode_pixels_rgb_unet_tokens(
+                        x,
+                        model_ref=model_for_gen,
+                        class_labels=null_cls,
+                        timesteps=t,
+                    )
+                    attn_null = torch.ones((int(tok_null.size(0)), int(tok_null.size(1))), device=tok_null.device, dtype=torch.long)
+                    pred_tok_null = model_for_gen(tok_null, attention_mask=attn_null, class_labels=null_cls, timesteps=t)
+                    pred_tok_null = self._fit_pred_to_target(
+                        pred_tok_null,
+                        tok_null,
+                        context="sample/rgb_unet_null_tokens",
+                    )
+                    pred_rgb_null = self._decode_rgb_unet_tokens_to_pixels(
+                        pred_tok_null,
+                        dec_ctx_null,
+                        model_ref=model_for_gen,
+                        class_labels=null_cls,
+                        timesteps=t,
+                    )
+                pred_rgb_null = pred_rgb_null.float()
                 pred_rgb = pred_rgb_null + float(guidance_scale) * (pred_rgb_cond - pred_rgb_null)
             else:
                 pred_rgb = pred_rgb_cond
@@ -5280,10 +5316,38 @@ class EnhancedHierarchicalTrainer:
                 except Exception:
                     pass
 
+        # Image batches carry pixels, not token ids — a sample still costs the model one
+        # full token grid (VQ/latent H*W), so count that for tok/s comparability with text.
+        image_tokens_per_sample = 0
+        if self.modality == "image":
+            try:
+                vq = getattr(self, "_image_maskgit_vq_tokenizer", None)
+                if vq is not None and hasattr(vq, "infer_grid_shape"):
+                    gh, gw = vq.infer_grid_shape(int(self.image_size))
+                else:
+                    gh, gw = self._image_expected_grid_shape()
+                image_tokens_per_sample = max(1, int(gh) * int(gw))
+            except Exception:
+                image_tokens_per_sample = 0
+
         def _batch_token_sample_counts(batch_obj) -> Tuple[int, int]:
             input_tensor = None
             if isinstance(batch_obj, dict):
                 input_tensor = batch_obj.get("input_ids", None)
+                if input_tensor is None:
+                    # cached VQ tokens [B,T]
+                    t = batch_obj.get("token_ids", None)
+                    if torch.is_tensor(t) and t.dim() >= 2:
+                        return int(t.size(0) * t.size(1)), max(1, int(t.size(0)))
+                    # cached latent/patch features [B,T,C] — count positions, not floats
+                    t = batch_obj.get("input_features", None)
+                    if torch.is_tensor(t) and t.dim() >= 2:
+                        return int(t.size(0) * t.size(1)), max(1, int(t.size(0)))
+                    # raw pixels [B,3,H,W] — one token grid per image
+                    t = batch_obj.get("pixel_values", None)
+                    if torch.is_tensor(t) and t.dim() > 0:
+                        b = int(t.size(0))
+                        return b * int(image_tokens_per_sample), max(1, b)
             elif isinstance(batch_obj, (list, tuple)) and len(batch_obj) > 0:
                 input_tensor = batch_obj[0]
             if torch.is_tensor(input_tensor):

@@ -255,6 +255,17 @@ def main(argv=None) -> None:
     logger.info("Built %s: %s params, block_size=%d, device=%s",
                 getattr(cfg, "model_type", "pinball"), f"{count_parameters(model):,}", block_size, device)
 
+    # EMA shadow model (use_ema: true). The trainer updates it after every optimizer step
+    # and the image MaskGIT/diffusion sampling paths prefer it (use_ema=True falls back to
+    # the raw model when absent). Costs one extra parameter copy on the device.
+    ema_model = None
+    if bool(getattr(cfg, "use_ema", False)):
+        import copy as _copy
+        ema_model = _copy.deepcopy(model).eval()
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+        logger.info("EMA shadow model enabled (decay ramps 0.95 -> 0.995 with step)")
+
     if modality == "image":
         from .data import create_image_dataloaders
         dataset_root = getattr(cfg, "image_dataset_root", None)
@@ -270,6 +281,10 @@ def main(argv=None) -> None:
             pin_memory=(device.type == "cuda"),
             auto_prepare=bool(getattr(cfg, "image_auto_prepare", False)),
             hf_dataset_id=str(getattr(cfg, "image_hf_dataset_id", "ILSVRC/imagenet-1k")),
+            prepare_streaming=bool(getattr(cfg, "image_prepare_streaming", True)),
+            prepare_max_train_samples=int(getattr(cfg, "image_prepare_max_train", 0) or 0),
+            prepare_max_val_samples=int(getattr(cfg, "image_prepare_max_val", 0) or 0),
+            prepare_overwrite=bool(getattr(cfg, "image_prepare_overwrite", False)),
             cache_mode=str(getattr(cfg, "image_cache_mode", "off")),
             cache_dir=str(getattr(cfg, "image_cache_dir", "") or ""),
             cache_image_token_mode=str(getattr(cfg, "image_token_mode", "latent")),
@@ -320,7 +335,7 @@ def main(argv=None) -> None:
     lr_scheduler = _build_scheduler(optimizer, warmup_steps, max_steps)
 
     trainer = EnhancedHierarchicalTrainer(
-        model, None,
+        model, ema_model,
         optimizer=optimizer, lr_scheduler=lr_scheduler, tokenizer=tokenizer, device=device,
         train_objective_mode=objective, mixed_precision=use_amp,
         log_interval=int(args.log_every if args.log_every is not None else getattr(cfg, "log_every", 10000)),
@@ -362,6 +377,11 @@ def main(argv=None) -> None:
             "image_maskgit_temperature_start", "image_maskgit_temperature_end",
             "image_num_classes", "image_roundtrip_check",
             "image_preview_enable", "image_preview_num_samples",
+            "image_preview_guidance_scale", "image_preview_diffusion_steps",
+            "image_preview_examples_dir",
+            "image_fid_enable", "image_fid_num_samples", "image_fid_guidance_scale",
+            "image_fid_diffusion_steps", "image_fid_save_examples",
+            "image_fid_examples_per_eval", "image_fid_examples_dir",
         ) if getattr(cfg, k, None) is not None},
         **({"image_maskgit_vq_tokenizer": vq_tokenizer} if vq_tokenizer is not None else {}),
     )
@@ -378,6 +398,33 @@ def main(argv=None) -> None:
         start_epoch = int(getattr(trainer, "current_epoch", 0))
         logger.info("Resumed from %s  (global_step=%d, epoch=%d)",
                     resume_path, resumed_steps, start_epoch)
+        if ema_model is not None:
+            # Restore the EMA shadow from its companion file when present; otherwise
+            # re-seed it from the (just restored) model weights.
+            root, ext = os.path.splitext(resume_path)
+            ema_path = f"{root}_ema{ext}"
+            if os.path.isfile(ema_path):
+                trainer.load_ema_checkpoint(ema_path)
+                logger.info("Resumed EMA weights from %s", ema_path)
+            else:
+                trainer.ema_model.load_state_dict(trainer.model.state_dict())
+                logger.info("No EMA companion at %s; re-seeded EMA from model weights", ema_path)
+
+    # Pre-training sanity pass (image_roundtrip_check): push one real batch through the
+    # VQ/VAE encode -> decode pipeline and save real-vs-reconstruction grids to
+    # <checkpoint_dir>/preview_examples/roundtrip_check/init/ — catches a broken or
+    # mismatched tokenizer BEFORE any training compute is spent. fail_fast raises.
+    if modality == "image" and bool(getattr(trainer, "image_roundtrip_check", False)):
+        rt_batch = train_loader(device)
+        rt_metrics = trainer.check_image_roundtrip(
+            rt_batch, eval_tag="init",
+            num_samples=int(getattr(trainer, "image_roundtrip_check_num_samples", 4)),
+            fail_fast=bool(getattr(trainer, "image_roundtrip_check_fail_fast", True)),
+        )
+        if rt_metrics:
+            summary = {k: (f"{v:.4f}" if isinstance(v, float) else v)
+                       for k, v in rt_metrics.items() if not k.endswith("_dir")}
+            logger.info("VQ/VAE roundtrip check passed: %s", summary)
 
     train_data = {"get_batch": train_loader, "steps_per_epoch": steps_per_epoch}
     val_data = {"get_batch": val_loader, "steps_per_epoch": int(args.eval_batches)}
@@ -449,6 +496,12 @@ def main(argv=None) -> None:
             logger.info("saved checkpoint -> %s", path)
         except Exception as exc:
             logger.warning("checkpoint save failed (%s)", exc)
+        if getattr(trainer, "ema_model", None) is not None:
+            ema_path = os.path.join(checkpoint_dir, f"pinball_{tag}_ema.pt")
+            try:
+                trainer.save_ema_checkpoint(ema_path)
+            except Exception as exc:
+                logger.warning("EMA checkpoint save failed (%s)", exc)
 
     # Step-based hooks: the trainer fires train_metrics_callback every
     # train_metrics_interval optimizer steps with a payload carrying global_step.
@@ -501,6 +554,28 @@ def main(argv=None) -> None:
                 logger.info("  copy: token_acc=%.3f span_exact=%.3f first_token_acc=%.3f",
                             metrics.get("copy_token_acc", 0.0), metrics.get("copy_span_exact", 0.0),
                             metrics.get("copy_first_token_acc", 0.0))
+
+            # Image eval hooks: sample-grid previews and (optionally) FID against the val
+            # set. Both are additionally gated inside the trainer by image_preview_enable /
+            # image_fid_enable; the *_eval_interval keys control the epoch cadence here.
+            if modality == "image":
+                pv_every = int(getattr(cfg, "image_preview_eval_interval", 1) or 0)
+                if pv_every > 0 and epoch % pv_every == 0:
+                    try:
+                        trainer.evaluate_image_preview(val_data, eval_tag=f"epoch{epoch}")
+                    except Exception as exc:  # best-effort; never abort training on it
+                        logger.warning("image preview failed (%s)", exc, exc_info=True)
+                fid_every = int(getattr(cfg, "image_fid_eval_interval", 0) or 0)
+                if fid_every > 0 and epoch % fid_every == 0:
+                    try:
+                        fid_score = trainer.evaluate_image_fid(
+                            val_data, use_ema=(getattr(trainer, "ema_model", None) is not None),
+                            eval_tag=f"epoch{epoch}",
+                        )
+                        if fid_score is not None:
+                            logger.info("epoch %d  FID=%.3f", epoch, float(fid_score))
+                    except Exception as exc:
+                        logger.warning("image FID eval failed (%s)", exc, exc_info=True)
 
             # Best-checkpoint tracking + patience counter.
             if float(sel_loss) < best_val - min_delta:

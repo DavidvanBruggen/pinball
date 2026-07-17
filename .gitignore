@@ -16,6 +16,10 @@ env/
 *.bin
 *.ckpt
 
+# Training run outputs (checkpoints, preview grids). Root-anchored so src/pinball is unaffected.
+/pinball/
+/transformer/
+
 # Editor / OS
 .DS_Store
 .idea/

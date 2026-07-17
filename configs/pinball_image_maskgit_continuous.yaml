@@ -31,8 +31,8 @@ muon_adjust_lr_fn: match_rms_adamw
 # Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
-num_epochs: 20
-samples_per_epoch: 651 #15625 #3125 #25000 #782 #25000
+num_epochs: 25
+samples_per_epoch: 25600          # 800 steps/epoch at b32 -> 20k steps total (~0.5 ImageNet epochs)
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
@@ -110,8 +110,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 192 #192 #768
-num_heads: 3 #3 #12
+hidden_dim: 512                   # matched to the discrete config (68M @ 512/8)
+num_heads: 8                      # head_dim stays 64 (flash sweet spot)
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -651,14 +651,20 @@ hier_downward_bidi_parent: true
 # NOTE: rope_mode must NOT be "1d" (axial coords need the ND dispatch); the
 # default "auto" is correct. xq_nominate stays OFF (causal machinery).
 
-image_dataset_root: ./data/imagenet   # ImageFolder layout: train/ + val/ class dirs
+image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf  # ImageFolder layout: train/ + val/ class dirs
 image_size: 256
 image_num_classes: 1000
 image_objective: maskgit
 image_roundtrip_check: true
 image_num_workers: 4
 image_cache_mode: off                 # off | read | write | readwrite (latent/token shard cache)
-# image_auto_prepare: true            # build ImageFolder from HF (ILSVRC/imagenet-1k) if missing
+# Auto-prepare: build the ImageFolder from a HF dataset if the root is missing/empty.
+image_auto_prepare: true
+image_hf_dataset_id: ILSVRC/imagenet-1k
+image_prepare_streaming: true
+image_prepare_max_train: 0            # 0 = all samples
+image_prepare_max_val: 0
+image_prepare_overwrite: false
 
 # --- continuous variant: SD-VAE latents [B, H*W, 4], masked-MSE on masked rows.
 image_maskgit_variant: continuous
@@ -669,3 +675,22 @@ image_latent_downsample: 8            # 256/8 = 32x32 latent grid
 image_maskgit_mask_value: zero
 image_maskgit_unmasked_weight: 0.0
 image_maskgit_use_timestep_cond: true
+
+# EMA shadow weights: updated every optimizer step (decay ramps 0.95 -> 0.995); the
+# MaskGIT sampling/preview paths prefer the EMA model. Saved as pinball_<tag>_ema.pt
+# next to each checkpoint and auto-restored on --resume.
+use_ema: true
+# Classifier-free guidance training: drop the class label with this probability so the
+# unconditional branch is trained (needed for preview/FID guidance_scale > 1).
+image_class_cond_drop_prob: 0.1
+
+# Per-epoch sample-grid previews (fake|real pairs under <checkpoint_dir>/preview_examples).
+image_preview_enable: true
+image_preview_eval_interval: 1        # every N epochs (0 = off)
+image_preview_num_samples: 8
+image_preview_guidance_scale: 3.0
+# FID against the val set (needs torchmetrics[image]); expensive — off by default.
+image_fid_enable: false
+image_fid_eval_interval: 0            # every N epochs (0 = off)
+image_fid_num_samples: 2048
+image_fid_guidance_scale: 3.0

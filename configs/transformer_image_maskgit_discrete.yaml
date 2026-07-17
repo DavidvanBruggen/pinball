@@ -1,0 +1,87 @@
+# Transformer baseline for the image MaskGIT head-to-head — the exact counterpart of
+# configs/pinball_image_maskgit_discrete.yaml: same data pipeline, VQ tokenizer, masking
+# schedule, optimizer, EMA, CFG and preview/FID hooks; only the backbone differs (vanilla
+# bidirectional GPT blocks, 1D raster RoPE + learned absolute positions — no hierarchy,
+# no spatial curve). Matched shape: hidden 512 / 8 heads / 12 layers (~59M untied vs
+# pinball's ~68M; bump transformer_n_layer to 14 for a closer param match).
+
+model_type: transformer
+modality: image
+
+block_size: 1024                  # = 32*32 VQ/latent grid (H*W); cli syncs to the real grid
+batch_size: 2048
+val_split: 0.01
+
+# Training — identical to the pinball run.
+learning_rate: 1e-4
+weight_decay: 0.1
+warmup_steps: 1000
+optimizer: muon_hybrid
+muon_lr_mult: 6.0
+muon_betas: [0.9, 0.95]
+muon_adjust_lr_fn: match_rms_adamw
+num_epochs: 100
+samples_per_epoch: 1024000 #25600
+gradient_accumulation_steps: 1
+gradient_checkpointing: false
+generate_every: 0
+save_every: 0
+checkpoint_dir: ./transformer/image_maskgit_discrete/checkpoints
+
+# Transformer shape (matched to the pinball config's hidden/heads/depth).
+hidden_dim: 512
+num_heads: 8
+transformer_n_layer: 12
+transformer_ffn_type: swiglu
+transformer_use_rope: true
+transformer_attn_backend: auto   # auto | flash | sdpa
+dropout: 0.1
+norm_type: layernorm
+# MaskGIT is bidirectional: no causal mask. (ar_graph_causal: false would imply the same,
+# but the explicit knob keeps the intent visible.)
+transformer_causal: false
+
+# ============================================================================
+# IMAGE MODALITY (discrete MaskGIT) — copied 1:1 from the pinball config
+# ============================================================================
+image_dataset_root:  /media/david/SSD_Data/Datasets/tiny-imagenet #/media/david/SSD_Data/Datasets/imagenet1k_hf  # /media/david/SSD_Data/Datasets/tiny-imagenet # /media/david/SSD_Data/Datasets/imagenet1k_hf  # ImageFolder layout: train/ + val/ class dirs
+image_size: 64 #64 #256
+image_num_classes: 200 # 1000
+image_objective: maskgit
+image_roundtrip_check: true
+image_num_workers: 4
+image_cache_mode: off                 # off | read | write | readwrite (latent/token shard cache)
+# Auto-prepare: build the ImageFolder from a HF dataset if the root is missing/empty.
+image_auto_prepare: true
+image_hf_dataset_id: zh-plus/tiny-imagenet #zh-plus/tiny-imagenet #ILSVRC/imagenet-1k
+image_prepare_streaming: true
+image_prepare_max_train: 0            # 0 = all samples
+image_prepare_max_val: 0
+image_prepare_overwrite: false
+
+# --- discrete variant: VQ codebook tokens, masked cross-entropy.
+image_maskgit_variant: discrete
+image_maskgit_vq_model_name: "./llamavae/vq_ds8_c2i.pt"   #"./llamavae/vq_ds16_c2i.pt"
+image_maskgit_train_mask_min: 0.1  # near-zero-mask batches carry ~no gradient
+image_maskgit_train_mask_max: 1.0
+image_maskgit_val_mask_ratio: 0.5
+image_maskgit_steps: 12
+image_maskgit_schedule: cosine
+image_maskgit_confidence: stability
+image_maskgit_use_timestep_cond: true
+
+# EMA shadow weights (sampling/preview prefer the EMA model).
+use_ema: true
+# Classifier-free guidance training: drop the class label with this probability.
+image_class_cond_drop_prob: 0.1
+
+# Per-epoch sample-grid previews (fake|real pairs under <checkpoint_dir>/preview_examples).
+image_preview_enable: true
+image_preview_eval_interval: 1        # every N epochs (0 = off)
+image_preview_num_samples: 8
+image_preview_guidance_scale: 3.0
+# FID against the val set (needs torchmetrics[image]); expensive — off by default.
+image_fid_enable: false
+image_fid_eval_interval: 0            # every N epochs (0 = off)
+image_fid_num_samples: 2048
+image_fid_guidance_scale: 3.0

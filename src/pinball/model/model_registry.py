@@ -38,10 +38,22 @@ def count_parameters(model, trainable_only: bool = True) -> int:
     return int(sum(p.numel() for p in params))
 
 
-def build_transformer_model(args, tokenizer, vocab_size: int, max_seq_len: int) -> TransformerLM:
+def build_transformer_model(
+    args,
+    tokenizer,
+    vocab_size: int,
+    max_seq_len: int,
+    tie_weights: bool = True,
+    class_cond_enable: bool = False,
+) -> TransformerLM:
     n_embd = int(getattr(args, "transformer_n_embd", 0) or getattr(args, "hidden_dim", 768))
     n_head = int(getattr(args, "transformer_n_head", 0) or getattr(args, "num_heads", 12))
     n_layer = int(getattr(args, "transformer_n_layer", 0) or 12)
+    # transformer_causal overrides; else follow the graph-causality flag (ar_graph_causal
+    # expands to hier_ar_enable in the config), so MaskGIT configs get bidi automatically.
+    causal = getattr(args, "transformer_causal", None)
+    if causal is None:
+        causal = getattr(args, "hier_ar_enable", True)
     config = TransformerConfig(
         vocab_size=int(vocab_size),
         block_size=int(max_seq_len),
@@ -56,12 +68,16 @@ def build_transformer_model(args, tokenizer, vocab_size: int, max_seq_len: int) 
         use_abs_pos_emb=bool(getattr(args, "transformer_use_abs_pos_emb", True)),
         attn_backend=str(getattr(args, "transformer_attn_backend", "auto")),
         gradient_checkpointing=bool(getattr(args, "transformer_gradient_checkpointing", getattr(args, "use_gradient_checkpointing", False))),
-        tie_weights=bool(getattr(args, "transformer_tie_weights", True)),
+        tie_weights=bool(getattr(args, "transformer_tie_weights", tie_weights)),
         ffn_type=str(getattr(args, "transformer_ffn_type", "swiglu")),
+        causal=bool(causal),
+        class_cond_enable=bool(class_cond_enable),
+        num_classes=int(getattr(args, "image_num_classes", 1000)) if class_cond_enable else 0,
+        class_cond_drop_prob=float(getattr(args, "image_class_cond_drop_prob", 0.1)),
     )
     model = TransformerLM(config, tokenizer=tokenizer)
     logger.info(
-        "Built Transformer baseline: layers=%d heads=%d embd=%d block=%d backend=%s ffn=%s rope=%s abs_pos=%s tied=%s",
+        "Built Transformer baseline: layers=%d heads=%d embd=%d block=%d backend=%s ffn=%s rope=%s abs_pos=%s tied=%s causal=%s class_cond=%s",
         int(config.n_layer),
         int(config.n_head),
         int(config.n_embd),
@@ -71,6 +87,8 @@ def build_transformer_model(args, tokenizer, vocab_size: int, max_seq_len: int) 
         bool(config.use_rope),
         bool(config.use_abs_pos_emb),
         bool(config.tie_weights),
+        bool(config.causal),
+        bool(config.class_cond_enable),
     )
     return model
 
@@ -452,9 +470,20 @@ def build_model(
     model_type = normalize_model_type(getattr(args, "model_type", "pinball"))
     max_seq_len = int(max_seq_len if max_seq_len is not None else getattr(args, "block_size", 1024))
     if model_type == "transformer":
-        if str(getattr(args, "modality", "text")).lower() != "text":
-            raise ValueError("model_type=transformer is currently supported for text/token inputs only")
-        return build_transformer_model(args, tokenizer=tokenizer, vocab_size=int(vocab_size), max_seq_len=max_seq_len)
+        modality = str(getattr(args, "modality", "text")).lower()
+        if modality not in {"text", "image"} or (modality == "image" and str(input_mode) != "tokens"):
+            raise ValueError(
+                "model_type=transformer supports text runs and discrete-token image MaskGIT "
+                "(input_mode=tokens) only"
+            )
+        return build_transformer_model(
+            args,
+            tokenizer=tokenizer,
+            vocab_size=int(vocab_size),
+            max_seq_len=max_seq_len,
+            tie_weights=bool(tie_weights),
+            class_cond_enable=bool(class_cond_enable),
+        )
     return build_pinball_model(
         args,
         tokenizer=tokenizer,
