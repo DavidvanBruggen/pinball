@@ -43,6 +43,25 @@ class TransformerConfig:
     # hier_layer_compile so speed comparisons stay fair). Lazy, probation fallback to
     # eager on first runtime failure; eval/generation stay eager (shape-varying).
     compile_blocks: bool = False
+    # Continuous-feature I/O ("features"): input is [B,T,vocab_size] floats projected by a
+    # Linear (no embedding table), output head projects back to vocab_size (= feature dim).
+    input_mode: str = "tokens"
+    # Sinusoidal timestep FiLM conditioning (diffusion); mirrors pinball's time_embed_mlp.
+    timestep_cond_enable: bool = False
+    timestep_embed_dim: int = 256
+    # Per-block FiLM (class+timestep) before every transformer block — the parity knob for
+    # pinball's refine_cond_mode="film" (DiT-style per-layer conditioning instead of a single
+    # input-embedding injection). Zero-init -> exact identity at init.
+    block_cond_film: bool = False
+    # RGB<->token conv U-Net bridge (shared RGBTokenUNet2D module — same stem as pinball's
+    # direct-pixel diffusion runs, trained end-to-end; token_dim = vocab_size).
+    rgb_unet_enable: bool = False
+    rgb_unet_downsample: int = 16
+    rgb_unet_base_channels: int = 64
+    rgb_unet_kernel_size: int = 5
+    rgb_unet_decode_kernel_size: int = 3
+    rgb_unet_decode_separable: bool = True
+    rgb_unet_max_channels: int = 512
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -277,8 +296,10 @@ class TransformerLM(nn.Module):
         self.use_rope = bool(config.use_rope)
         self.use_abs_pos_emb = bool(config.use_abs_pos_emb)
 
-        # Class conditioning (image MaskGIT): FiLM on the token embeddings, mirroring the
-        # pinball model's _apply_film_conditioning (same null-index/CFG-drop semantics).
+        # Class conditioning (image MaskGIT/diffusion): FiLM on the token embeddings,
+        # mirroring the pinball model's _apply_film_conditioning (same null-index/CFG-drop
+        # semantics). Timestep conditioning adds a sinusoidal->MLP embedding into the same
+        # FiLM vector (mirrors pinball's time_embed_mlp).
         self.num_classes = int(config.num_classes)
         self.class_cond_drop_prob = max(0.0, min(1.0, float(config.class_cond_drop_prob)))
         self.class_null_index = int(self.num_classes)
@@ -286,16 +307,57 @@ class TransformerLM(nn.Module):
         self.cond_film: Optional[nn.Linear] = None
         if bool(config.class_cond_enable) and self.num_classes > 0:
             self.class_embedding = nn.Embedding(self.num_classes + 1, config.n_embd)
+        self.timestep_embed_dim = max(16, int(config.timestep_embed_dim))
+        self.time_embed_mlp: Optional[nn.Sequential] = None
+        if bool(config.timestep_cond_enable):
+            self.time_embed_mlp = nn.Sequential(
+                nn.Linear(self.timestep_embed_dim, config.n_embd),
+                nn.SiLU(),
+                nn.Linear(config.n_embd, config.n_embd),
+            )
+        if self.class_embedding is not None or self.time_embed_mlp is not None:
             self.cond_film = nn.Linear(config.n_embd, 2 * config.n_embd)
+        # Per-block FiLM (mirrors pinball's refine_cond_film: tanh gamma, zero-init identity).
+        self.block_cond_films: Optional[nn.ModuleList] = None
+        if bool(config.block_cond_film) and self.cond_film is not None:
+            self.block_cond_films = nn.ModuleList(
+                [nn.Linear(config.n_embd, 2 * config.n_embd) for _ in range(config.n_layer)]
+            )
 
-        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=self.pad_token_id)
+        self.input_mode = str(config.input_mode).lower()
+        self.tie_weights = bool(config.tie_weights)
+        self.token_embedding: Optional[nn.Embedding] = None
+        self.feature_projection: Optional[nn.Linear] = None
+        if self.input_mode == "features":
+            # Continuous features in: [B,T,vocab_size] floats -> linear embed (no table).
+            self.feature_projection = nn.Linear(config.vocab_size, config.n_embd)
+        else:
+            self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=self.pad_token_id)
         self.position_embedding = nn.Embedding(config.block_size, config.n_embd) if config.use_abs_pos_emb else None
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layer)])
         self.ln_f = make_norm(config.n_embd, norm_type=config.norm_type, eps=config.norm_eps)
         self.output_projection = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        if config.tie_weights:
+        if config.tie_weights and self.token_embedding is not None:
             self.output_projection.weight = self.token_embedding.weight
+
+        # RGB<->token conv U-Net bridge (the direct-pixel stem): same module pinball uses,
+        # so the pixel-diffusion comparison differs ONLY in the sequence model between
+        # encode and decode. Lazy import — the pinball module is heavy.
+        self.rgb_token_unet = None
+        if bool(config.rgb_unet_enable):
+            from .hierarchical_flow_gat_cached_batch import RGBTokenUNet2D
+            self.rgb_token_unet = RGBTokenUNet2D(
+                token_dim=int(config.vocab_size),
+                downsample_factor=int(config.rgb_unet_downsample),
+                base_channels=int(config.rgb_unet_base_channels),
+                kernel_size=int(config.rgb_unet_kernel_size),
+                decode_kernel_size=int(config.rgb_unet_decode_kernel_size),
+                decode_separable=bool(config.rgb_unet_decode_separable),
+                max_channels=int(config.rgb_unet_max_channels),
+                dropout=float(config.dropout),
+                cond_dim=int(config.n_embd),
+            )
 
         self._last_ce_loss = None
         self._last_copy_dst_ce_loss = None
@@ -304,6 +366,11 @@ class TransformerLM(nn.Module):
         self._last_transformer_attn_backend = "unknown"
         self.compile_blocks = bool(config.compile_blocks)
         self.apply(self._init_weights)
+        # AFTER the global init sweep: per-block FiLM must start as exact identity.
+        if self.block_cond_films is not None:
+            for film in self.block_cond_films:
+                nn.init.zeros_(film.weight)
+                nn.init.zeros_(film.bias)
 
     def _block_callable(self, block: nn.Module):
         """torch.compile'd block forward in training mode when compile_blocks is on —
@@ -350,20 +417,107 @@ class TransformerLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _build_timestep_embedding(self, timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+        if timesteps.dim() == 0:
+            timesteps = timesteps.unsqueeze(0)
+        timesteps = timesteps.to(dtype=torch.float32)
+        half = dim // 2
+        if half <= 0:
+            return timesteps.unsqueeze(-1)
+        freqs = torch.exp(
+            -math.log(float(max_period))
+            * torch.arange(0, half, device=timesteps.device, dtype=torch.float32)
+            / max(half - 1, 1)
+        )
+        args = timesteps.unsqueeze(-1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
+
+    def _compute_conditioning_vector(
+        self,
+        batch_size: int,
+        device: torch.device,
+        class_labels: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        cond = None
+        if self.class_embedding is not None:
+            if class_labels is None:
+                cls = torch.full((int(batch_size),), int(self.class_null_index), dtype=torch.long, device=device)
+            else:
+                cls = class_labels.to(device=device, dtype=torch.long).view(-1)
+                if int(cls.numel()) != int(batch_size):
+                    cls = cls.expand(int(batch_size)) if int(cls.numel()) == 1 else cls[: int(batch_size)]
+                cls = cls.clamp(min=0, max=max(0, int(self.num_classes)))
+                if self.training and self.class_cond_drop_prob > 0.0:
+                    drop_mask = torch.rand(int(batch_size), device=device) < float(self.class_cond_drop_prob)
+                    if bool(drop_mask.any()):
+                        cls = cls.clone()
+                        cls[drop_mask] = int(self.class_null_index)
+            cond = self.class_embedding(cls)
+        if timesteps is not None and self.time_embed_mlp is not None:
+            t = timesteps.to(device=device)
+            if t.dim() == 0:
+                t = t.expand(int(batch_size))
+            if t.dim() > 1:
+                t = t.view(-1)
+            if int(t.numel()) != int(batch_size):
+                t = t.expand(int(batch_size)) if int(t.numel()) == 1 else t[: int(batch_size)]
+            t_emb = self._build_timestep_embedding(t, int(self.timestep_embed_dim))
+            t_emb = self.time_embed_mlp(t_emb.to(dtype=self.time_embed_mlp[0].weight.dtype))
+            cond = t_emb if cond is None else cond + t_emb
+        return cond
+
+    def encode_rgb_to_tokens(
+        self,
+        pixel_values: torch.Tensor,
+        class_labels: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
+        cond_vec: Optional[torch.Tensor] = None,
+    ):
+        if self.rgb_token_unet is None:
+            raise RuntimeError("RGB token U-Net bridge is not enabled on the transformer baseline")
+        cond = cond_vec if cond_vec is not None else self._compute_conditioning_vector(
+            int(pixel_values.size(0)), pixel_values.device, class_labels=class_labels, timesteps=timesteps,
+        )
+        return self.rgb_token_unet.encode(pixel_values, cond=cond)
+
+    def decode_tokens_to_rgb(
+        self,
+        token_features: torch.Tensor,
+        context,
+        class_labels: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
+        cond_vec: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.rgb_token_unet is None:
+            raise RuntimeError("RGB token U-Net bridge is not enabled on the transformer baseline")
+        cond = cond_vec if cond_vec is not None else self._compute_conditioning_vector(
+            int(token_features.size(0)), token_features.device, class_labels=class_labels, timesteps=timesteps,
+        )
+        return self.rgb_token_unet.decode(token_features, context, cond=cond)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         class_labels: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
+        cond_vec: Optional[torch.Tensor] = None,
         reveal_target_ids: Optional[torch.Tensor] = None,
         reveal_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         del reveal_target_ids, reveal_mask, kwargs
-        if input_ids.dim() != 2:
+        if self.input_mode == "features":
+            if input_ids.dim() != 3:
+                raise ValueError(f"TransformerLM(features) expects [B,T,C], got {tuple(input_ids.shape)}")
+        elif input_ids.dim() != 2:
             raise ValueError(f"TransformerLM expects token ids [B,T], got {tuple(input_ids.shape)}")
-        bsz, seq_len = input_ids.shape
+        bsz, seq_len = int(input_ids.size(0)), int(input_ids.size(1))
         if seq_len > self.block_size:
             input_ids = input_ids[:, -self.block_size :]
             if attention_mask is not None:
@@ -375,24 +529,20 @@ class TransformerLM(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(bsz, seq_len)
 
-        x = self.token_embedding(input_ids)
+        if self.feature_projection is not None:
+            x = self.feature_projection(input_ids.to(dtype=self.feature_projection.weight.dtype))
+        else:
+            x = self.token_embedding(input_ids)
         if self.position_embedding is not None:
             pos = position_ids.clamp_min(0).clamp_max(self.block_size - 1)
             x = x + self.position_embedding(pos)
-        if self.class_embedding is not None:
-            if class_labels is None:
-                cls = torch.full((bsz,), int(self.class_null_index), dtype=torch.long, device=x.device)
-            else:
-                cls = class_labels.to(device=x.device, dtype=torch.long).view(-1)
-                if int(cls.numel()) != int(bsz):
-                    cls = cls.expand(int(bsz)) if int(cls.numel()) == 1 else cls[: int(bsz)]
-                cls = cls.clamp(min=0, max=max(0, int(self.num_classes)))
-                if self.training and self.class_cond_drop_prob > 0.0:
-                    drop_mask = torch.rand(int(bsz), device=x.device) < float(self.class_cond_drop_prob)
-                    if bool(drop_mask.any()):
-                        cls = cls.clone()
-                        cls[drop_mask] = int(self.class_null_index)
-            gamma, beta = self.cond_film(self.class_embedding(cls)).chunk(2, dim=-1)
+        # Precomputed cond_vec (trainer shares ONE per step with the RGB bridge so the CFG
+        # class-drop is sampled once, not independently per encode/core/decode call).
+        cond = cond_vec if cond_vec is not None else self._compute_conditioning_vector(
+            bsz, x.device, class_labels=class_labels, timesteps=timesteps
+        )
+        if cond is not None and self.cond_film is not None:
+            gamma, beta = self.cond_film(cond.to(dtype=x.dtype)).chunk(2, dim=-1)
             x = x * (1.0 + torch.sigmoid(gamma).unsqueeze(1)) + beta.unsqueeze(1)
         x = self.drop(x)
 
@@ -402,7 +552,13 @@ class TransformerLM(nn.Module):
         if attention_mask is not None and bool(attention_mask.to(dtype=torch.bool).all().item()):
             attention_mask = None
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            if self.block_cond_films is not None and cond is not None:
+                # Per-block FiLM (pinball refine_cond_mode="film" parity): tanh gamma,
+                # zero-init -> identity. Applied eagerly outside the compiled block.
+                gb = self.block_cond_films[i](cond.to(dtype=x.dtype))
+                b_gamma, b_beta = gb.chunk(2, dim=-1)
+                x = x * (1.0 + torch.tanh(b_gamma).unsqueeze(1)) + b_beta.unsqueeze(1)
             if self.gradient_checkpointing and self.training:
                 x = checkpoint(block, x, attention_mask, position_ids, use_reentrant=False)
             else:

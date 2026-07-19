@@ -1656,6 +1656,11 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         reveal_mask: Optional[torch.Tensor] = None,
         class_labels: Optional[torch.Tensor] = None,
         timesteps: Optional[torch.Tensor] = None,
+        cond_vec: Optional[torch.Tensor] = None,  # precomputed conditioning (class+timestep FiLM
+                                  # vector). When given, class_labels/timesteps are NOT re-embedded:
+                                  # the trainer computes it ONCE per step and shares it with the RGB
+                                  # bridge encode/decode so the CFG class-drop is sampled once, not
+                                  # independently per call.
         logits_last_only: bool = False,  # AR generation: project only the final position
                                   # retrieval: build the bundle from THIS forward's base L3
                                   # (no separate no-grad forward, which perturbs training).
@@ -1890,12 +1895,13 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         else:                                    # classic token IDs
             token_embeddings_dense = self._get_embeddings(input_ids, position_ids)#, max_len=seq_len)  # (B, L, H)
 
-        cond_vec = self._compute_conditioning_vector(
-            batch_size=int(token_embeddings_dense.size(0)),
-            device=token_embeddings_dense.device,
-            class_labels=class_labels,
-            timesteps=timesteps,
-        )
+        if cond_vec is None:
+            cond_vec = self._compute_conditioning_vector(
+                batch_size=int(token_embeddings_dense.size(0)),
+                device=token_embeddings_dense.device,
+                class_labels=class_labels,
+                timesteps=timesteps,
+            )
         token_embeddings_dense = self._apply_film_conditioning(token_embeddings_dense, cond_vec)
 
         # Get batch size and sequence lengths.
@@ -2314,6 +2320,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 reveal_target_ids, reveal_mask,
                 class_labels=class_labels,
                 timesteps=timesteps,
+                cond_vec=cond_vec,
                 logits_last_only=logits_last_only,
                 logits_last_index=logits_last_index,
             )

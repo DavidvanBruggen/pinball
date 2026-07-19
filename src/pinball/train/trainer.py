@@ -2254,6 +2254,7 @@ class EnhancedHierarchicalTrainer:
         image_diffusion_strict_shapes=True,
         image_sampling_legacy_update=False,
         image_sampling_respace_timesteps=True,
+        image_sampling_clamp_x0=True,
         image_objective="diffusion",
         image_maskgit_variant="continuous",
         image_maskgit_vq_model_name="",
@@ -2411,6 +2412,7 @@ class EnhancedHierarchicalTrainer:
         self.image_diffusion_strict_shapes = bool(image_diffusion_strict_shapes)
         self.image_sampling_legacy_update = bool(image_sampling_legacy_update)
         self.image_sampling_respace_timesteps = bool(image_sampling_respace_timesteps)
+        self.image_sampling_clamp_x0 = bool(image_sampling_clamp_x0)
         self.image_objective = str(image_objective).lower()
         if self.image_objective not in {"diffusion", "maskgit"}:
             self.image_objective = "diffusion"
@@ -3287,6 +3289,55 @@ class EnhancedHierarchicalTrainer:
             tgt._last_image_target_mean = target_mean
             tgt._last_image_t_mean = t_mean
 
+    def _shared_image_cond_vec(
+        self,
+        model_ref: Optional[nn.Module],
+        batch_size: int,
+        device: torch.device,
+        class_labels: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Compute the class+timestep conditioning vector ONCE per step so the RGB bridge
+        encode, the core forward, and the bridge decode all see the SAME vector. Without
+        this each of the three calls sampled its own CFG class-drop mask in training:
+        ~27% of samples got inconsistent conditioning across the modules and the fully
+        unconditional configuration CFG needs was trained with p=drop^3 instead of drop."""
+        mdl = self.model if model_ref is None else model_ref
+        fn = getattr(mdl, "_compute_conditioning_vector", None)
+        if fn is None:
+            mod = getattr(mdl, "module", None)
+            if mod is not None:
+                fn = getattr(mod, "_compute_conditioning_vector", None)
+        if fn is None:
+            return None
+        return fn(
+            batch_size=int(batch_size),
+            device=device,
+            class_labels=class_labels,
+            timesteps=timesteps,
+        )
+
+    def _val_diffusion_draws(
+        self,
+        batch_index: int,
+        batch_size: int,
+        noise_shape: Tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Deterministic (t, noise) for validation batches: seeded on a CPU generator per
+        batch index, so the validation diffusion loss is comparable across epochs/runs.
+        Unseeded draws made best-checkpoint selection a lottery over timestep luck."""
+        g = torch.Generator()
+        g.manual_seed(int(getattr(self, "seed", 42) or 42) * 1000003 + int(batch_index))
+        t = torch.randint(
+            0, int(self.image_diffusion_steps), (int(batch_size),), generator=g, dtype=torch.long
+        ).to(device)
+        noise = torch.randn(tuple(noise_shape), generator=g, dtype=torch.float32).to(
+            device=device, dtype=dtype
+        )
+        return t, noise
+
     def _weighted_mse_loss(
         self,
         pred: torch.Tensor,
@@ -3861,11 +3912,20 @@ class EnhancedHierarchicalTrainer:
                 x_t_rgb = torch.sqrt(ab) * x0_rgb + torch.sqrt(1.0 - ab) * noise_rgb
 
                 with amp_ctx:
+                    # ONE conditioning vector for encode + core + decode (single CFG drop).
+                    cond_vec = self._shared_image_cond_vec(
+                        model_ref=self.model,
+                        batch_size=bsz,
+                        device=pixel_values.device,
+                        class_labels=class_labels,
+                        timesteps=t,
+                    )
                     x_t_tokens, decode_context = self._encode_pixels_rgb_unet_tokens(
                         x_t_rgb,
                         model_ref=self.model,
                         class_labels=class_labels,
                         timesteps=t,
+                        cond_vec=cond_vec,
                     )
                     tok = int(x_t_tokens.size(1))
                     attention_mask = torch.ones((bsz, tok), device=x_t_tokens.device, dtype=torch.long)
@@ -3874,6 +3934,7 @@ class EnhancedHierarchicalTrainer:
                         attention_mask=attention_mask,
                         class_labels=class_labels,
                         timesteps=t,
+                        cond_vec=cond_vec,
                     )
                     pred_tokens_fit = self._fit_pred_to_target(
                         pred_tokens,
@@ -3886,6 +3947,7 @@ class EnhancedHierarchicalTrainer:
                         model_ref=self.model,
                         class_labels=class_labels,
                         timesteps=t,
+                        cond_vec=cond_vec,
                     )
                     pr = pred_eps_rgb
                     tg = self._diffusion_target_from_x0_noise(x0=x0_rgb, noise=noise_rgb, alpha_bar_t=ab.view(bsz))
@@ -4410,14 +4472,22 @@ class EnhancedHierarchicalTrainer:
             t_idx = int(t_indices[idx_pos].item())
             t = torch.full((int(x.size(0)),), int(t_idx), device=self.device, dtype=torch.long)
             with self._image_sampling_amp_ctx():
+                cond_vec = self._shared_image_cond_vec(
+                    model_ref=model_for_gen,
+                    batch_size=int(x.size(0)),
+                    device=x.device,
+                    class_labels=cls,
+                    timesteps=t,
+                )
                 tok_cond, dec_ctx = self._encode_pixels_rgb_unet_tokens(
                     x,
                     model_ref=model_for_gen,
                     class_labels=cls,
                     timesteps=t,
+                    cond_vec=cond_vec,
                 )
                 attn = torch.ones((int(tok_cond.size(0)), int(tok_cond.size(1))), device=tok_cond.device, dtype=torch.long)
-                pred_tok_cond = model_for_gen(tok_cond, attention_mask=attn, class_labels=cls, timesteps=t)
+                pred_tok_cond = model_for_gen(tok_cond, attention_mask=attn, class_labels=cls, timesteps=t, cond_vec=cond_vec)
                 pred_tok_cond = self._fit_pred_to_target(
                     pred_tok_cond,
                     tok_cond,
@@ -4429,20 +4499,29 @@ class EnhancedHierarchicalTrainer:
                     model_ref=model_for_gen,
                     class_labels=cls,
                     timesteps=t,
+                    cond_vec=cond_vec,
                 )
             pred_rgb_cond = pred_rgb_cond.float()
 
             if cls is not None and guidance_scale > 0.0:
                 null_cls = torch.full_like(cls, int(self.image_num_classes))
                 with self._image_sampling_amp_ctx():
+                    cond_vec_null = self._shared_image_cond_vec(
+                        model_ref=model_for_gen,
+                        batch_size=int(x.size(0)),
+                        device=x.device,
+                        class_labels=null_cls,
+                        timesteps=t,
+                    )
                     tok_null, dec_ctx_null = self._encode_pixels_rgb_unet_tokens(
                         x,
                         model_ref=model_for_gen,
                         class_labels=null_cls,
                         timesteps=t,
+                        cond_vec=cond_vec_null,
                     )
                     attn_null = torch.ones((int(tok_null.size(0)), int(tok_null.size(1))), device=tok_null.device, dtype=torch.long)
-                    pred_tok_null = model_for_gen(tok_null, attention_mask=attn_null, class_labels=null_cls, timesteps=t)
+                    pred_tok_null = model_for_gen(tok_null, attention_mask=attn_null, class_labels=null_cls, timesteps=t, cond_vec=cond_vec_null)
                     pred_tok_null = self._fit_pred_to_target(
                         pred_tok_null,
                         tok_null,
@@ -4454,6 +4533,7 @@ class EnhancedHierarchicalTrainer:
                         model_ref=model_for_gen,
                         class_labels=null_cls,
                         timesteps=t,
+                        cond_vec=cond_vec_null,
                     )
                 pred_rgb_null = pred_rgb_null.float()
                 pred_rgb = pred_rgb_null + float(guidance_scale) * (pred_rgb_cond - pred_rgb_null)
@@ -4462,6 +4542,13 @@ class EnhancedHierarchicalTrainer:
 
             ab_t = alpha_bars[int(t_idx)].to(dtype=x.dtype)
             x0_pred, _eps_pred = self._prediction_to_x0_eps(pred=pred_rgb, x_t=x, alpha_bar_t=ab_t)
+            if bool(getattr(self, "image_sampling_clamp_x0", True)):
+                # Pixel data is bounded: clamping the per-step x0 estimate keeps the
+                # trajectory on-manifold (standard DDPM practice; matters at few steps).
+                if bool(self.image_rgb_centered_diffusion):
+                    x0_pred = x0_pred.clamp(-1.0, 1.0)
+                else:
+                    x0_pred = x0_pred.clamp(0.0, 1.0)
 
             if idx_pos + 1 < int(t_indices.numel()):
                 t_prev = int(t_indices[idx_pos + 1].item())
@@ -4502,7 +4589,7 @@ class EnhancedHierarchicalTrainer:
         total_loss = 0.0
         denom = 0
         with torch.no_grad():
-            for _, batch_data in enumerate(pbar):
+            for val_bi, batch_data in enumerate(pbar):
                 batch = get_batch(self.device) if use_get_batch else batch_data
                 if self.image_token_mode == "rgb_unet":
                     if not isinstance(batch, dict):
@@ -4524,21 +4611,34 @@ class EnhancedHierarchicalTrainer:
                         bsz = int(pixel_values.size(0))
                         sched = self._get_image_diffusion_params(device=pixel_values.device)
                         alpha_bars = sched["alpha_bars"]
-                        t = torch.randint(0, int(self.image_diffusion_steps), (bsz,), device=pixel_values.device, dtype=torch.long)
-                        ab = alpha_bars.index_select(0, t).view(bsz, 1, 1, 1).to(dtype=pixel_values.dtype)
                         x0_rgb = self._rgb_to_centered(pixel_values) if bool(self.image_rgb_centered_diffusion) else pixel_values
-                        noise_rgb = torch.randn_like(x0_rgb)
+                        t, noise_rgb = self._val_diffusion_draws(
+                            batch_index=val_bi,
+                            batch_size=bsz,
+                            noise_shape=tuple(x0_rgb.shape),
+                            device=x0_rgb.device,
+                            dtype=x0_rgb.dtype,
+                        )
+                        ab = alpha_bars.index_select(0, t).view(bsz, 1, 1, 1).to(dtype=pixel_values.dtype)
                         x_t_rgb = torch.sqrt(ab) * x0_rgb + torch.sqrt(1.0 - ab) * noise_rgb
                         with self._image_sampling_amp_ctx():
+                            cond_vec = self._shared_image_cond_vec(
+                                model_ref=model_to_use,
+                                batch_size=bsz,
+                                device=pixel_values.device,
+                                class_labels=class_labels,
+                                timesteps=t,
+                            )
                             x_t_tokens, decode_context = self._encode_pixels_rgb_unet_tokens(
                                 x_t_rgb,
                                 model_ref=model_to_use,
                                 class_labels=class_labels,
                                 timesteps=t,
+                                cond_vec=cond_vec,
                             )
                             tok = int(x_t_tokens.size(1))
                             attn = torch.ones((bsz, tok), device=x_t_tokens.device, dtype=torch.long)
-                            pred_tokens = model_to_use(x_t_tokens, attention_mask=attn, class_labels=class_labels, timesteps=t)
+                            pred_tokens = model_to_use(x_t_tokens, attention_mask=attn, class_labels=class_labels, timesteps=t, cond_vec=cond_vec)
                             pred_tokens_fit = self._fit_pred_to_target(
                                 pred_tokens,
                                 x_t_tokens,
@@ -4550,6 +4650,7 @@ class EnhancedHierarchicalTrainer:
                                 model_ref=model_to_use,
                                 class_labels=class_labels,
                                 timesteps=t,
+                                cond_vec=cond_vec,
                             )
                         pr = pred_eps_rgb.float()
                         tg = self._diffusion_target_from_x0_noise(x0=x0_rgb, noise=noise_rgb, alpha_bar_t=ab.view(bsz))
@@ -4573,9 +4674,14 @@ class EnhancedHierarchicalTrainer:
                         bsz, tok, _ = x0.shape
                         sched = self._get_image_diffusion_params(device=x0.device)
                         alpha_bars = sched["alpha_bars"]
-                        t = torch.randint(0, int(self.image_diffusion_steps), (bsz,), device=x0.device, dtype=torch.long)
+                        t, noise = self._val_diffusion_draws(
+                            batch_index=val_bi,
+                            batch_size=bsz,
+                            noise_shape=tuple(x0.shape),
+                            device=x0.device,
+                            dtype=x0.dtype,
+                        )
                         ab = alpha_bars.index_select(0, t).view(bsz, 1, 1).to(dtype=x0.dtype)
-                        noise = torch.randn_like(x0)
                         x_t = torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
                         attn = torch.ones((bsz, tok), device=x0.device, dtype=torch.long)
                         with self._image_sampling_amp_ctx():
@@ -4595,9 +4701,14 @@ class EnhancedHierarchicalTrainer:
                     bsz, tok, _ = x0.shape
                     sched = self._get_image_diffusion_params(device=x0.device)
                     alpha_bars = sched["alpha_bars"]
-                    t = torch.randint(0, int(self.image_diffusion_steps), (bsz,), device=x0.device, dtype=torch.long)
+                    t, noise = self._val_diffusion_draws(
+                        batch_index=val_bi,
+                        batch_size=bsz,
+                        noise_shape=tuple(x0.shape),
+                        device=x0.device,
+                        dtype=x0.dtype,
+                    )
                     ab = alpha_bars.index_select(0, t).view(bsz, 1, 1).to(dtype=x0.dtype)
-                    noise = torch.randn_like(x0)
                     x_t = torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
                     attn = torch.ones((bsz, tok), device=x0.device, dtype=torch.long)
                     with self._image_sampling_amp_ctx():

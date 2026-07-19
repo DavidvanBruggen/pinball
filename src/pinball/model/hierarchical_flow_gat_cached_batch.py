@@ -2004,6 +2004,7 @@ def _compute_pair_aux_loss(
     low_level: int,
     high_level: int,
     detach_target: bool = True,
+    loss_mode: str = "mse",
 ) -> torch.Tensor:
     """
     Fast, vectorized aux loss: predict level `low_level` features from their
@@ -2056,6 +2057,16 @@ def _compute_pair_aux_loss(
     if detach_target:
         target = target.detach()
 
+    # Same mode math as _compute_hier_aux_pair_loss (the causal/jepa paths' helper):
+    # raw MSE on unnormalized features is unbounded — it tracks feature-norm growth
+    # quadratically and can come to dominate the objective.
+    if loss_mode in ("mse_norm", "nmse"):
+        sq_err = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
+        denom = target.pow(2).mean(dim=-1).clamp_min(1e-8)
+        return (sq_err / denom).mean()
+    if loss_mode == "cosine":
+        cos = F.cosine_similarity(pred, target, dim=-1, eps=1e-8)
+        return ((1.0 - cos) * 0.5).mean()
     return F.mse_loss(pred, target)
 
 def compute_hierarchy_aux_loss(
@@ -2066,6 +2077,7 @@ def compute_hierarchy_aux_loss(
     w_l1_from_l2: float = 1.0,
     w_l0_from_l1: float = 1.0,
     w_l0_from_l3: float = 0.25,   # smaller weight by default
+    loss_mode: str = "mse",       # "mse" | "mse_norm" | "cosine" (hier_aux_loss_mode)
 ) -> torch.Tensor:
     """
     Combined hierarchy aux loss:
@@ -2084,23 +2096,23 @@ def compute_hierarchy_aux_loss(
 
     # L2 <- L3
     if w_l2_from_l3 != 0.0:
-        l = _compute_pair_aux_loss(g, low_level=2, high_level=3, detach_target=detach_target)
+        l = _compute_pair_aux_loss(g, low_level=2, high_level=3, detach_target=detach_target, loss_mode=loss_mode)
         loss_total = loss_total + w_l2_from_l3 * l
 
     # L1 <- L2
     if w_l1_from_l2 != 0.0:
-        l = _compute_pair_aux_loss(g, low_level=1, high_level=2, detach_target=detach_target)
+        l = _compute_pair_aux_loss(g, low_level=1, high_level=2, detach_target=detach_target, loss_mode=loss_mode)
         loss_total = loss_total + w_l1_from_l2 * l
 
     # L0 <- L1  (short-range reconstruction)
     _detach_l0 = detach_target and not link_low0
     if w_l0_from_l1 != 0.0:
-        l = _compute_pair_aux_loss(g, low_level=0, high_level=1, detach_target=_detach_l0)
+        l = _compute_pair_aux_loss(g, low_level=0, high_level=1, detach_target=_detach_l0, loss_mode=loss_mode)
         loss_total = loss_total + w_l0_from_l1 * l
 
     # L0 <- L3  (long-range “closing the loop”; only has effect if 0–3 edges exist)
     if w_l0_from_l3 != 0.0:
-        l = _compute_pair_aux_loss(g, low_level=0, high_level=3, detach_target=_detach_l0)
+        l = _compute_pair_aux_loss(g, low_level=0, high_level=3, detach_target=_detach_l0, loss_mode=loss_mode)
         loss_total = loss_total + w_l0_from_l3 * l
 
     return loss_total
@@ -7593,6 +7605,7 @@ class HierarchicalFlowGAT(nn.Module):
                     w_l1_from_l2=float(getattr(self, "hier_aux_w_l1_from_l2", 1.0)),
                     w_l0_from_l1=float(getattr(self, "hier_aux_w_l0_from_l1", 1.0)),
                     w_l0_from_l3=float(getattr(self, "hier_aux_w_l0_from_l3", 0.25)),
+                    loss_mode=str(getattr(self, "hier_aux_loss_mode", "mse")),
                 )
 
             pair_defs = [

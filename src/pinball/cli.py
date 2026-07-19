@@ -399,7 +399,7 @@ def main(argv=None) -> None:
             "image_diffusion_prediction", "image_rgb_centered_diffusion",
             "image_diffusion_min_snr_gamma", "image_diffusion_steps",
             "image_diffusion_beta_start", "image_diffusion_beta_end",
-            "image_sampling_respace_timesteps",
+            "image_sampling_respace_timesteps", "image_sampling_clamp_x0",
             "image_preview_enable", "image_preview_num_samples",
             "image_preview_guidance_scale", "image_preview_diffusion_steps",
             "image_preview_examples_dir",

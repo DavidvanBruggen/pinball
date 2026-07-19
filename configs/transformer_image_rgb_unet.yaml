@@ -1,0 +1,105 @@
+# DIRECT PIXEL transformer baseline — the head-to-head counterpart of
+# pinball_image_rgb_unet.yaml. IDENTICAL pipeline: the same RGBTokenUNet2D conv bridge
+# (pixels -> 32x32 = 1024 token features -> decode with skips), the same pixel-space
+# v-prediction diffusion objective/schedule, same data/optimizer/EMA/CFG/preview settings —
+# only the sequence model between encode and decode differs (vanilla bidi transformer with
+# 1D raster RoPE + abs pos vs pinball's curve-mode hierarchy). Timestep + class conditioning
+# enter via the same FiLM scheme on both models.
+
+model_type: transformer
+modality: image
+tokenizer_name: gpt2            # unused in image mode (features input); kept for cli defaults
+
+block_size: 1024                # synced by the cli to (image_size / rgb_unet_downsample)^2
+batch_size: 36
+val_split: 0.01
+
+# Training — identical to the pinball config.
+train_mode: ar
+learning_rate: 1e-4
+weight_decay: 0.1
+warmup_steps: 2000
+optimizer: muon_hybrid
+muon_lr_mult: 6.0
+muon_betas: [0.9, 0.95]
+muon_adjust_lr_fn: match_rms_adamw
+num_epochs: 100
+samples_per_epoch: 6400 #102400
+gradient_accumulation_steps: 4
+gradient_checkpointing: false
+train_feature_chunked_ce_enable: false
+longctx_diag_every: 0
+generate_every: 0
+save_every: 0
+checkpoint_dir: ./transformer/image_rgb_unet/checkpoints
+
+# Transformer backbone — matches the maskgit baseline shape (512/8/12 swiglu + rope).
+# NOTE ~40M params untied vs pinball's ~68M+ (hierarchy extras); bump transformer_n_layer
+# toward 14-16 for a closer param match if judging at matched size rather than matched shape.
+hidden_dim: 512
+num_heads: 8
+transformer_n_layer: 12
+transformer_ffn_type: swiglu
+transformer_use_rope: true
+transformer_attn_backend: auto   # auto | flash | sdpa
+# Compile parity with pinball's hier_layer_compile + hier_refresh_compile.
+transformer_compile: true
+# Per-block FiLM conditioning (class+timestep before every block) — parity with pinball's
+# refine_cond_mode: film. Zero-init = identity at init; fresh runs only (adds params).
+transformer_block_cond_film: true
+dropout: 0.1
+norm_type: layernorm
+# Diffusion is bidirectional: the model sees the whole noisy image every step.
+transformer_causal: false
+ar_graph_causal: false
+
+# ============================================================================
+# IMAGE MODALITY — copied 1:1 from pinball_image_rgb_unet.yaml
+# ============================================================================
+image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf # /media/david/SSD_Data/Datasets/tiny-imagenet
+image_size: 256 #64
+image_num_classes: 1000 #200
+image_objective: diffusion
+image_token_mode: rgb_unet
+image_roundtrip_check: false    # the bridge is LEARNED — an init-time roundtrip is noise by design
+image_num_workers: 8
+image_cache_mode: off           # cache shards store latents/VQ tokens, not pixels
+image_auto_prepare: true
+image_hf_dataset_id: ILSVRC/imagenet-1k #zh-plus/tiny-imagenet
+image_prepare_streaming: true
+image_prepare_max_train: 0
+image_prepare_max_val: 0
+image_prepare_overwrite: false
+
+# RGB bridge (the CNN stem): downsample 2 -> 32x32 grid = 1024 tokens at 64px.
+image_rgb_unet_token_dim: 64
+image_rgb_unet_downsample: 4
+image_rgb_unet_base_channels: 64
+image_rgb_unet_kernel_size: 5
+image_rgb_unet_decode_kernel_size: 3
+image_rgb_unet_decode_separable: true
+image_rgb_unet_max_channels: 512
+
+# Diffusion (pixel-space v-prediction; auto -> rgb_epsilon + v for rgb_unet mode).
+image_diffusion_steps: 1000
+image_diffusion_schedule: cosine
+image_diffusion_target: auto
+image_diffusion_prediction: auto
+image_rgb_centered_diffusion: true
+image_diffusion_min_snr_gamma: 5.0
+image_diffusion_beta_start: 1e-4
+image_diffusion_beta_end: 2e-2
+
+use_ema: true
+image_class_cond_drop_prob: 0.1
+
+image_preview_enable: true
+image_preview_eval_interval: 1
+image_preview_num_samples: 8
+image_preview_guidance_scale: 3.0   # real CFG (1.0 = conditional-only): global structure shows
+                                    # up far earlier in previews under guidance
+image_preview_diffusion_steps: 36
+image_fid_enable: false
+image_fid_eval_interval: 0
+image_fid_num_samples: 2048
+image_fid_guidance_scale: 3.0

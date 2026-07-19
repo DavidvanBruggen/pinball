@@ -17,27 +17,28 @@ modality: image
 tokenizer_name: gpt2            # unused in image mode (features input); kept for cli defaults
 
 block_size: 1024                # synced by the cli to (image_size / rgb_unet_downsample)^2
-batch_size: 64                  # T=1024: ~7GiB @ b32 bf16 on the 4090; Blackwell takes 128-256
+batch_size: 256                 # T=1024: ~7GiB @ b32 bf16 on the 4090; Blackwell takes 128-256
 val_split: 0.01
 
 # Training
 train_mode: ar                  # graph flags below force bidi; this only names the text path
 learning_rate: 1e-4
 weight_decay: 0.1
-warmup_steps: 1000
+warmup_steps: 2000
 optimizer: muon_hybrid
 muon_lr_mult: 6.0
 muon_betas: [0.9, 0.95]
 muon_adjust_lr_fn: match_rms_adamw
-num_epochs: 100
-samples_per_epoch: 102400       # ~1600 steps/epoch at b64 -> preview cadence stays useful
+num_epochs: 500
+samples_per_epoch: 102400  # 64000 #102400       # ~1600 steps/epoch at b64 -> preview cadence stays useful
 gradient_accumulation_steps: 1
 gradient_checkpointing: false
 train_feature_chunked_ce_enable: false
 longctx_diag_every: 0
 generate_every: 0
 save_every: 0
-checkpoint_dir: ./pinball/image_rgb_unet/checkpoints
+checkpoint_dir: ./pinball/image_rgb_unet_nohilbert/checkpoints
+#checkpoint_dir: ./pinball/image_rgb_unet_nohilbert/checkpoints
 
 # --- Graph / hierarchy: identical recipe to the discrete MaskGIT config -----------------
 ar_graph_causal: false          # BIDI: diffusion sees the whole (noisy) image every step
@@ -77,7 +78,7 @@ xq_nominate_enable: false       # causal machinery; stays off in bidi
 use_hqd: false
 
 local_pack_cross_level: true
-local_pack_window: 624          # ~128-token spatial-blob reach at 1024-token grids
+local_pack_window: 1248 #624          # ~128-token spatial-blob reach at 1024-token grids
 local_pack_query_levels: [0, 1, 2, 3]
 local_pack_level_bias: true
 local_pack_coarse_lane: true
@@ -87,6 +88,10 @@ local_pack_lane_merge: false
 norm_type: layernorm
 dropout: 0.1
 gen_frontier_consistent: false
+# Per-layer conditioning: FiLM the refinement stack with the class+timestep vector at EVERY
+# layer (DiT-style AdaLN analogue) instead of only the input embedding. refine_cond_film is
+# zero-init = exact identity at init; fresh runs only (adds params -> old ckpts need strict=False).
+refine_cond_mode: film
 
 attn_backend: flash
 qkv_sharing: shared
@@ -118,11 +123,19 @@ pinball_cross_query_write_scale_init: 0.1
 pinball_l3_workspace_tokens: 8
 
 use_aux_loss: true
-hier_predaux_enable: true
+# The consistency aux (node ~ mean of its cross-level neighbors) was RAW MSE on unnormalized
+# features: unbounded, tracks feature-norm growth quadratically (climbed 0.8 -> 20 over epochs
+# and at the old hardcoded lambda 0.1 became ~98% of the objective). cosine is bounded [0,1]
+# per pair. lambda_hier_aux was previously NOT read from yaml at all (always 0.1); now threaded.
+hier_aux_loss_mode: cosine # "mse" | "mse_norm" | "cosine" (hier_aux_loss_mode)
+lambda_hier_aux: 0.05
+hier_predaux_enable: false # image bidirectional attention makes predaux able to cheat: the model can see the target features in its context, use only for causal modes.
 lambda_hier_predaux: 0.05
 hier_predaux_levels: [1, 2, 3]
 hier_predaux_horizon: 0
-hier_predaux_loss_mode: mse
+hier_predaux_loss_mode: cosine   # bounded [0,2] — raw mse on unnormalized features diverged
+                                 # (the aux blow-up on the 1d run); cosine keeps the signal
+                                 # scale-free. mse_norm is the middle option.
 hier_predaux_predictor: mlp
 hier_predaux_directions: both
 hier_copredict_l0: false
@@ -130,22 +143,22 @@ hier_copredict_l0: false
 # ============================================================================
 # IMAGE MODALITY: raw pixels + learned CNN bridge + pixel-space diffusion
 # ============================================================================
-spatial_curve: hilbert
+spatial_curve: none #hilbert
 # spatial_dims: left unset — the cli derives [image_size/ds, image_size/ds] = [32, 32]
-local_pack_rope_axial: true
+local_pack_rope_axial: false
 local_pack_bidirectional: true
 hier_downward_bidi_parent: true
 
-image_dataset_root: /media/david/SSD_Data/Datasets/tiny-imagenet
-image_size: 64
-image_num_classes: 200
+image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf   #/media/david/SSD_Data/Datasets/imagenet1k_hf  #/media/david/SSD_Data/Datasets/tiny-imagenet
+image_size: 256 #256 #64
+image_num_classes: 1000 #200
 image_objective: diffusion
 image_token_mode: rgb_unet
 image_roundtrip_check: false    # the bridge is LEARNED — an init-time roundtrip is noise by design
 image_num_workers: 8            # pixels needed every step (no latent/token cache applies)
 image_cache_mode: off           # cache shards store latents/VQ tokens, not pixels
 image_auto_prepare: true
-image_hf_dataset_id: zh-plus/tiny-imagenet
+image_hf_dataset_id: ILSVRC/imagenet-1k #ILSVRC/imagenet-1k #zh-plus/tiny-imagenet
 image_prepare_streaming: true
 image_prepare_max_train: 0
 image_prepare_max_val: 0
@@ -154,7 +167,7 @@ image_prepare_overwrite: false
 # RGB bridge (the CNN stem): downsample 2 -> 32x32 grid = 1024 tokens at 64px.
 # n_down = log2(ds) = 1 conv stage each way; token_dim is the feature width pinball sees.
 image_rgb_unet_token_dim: 64
-image_rgb_unet_downsample: 2
+image_rgb_unet_downsample: 4
 image_rgb_unet_base_channels: 64
 image_rgb_unet_kernel_size: 5
 image_rgb_unet_decode_kernel_size: 3
@@ -178,7 +191,8 @@ image_class_cond_drop_prob: 0.1
 image_preview_enable: true
 image_preview_eval_interval: 1
 image_preview_num_samples: 8
-image_preview_guidance_scale: 1.0
+image_preview_guidance_scale: 3.0   # real CFG (1.0 = conditional-only): global structure shows
+                                    # up far earlier in previews under guidance
 image_preview_diffusion_steps: 36    # respaced from the 1000 train steps; keeps previews fast
 image_fid_enable: false
 image_fid_eval_interval: 0

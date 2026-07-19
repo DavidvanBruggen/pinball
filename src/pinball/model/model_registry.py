@@ -45,6 +45,7 @@ def build_transformer_model(
     max_seq_len: int,
     tie_weights: bool = True,
     class_cond_enable: bool = False,
+    input_mode: str = "tokens",
 ) -> TransformerLM:
     n_embd = int(getattr(args, "transformer_n_embd", 0) or getattr(args, "hidden_dim", 768))
     n_head = int(getattr(args, "transformer_n_head", 0) or getattr(args, "num_heads", 12))
@@ -75,6 +76,30 @@ def build_transformer_model(
         num_classes=int(getattr(args, "image_num_classes", 1000)) if class_cond_enable else 0,
         class_cond_drop_prob=float(getattr(args, "image_class_cond_drop_prob", 0.1)),
         compile_blocks=bool(getattr(args, "transformer_compile", False)),
+        # Per-block FiLM — parity knob for pinball's refine_cond_mode="film".
+        block_cond_film=bool(getattr(args, "transformer_block_cond_film", False)),
+        input_mode=str(input_mode).lower(),
+        # Timestep FiLM for image diffusion runs (pinball conditions on t; parity).
+        # Gated to diffusion so existing maskgit transformer checkpoints keep loading.
+        timestep_cond_enable=bool(
+            str(getattr(args, "modality", "text")).lower() == "image"
+            and str(getattr(args, "image_objective", "diffusion")).lower() == "diffusion"
+        ),
+        # Direct-pixel RGB bridge (same RGBTokenUNet2D as pinball's rgb_unet mode).
+        rgb_unet_enable=bool(
+            str(getattr(args, "modality", "text")).lower() == "image"
+            and str(getattr(args, "image_token_mode", "latent")).lower() == "rgb_unet"
+            and not (
+                str(getattr(args, "image_objective", "diffusion")).lower() == "maskgit"
+                and str(getattr(args, "image_maskgit_variant", "continuous")).lower() == "discrete"
+            )
+        ),
+        rgb_unet_downsample=int(getattr(args, "image_rgb_unet_downsample", 16)),
+        rgb_unet_base_channels=int(getattr(args, "image_rgb_unet_base_channels", 64)),
+        rgb_unet_kernel_size=int(getattr(args, "image_rgb_unet_kernel_size", 5)),
+        rgb_unet_decode_kernel_size=int(getattr(args, "image_rgb_unet_decode_kernel_size", 3)),
+        rgb_unet_decode_separable=bool(getattr(args, "image_rgb_unet_decode_separable", True)),
+        rgb_unet_max_channels=int(getattr(args, "image_rgb_unet_max_channels", 512)),
     )
     model = TransformerLM(config, tokenizer=tokenizer)
     logger.info(
@@ -296,6 +321,9 @@ def build_pinball_model(
         local_connectivity_window_size=int(getattr(args, "local_connectivity_window_size", 4)),
         # --- Hierarchy auxiliary (reconstruction) loss ---
         use_aux_loss=bool(getattr(args, "use_aux_loss", False)),
+        lambda_hier_aux=float(getattr(args, "lambda_hier_aux", 0.1)),
+        hier_aux_loss_mode=str(getattr(args, "hier_aux_loss_mode", "mse")),
+        hier_aux_unit_norm=bool(getattr(args, "hier_aux_unit_norm", False)),
         hier_aux_link_l0_target=bool(getattr(args, "hier_aux_link_l0_target", False)),
         # --- AR graph connectivity (causal edge construction for autoregressive training) ---
         hier_ar_enable=bool(getattr(args, "hier_ar_enable", False)),
@@ -473,10 +501,10 @@ def build_model(
     max_seq_len = int(max_seq_len if max_seq_len is not None else getattr(args, "block_size", 1024))
     if model_type == "transformer":
         modality = str(getattr(args, "modality", "text")).lower()
-        if modality not in {"text", "image"} or (modality == "image" and str(input_mode) != "tokens"):
+        if modality not in {"text", "image"} or str(input_mode) not in {"tokens", "features"}:
             raise ValueError(
-                "model_type=transformer supports text runs and discrete-token image MaskGIT "
-                "(input_mode=tokens) only"
+                "model_type=transformer supports text runs, discrete-token image MaskGIT "
+                "(input_mode=tokens), and continuous-feature image runs (input_mode=features)"
             )
         return build_transformer_model(
             args,
@@ -485,6 +513,7 @@ def build_model(
             max_seq_len=max_seq_len,
             tie_weights=bool(tie_weights),
             class_cond_enable=bool(class_cond_enable),
+            input_mode=str(input_mode),
         )
     return build_pinball_model(
         args,
