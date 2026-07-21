@@ -93,8 +93,34 @@ def _build_optimizer(model, cfg):
     betas = getattr(cfg, "muon_betas", (0.9, 0.95))
     adjust_lr_fn = str(getattr(cfg, "muon_adjust_lr_fn", "match_rms_adamw"))
 
-    muon_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
-    other_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+    # Muon orthogonalizes each update (Newton-Schulz), which is designed ONLY for a
+    # network's hidden weight matrices. The input/output layers — token/position/class
+    # EMBEDDINGS and the vocab OUTPUT HEAD — must stay on AdamW: orthogonalizing a
+    # [vocab, dim] table forces uniform singular values and kills per-token logit scaling,
+    # so the head cannot sharpen or even represent the class-conditional marginal (measured:
+    # image MaskGIT head collapsed, full-mask CE > uniform, ~2.5% top-1 with 90% context).
+    # The `ndim >= 2` split alone WRONGLY swept these 2D tables into Muon — the opposite of
+    # this function's stated intent ("embeddings ... use AdamW"). Exclude them by module type
+    # (every nn.Embedding) plus the output-head weight by name (covers the untied image head;
+    # the tied text head shares the already-excluded embedding tensor).
+    embed_param_ids = set()
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.Embedding):
+            for p in mod.parameters(recurse=False):
+                embed_param_ids.add(id(p))
+    head_name_markers = ("output_projection", "lm_head")
+    for name, p in model.named_parameters():
+        if any(marker in name for marker in head_name_markers):
+            embed_param_ids.add(id(p))
+
+    muon_params = [
+        p for p in model.parameters()
+        if p.requires_grad and p.ndim >= 2 and id(p) not in embed_param_ids
+    ]
+    other_params = [
+        p for p in model.parameters()
+        if p.requires_grad and (p.ndim < 2 or id(p) in embed_param_ids)
+    ]
 
     param_groups = []
     if muon_params:

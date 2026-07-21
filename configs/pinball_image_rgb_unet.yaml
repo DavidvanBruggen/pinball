@@ -17,7 +17,7 @@ modality: image
 tokenizer_name: gpt2            # unused in image mode (features input); kept for cli defaults
 
 block_size: 1024                # synced by the cli to (image_size / rgb_unet_downsample)^2
-batch_size: 2                 # T=1024: ~7GiB @ b32 bf16 on the 4090; Blackwell takes 128-256
+batch_size: 8                 # T=1024: ~7GiB @ b32 bf16 on the 4090; Blackwell takes 128-256
 val_split: 0.01
 
 # Training
@@ -167,7 +167,7 @@ image_prepare_overwrite: false
 # RGB bridge (the CNN stem): downsample 2 -> 32x32 grid = 1024 tokens at 64px.
 # n_down = log2(ds) = 1 conv stage each way; token_dim is the feature width pinball sees.
 image_rgb_unet_token_dim: 64
-image_rgb_unet_downsample: 2
+image_rgb_unet_downsample: 4
 image_rgb_unet_base_channels: 64
 image_rgb_unet_kernel_size: 5
 image_rgb_unet_decode_kernel_size: 3
