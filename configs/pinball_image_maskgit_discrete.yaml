@@ -12,7 +12,7 @@ tokenizer_name: gpt2
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: "" #/home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
 block_size: 1024                  # = 32*32 VQ/latent grid (H*W); cli syncs to the real grid
-batch_size: 256
+batch_size: 128
 val_split: 0.01
 
 # Training
@@ -31,8 +31,8 @@ muon_adjust_lr_fn: match_rms_adamw
 # Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
-num_epochs: 100
-samples_per_epoch: 1024000 #25600          # 800 steps/epoch at b32 -> 20k steps total (~0.5 ImageNet epochs)
+num_epochs: 1000
+samples_per_epoch: 64000 #1024000 #25600          # 800 steps/epoch at b32 -> 20k steps total (~0.5 ImageNet epochs)
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
@@ -72,7 +72,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/image_maskgit_discrete/checkpoints
+checkpoint_dir: ./pinball/image_maskgit_discrete_miniimagenet/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -110,8 +110,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 1536 #512                   # 68M @ 512/8: the 16385-way VQ head needs width (192 is rank-starved);
-num_heads: 24                      # head_dim stays 64 (flash sweet spot). 270ms/step b32@1024 Blackwell.
+hidden_dim: 512 #512                   # 68M @ 512/8: the 16385-way VQ head needs width (192 is rank-starved);
+num_heads: 8                      # head_dim stays 64 (flash sweet spot). 270ms/step b32@1024 Blackwell.
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -176,7 +176,7 @@ hier_refresh_compile: true
 # measured +14% at T=64 and +26% at T=1024 alone; 1.8x combined with refresh compile at
 # T=1024 (2026-07-17, 4090 under contention). Training-only, probation fallback to eager.
 # OFF here: flipping it mid-experiment changes step numerics slightly vs your running curve.
-hier_layer_compile: false
+hier_layer_compile: true
 # HQD v2 — cross-query-guided nomination (NSA-style selective sparse attention). At the
 # multirate midpoint each L0 query scores the CLOSED L3 windows with the 0:3 refiner's TRAINED
 # q/k (per-query, causal), descends into the top-k winners' L1 children (cosine), and
@@ -257,7 +257,7 @@ xq_nominate_read_sink: true
 # the open question is whether the coarse-lateral repositioning hurts or helps quality.
 # Fall back to query_levels [0] to keep coarse laterals untouched (+2% cost instead).
 local_pack_cross_level: true
-local_pack_window: 624            # ~128-token spatial blob reach at 1024-token grids (1248 would be near-global) # 156 624 1248
+local_pack_window: 1248            # ~128-token spatial blob reach at 1024-token grids (1248 would be near-global) # 156 624 1248
 local_pack_query_levels: [0, 1, 2, 3]
 # Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
 # bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
@@ -594,7 +594,12 @@ pinball_cross_query_write_scale_init: 0.1
 # features -> shapes L3 into a good L0-abstraction, which is exactly what the downward cross-query
 # (L0/L1/L2 <- L3) needs to be worth reading. Synergises with the copredict head.
 use_aux_loss: true
-
+# The consistency aux (node ~ mean of its cross-level neighbors) was RAW MSE on unnormalized
+# features: unbounded, tracks feature-norm growth quadratically (climbed 0.8 -> 20 over epochs
+# and at the old hardcoded lambda 0.1 became ~98% of the objective). cosine is bounded [0,1]
+# per pair. lambda_hier_aux was previously NOT read from yaml at all (always 0.1); now threaded.
+hier_aux_loss_mode: cosine # "mse" | "mse_norm" | "cosine" (hier_aux_loss_mode)
+lambda_hier_aux: 0.005
 # PREDICTIVE coarse aux (Stage 3, "next-concept" prediction) — the LM objective one timescale up.
 # Each coarse node at window i predicts the DETACHED pooled child summary of window i+h at its own
 # level, where h (auto) is the first strictly-future NON-overlapping window (h=2 at 50% overlap) —
@@ -603,7 +608,7 @@ use_aux_loss: true
 # abstraction that carries forward. Training-only (forward untouched, no leak surface); targets
 # detached (JEPA-style). OFF here so the current upref_consolidated run is unaffected — flip on
 # for the next run (safe mid-warm-start too: it only adds small per-level predictor MLPs).
-hier_predaux_enable: true  # cleaner-pinball: ON — with the scatter gradient path gone, the
+hier_predaux_enable: false  # cleaner-pinball: ON — with the scatter gradient path gone, the
                            # coarse levels carry their own predictive objective (Stage 3)
 lambda_hier_predaux: 0.05
 hier_predaux_levels: [1, 2, 3]
@@ -643,12 +648,12 @@ hier_copredict_gate_init: 0.0      # per-level gate init; 0.0 = identity warm st
 # the full pack/refresh recipe runs. spatial_dims is auto-set from the VQ grid
 # by the cli for discrete runs.
 modality: image
-spatial_curve: hilbert #none #hilbert
-spatial_dims: [32, 32]
+spatial_curve: none #none #hilbert
+##spatial_dims: [32, 32]
 # Axial ND RoPE on the packed path: attention scores use TRUE (dy,dx) offsets
 # (L0 = pixel coords, coarse = child-blob centroid) instead of 1D curve-index
 # rotations — proper 2D positioning inside the curve blobs. A/B knob.
-local_pack_rope_axial: true
+local_pack_rope_axial: false
 # Two-sided packed windows under the bidi runtime flags (see pack memory).
 local_pack_bidirectional: true
 # Downward refresh reads the CONTAINING parent (spatial ancestor in curve mode)
@@ -657,16 +662,16 @@ hier_downward_bidi_parent: true
 # NOTE: rope_mode must NOT be "1d" (axial coords need the ND dispatch); the
 # default "auto" is correct. xq_nominate stays OFF (causal machinery).
 
-image_dataset_root: /media/david/SSD_Data/Datasets/tiny-imagenet  # /media/david/SSD_Data/Datasets/tiny-imagenet # /media/david/SSD_Data/Datasets/imagenet1k_hf  # ImageFolder layout: train/ + val/ class dirs
-image_size: 64 #64 #256
-image_num_classes: 200 # 1000
+image_dataset_root: /media/david/SSD_Data/Datasets/mini-imagenet # /media/david/SSD_Data/Datasets/tiny-imagenet # /media/david/SSD_Data/Datasets/imagenet1k_hf  # ImageFolder layout: train/ + val/ class dirs
+image_size: 256 #64 #256
+image_num_classes: 100 #200 # 1000
 image_objective: maskgit
 image_roundtrip_check: true
-image_num_workers: 4
+image_num_workers: 8
 image_cache_mode: readwrite                 # off | read | write | readwrite (latent/token shard cache)
 # Auto-prepare: build the ImageFolder from a HF dataset if the root is missing/empty.
 image_auto_prepare: true
-image_hf_dataset_id: zh-plus/tiny-imagenet #zh-plus/tiny-imagenet #ILSVRC/imagenet-1k
+image_hf_dataset_id: timm/mini-imagenet #ILSVRC/imagenet-1k #zh-plus/tiny-imagenet #ILSVRC/imagenet-1k
 image_prepare_streaming: true
 image_prepare_max_train: 0            # 0 = all samples
 image_prepare_max_val: 0

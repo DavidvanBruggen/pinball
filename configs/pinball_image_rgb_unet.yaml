@@ -17,7 +17,7 @@ modality: image
 tokenizer_name: gpt2            # unused in image mode (features input); kept for cli defaults
 
 block_size: 1024                # synced by the cli to (image_size / rgb_unet_downsample)^2
-batch_size: 256                 # T=1024: ~7GiB @ b32 bf16 on the 4090; Blackwell takes 128-256
+batch_size: 2                 # T=1024: ~7GiB @ b32 bf16 on the 4090; Blackwell takes 128-256
 val_split: 0.01
 
 # Training
@@ -29,15 +29,15 @@ optimizer: muon_hybrid
 muon_lr_mult: 6.0
 muon_betas: [0.9, 0.95]
 muon_adjust_lr_fn: match_rms_adamw
-num_epochs: 500
-samples_per_epoch: 102400  # 64000 #102400       # ~1600 steps/epoch at b64 -> preview cadence stays useful
+num_epochs: 1000
+samples_per_epoch: 6400  # 64000 #102400       # ~1600 steps/epoch at b64 -> preview cadence stays useful
 gradient_accumulation_steps: 1
 gradient_checkpointing: false
 train_feature_chunked_ce_enable: false
 longctx_diag_every: 0
 generate_every: 0
 save_every: 0
-checkpoint_dir: ./pinball/image_rgb_unet_nohilbert/checkpoints
+checkpoint_dir: ./pinball/image_rgb_unet_smallbatchtest/checkpoints
 #checkpoint_dir: ./pinball/image_rgb_unet_nohilbert/checkpoints
 
 # --- Graph / hierarchy: identical recipe to the discrete MaskGIT config -----------------
@@ -47,11 +47,11 @@ pinball_monitor_gates_every: 100
 ar_hier_edge_mode: none
 drop_static_cross_level_edges: true
 
-hidden_dim: 512
+hidden_dim: 512 #512
 num_heads: 8
 attn_sparse_qk_mult: 1.0
 attn_sparse_v_mult: 1.0
-num_refinement_layers: 12
+num_refinement_layers: 12 #12
 num_layers: [0, 0, 0, 0]
 internal_cycles: [0, 0, 0, 0]
 refinement_style: unified
@@ -78,7 +78,7 @@ xq_nominate_enable: false       # causal machinery; stays off in bidi
 use_hqd: false
 
 local_pack_cross_level: true
-local_pack_window: 1248 #624          # ~128-token spatial-blob reach at 1024-token grids
+local_pack_window: 1248 #156 #1248 #624          # ~128-token spatial-blob reach at 1024-token grids
 local_pack_query_levels: [0, 1, 2, 3]
 local_pack_level_bias: true
 local_pack_coarse_lane: true
@@ -128,7 +128,7 @@ use_aux_loss: true
 # and at the old hardcoded lambda 0.1 became ~98% of the objective). cosine is bounded [0,1]
 # per pair. lambda_hier_aux was previously NOT read from yaml at all (always 0.1); now threaded.
 hier_aux_loss_mode: cosine # "mse" | "mse_norm" | "cosine" (hier_aux_loss_mode)
-lambda_hier_aux: 0.05
+lambda_hier_aux: 0.005
 hier_predaux_enable: false # image bidirectional attention makes predaux able to cheat: the model can see the target features in its context, use only for causal modes.
 lambda_hier_predaux: 0.05
 hier_predaux_levels: [1, 2, 3]
@@ -143,15 +143,15 @@ hier_copredict_l0: false
 # ============================================================================
 # IMAGE MODALITY: raw pixels + learned CNN bridge + pixel-space diffusion
 # ============================================================================
-spatial_curve: none #hilbert
+spatial_curve: none #none #hilbert
 # spatial_dims: left unset — the cli derives [image_size/ds, image_size/ds] = [32, 32]
 local_pack_rope_axial: false
 local_pack_bidirectional: true
 hier_downward_bidi_parent: true
 
-image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf   #/media/david/SSD_Data/Datasets/imagenet1k_hf  #/media/david/SSD_Data/Datasets/tiny-imagenet
+image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf  #/media/david/SSD_Data/Datasets/imagenet1k_hf  #/media/david/SSD_Data/Datasets/tiny-imagenet
 image_size: 256 #256 #64
-image_num_classes: 1000 #200
+image_num_classes: 1000 #1000 #200
 image_objective: diffusion
 image_token_mode: rgb_unet
 image_roundtrip_check: false    # the bridge is LEARNED — an init-time roundtrip is noise by design
@@ -167,12 +167,12 @@ image_prepare_overwrite: false
 # RGB bridge (the CNN stem): downsample 2 -> 32x32 grid = 1024 tokens at 64px.
 # n_down = log2(ds) = 1 conv stage each way; token_dim is the feature width pinball sees.
 image_rgb_unet_token_dim: 64
-image_rgb_unet_downsample: 4
+image_rgb_unet_downsample: 2
 image_rgb_unet_base_channels: 64
 image_rgb_unet_kernel_size: 5
 image_rgb_unet_decode_kernel_size: 3
 image_rgb_unet_decode_separable: true
-image_rgb_unet_max_channels: 512
+image_rgb_unet_max_channels: 512 #512
 
 # Diffusion (pixel-space v-prediction; target/prediction "auto" resolve to
 # rgb_epsilon + v for rgb_unet mode).

@@ -302,6 +302,11 @@ def main(argv=None) -> None:
             prepare_overwrite=bool(getattr(cfg, "image_prepare_overwrite", False)),
             cache_mode=str(getattr(cfg, "image_cache_mode", "off")),
             cache_dir=str(getattr(cfg, "image_cache_dir", "") or ""),
+            # Build the token/latent cache on the SAME device the run trains on (else it
+            # defaults to cuda:0, which — with the smi<->torch index inversion — is often the
+            # small card). image_cache_build_batch_size widens the VQ-encode batch to fill it.
+            cache_device=(str(device) if device.type == "cuda" else None),
+            cache_build_batch_size=int(getattr(cfg, "image_cache_build_batch_size", 64)),
             cache_image_token_mode=str(getattr(cfg, "image_token_mode", "latent")),
             cache_image_objective=str(getattr(cfg, "image_objective", "maskgit")),
             cache_image_maskgit_variant=str(getattr(cfg, "image_maskgit_variant", "continuous")),

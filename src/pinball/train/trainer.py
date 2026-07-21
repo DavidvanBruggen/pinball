@@ -5060,7 +5060,17 @@ class EnhancedHierarchicalTrainer:
 
     def _resolve_image_eval_get_batch(self, data_provider):
         if isinstance(data_provider, dict) and "get_batch" in data_provider:
-            return data_provider["get_batch"]
+            get_batch = data_provider["get_batch"]
+            # When the val provider is token/latent-cache-backed it yields token_ids
+            # (no pixel_values) — fine for CE validation, but the image preview / FID
+            # paths need raw pixels (to render real|fake grids and size the batch). The
+            # loader exposes a parallel raw-pixel eval provider (cache=None) for exactly
+            # this case; prefer it so previews/FID keep working with caching enabled.
+            if str(getattr(get_batch, "cache_mode", "off")).lower() != "off":
+                raw = getattr(get_batch, "raw_eval_batch", None)
+                if raw is not None:
+                    return raw
+            return get_batch
         if isinstance(data_provider, torch.utils.data.DataLoader):
             data_iter = iter(data_provider)
 
