@@ -2239,6 +2239,7 @@ class EnhancedHierarchicalTrainer:
         image_diffusion_steps=1000,
         image_diffusion_beta_start=1e-4,
         image_diffusion_beta_end=2e-2,
+        image_diffusion_val_fixed_timesteps=None,
         image_fid_enable=False,
         image_fid_num_samples=2048,
         image_fid_guidance_scale=3.0,
@@ -2397,6 +2398,19 @@ class EnhancedHierarchicalTrainer:
         self.image_diffusion_steps = max(2, int(image_diffusion_steps))
         self.image_diffusion_beta_start = float(image_diffusion_beta_start)
         self.image_diffusion_beta_end = float(image_diffusion_beta_end)
+        # Validation timestep policy. Empty/None = the legacy seeded-random draw over the FULL
+        # 0..steps range (comparable across epochs but dominated by the near-irreducible
+        # high-noise term). A non-empty list pins validation to those fixed timesteps (cycled
+        # across the batch), turning the val loss into a low-variance progress signal that
+        # isolates informative noise levels. Clamped to [0, steps-1].
+        _fixed_ts = image_diffusion_val_fixed_timesteps
+        if _fixed_ts is None:
+            _fixed_ts = []
+        elif isinstance(_fixed_ts, (int, float)):
+            _fixed_ts = [_fixed_ts]
+        self.image_diffusion_val_fixed_timesteps = [
+            max(0, min(int(self.image_diffusion_steps) - 1, int(v))) for v in _fixed_ts
+        ]
         self.image_fid_enable = bool(image_fid_enable)
         self.image_fid_num_samples = max(64, int(image_fid_num_samples))
         self.image_fid_guidance_scale = float(image_fid_guidance_scale)
@@ -3327,12 +3341,25 @@ class EnhancedHierarchicalTrainer:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Deterministic (t, noise) for validation batches: seeded on a CPU generator per
         batch index, so the validation diffusion loss is comparable across epochs/runs.
-        Unseeded draws made best-checkpoint selection a lottery over timestep luck."""
+        Unseeded draws made best-checkpoint selection a lottery over timestep luck.
+
+        If image_diffusion_val_fixed_timesteps is set, t is PINNED to those values (cycled
+        deterministically across batch positions and batches) instead of drawn over the full
+        range — a low-variance progress signal at chosen noise levels. Noise stays seeded."""
         g = torch.Generator()
         g.manual_seed(int(getattr(self, "seed", 42) or 42) * 1000003 + int(batch_index))
-        t = torch.randint(
-            0, int(self.image_diffusion_steps), (int(batch_size),), generator=g, dtype=torch.long
-        ).to(device)
+        fixed_ts = getattr(self, "image_diffusion_val_fixed_timesteps", None) or []
+        if fixed_ts:
+            # Cycle the fixed timesteps across (batch_index, position) so each is applied to an
+            # equal share of val images; fully deterministic (no RNG on t) => minimal variance.
+            fixed = torch.tensor([int(v) for v in fixed_ts], dtype=torch.long)
+            start = (int(batch_index) * int(batch_size)) % int(fixed.numel())
+            sel = (torch.arange(int(batch_size), dtype=torch.long) + start) % int(fixed.numel())
+            t = fixed.index_select(0, sel).to(device)
+        else:
+            t = torch.randint(
+                0, int(self.image_diffusion_steps), (int(batch_size),), generator=g, dtype=torch.long
+            ).to(device)
         noise = torch.randn(tuple(noise_shape), generator=g, dtype=torch.float32).to(
             device=device, dtype=dtype
         )

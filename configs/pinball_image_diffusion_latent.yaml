@@ -145,11 +145,13 @@ hier_downward_bidi_parent: true
 
 image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf #/media/david/SSD_Data/Datasets/mini-imagenet  # swap to imagenet1k_hf for the full proj-oc data
 image_size: 256
-image_num_classes: 100          # 1000 for imagenet1k
+image_num_classes: 1000         # MUST match the dataset's class count (imagenet1k = 1000; mini-imagenet = 100).
+                                # Mismatch is silent: the model clamps labels to [0, num_classes] and folds
+                                # every out-of-range class onto the null/unconditional index (breaks conditioning).
 image_objective: diffusion
 image_token_mode: latent        # <-- the swap: frozen SD-VAE latents instead of the learned rgb_unet CNN
 image_roundtrip_check: true     # frozen VAE round-trip is a meaningful init-time sanity check
-image_num_workers: 8
+image_num_workers: 16
 # Latents are deterministic (frozen VAE) -> cacheable. readwrite builds the latent shard
 # cache ONCE upfront, then every step reads shards (no per-step VAE encode). Set to `off`
 # to skip the upfront build and encode on the fly instead (slower per step; no persistence).
@@ -179,6 +181,13 @@ image_rgb_centered_diffusion: false    # latents are NOT centered RGB (this knob
 image_diffusion_min_snr_gamma: 5.0     # min-SNR-5 loss weighting (the proj-oc run used 0.0; set 0.0 to match it exactly)
 image_diffusion_beta_start: 1e-4
 image_diffusion_beta_end: 2e-2
+# Validation timestep policy. [] = the legacy seeded-random draw over the FULL 0..steps range
+# (comparable across epochs but dominated by the near-irreducible high-noise term, so it barely
+# moves as quality improves). A fixed list PINS validation to these timesteps (cycled across the
+# batch) -> a low-variance progress curve at chosen noise levels. [250,500,750] = early/mid/late
+# denoising; widen for more granularity. NOTE: changes the val-loss definition, so numbers aren't
+# comparable to full-range runs (fine for a fresh run). Sampling/preview are unaffected.
+image_diffusion_val_fixed_timesteps: [250, 500, 750]
 
 use_ema: true
 image_class_cond_drop_prob: 0.1
