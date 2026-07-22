@@ -11,21 +11,21 @@ modality: image
 tokenizer_name: gpt2            # unused in image mode (features input); kept for cli defaults
 
 block_size: 1024                # synced by the cli to (image_size / rgb_unet_downsample)^2
-batch_size: 4
+batch_size: 16
 val_split: 0.01
 
 # Training — identical to the pinball config.
 train_mode: ar
-learning_rate: 1e-4
+learning_rate: 3e-4
 weight_decay: 0.1
-warmup_steps: 2000
+warmup_steps: 5000
 optimizer: muon_hybrid
-muon_lr_mult: 6.0
+muon_lr_mult: 3.0
 muon_betas: [0.9, 0.95]
 muon_adjust_lr_fn: match_rms_adamw
 num_epochs: 100
 samples_per_epoch: 6400 #102400
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 4
 gradient_checkpointing: false
 train_feature_chunked_ce_enable: false
 longctx_diag_every: 0
@@ -56,16 +56,16 @@ ar_graph_causal: false
 # ============================================================================
 # IMAGE MODALITY — copied 1:1 from pinball_image_rgb_unet.yaml
 # ============================================================================
-image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf # /media/david/SSD_Data/Datasets/tiny-imagenet
+image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf #/media/david/SSD_Data/Datasets/mini-imagenet #/media/david/SSD_Data/Datasets/imagenet1k_hf # /media/david/SSD_Data/Datasets/tiny-imagenet
 image_size: 256 #64
-image_num_classes: 1000 #200
+image_num_classes: 1000 #100 #1000 #200
 image_objective: diffusion
 image_token_mode: rgb_unet
 image_roundtrip_check: false    # the bridge is LEARNED — an init-time roundtrip is noise by design
 image_num_workers: 8
 image_cache_mode: off           # cache shards store latents/VQ tokens, not pixels
 image_auto_prepare: true
-image_hf_dataset_id: ILSVRC/imagenet-1k #zh-plus/tiny-imagenet
+image_hf_dataset_id: ILSVRC/imagenet-1k #timm/mini-imagenet #ILSVRC/imagenet-1k #zh-plus/tiny-imagenet
 image_prepare_streaming: true
 image_prepare_max_train: 0
 image_prepare_max_val: 0
@@ -73,7 +73,7 @@ image_prepare_overwrite: false
 
 # RGB bridge (the CNN stem): downsample 2 -> 32x32 grid = 1024 tokens at 64px.
 image_rgb_unet_token_dim: 64
-image_rgb_unet_downsample: 4
+image_rgb_unet_downsample: 8
 image_rgb_unet_base_channels: 64
 image_rgb_unet_kernel_size: 5
 image_rgb_unet_decode_kernel_size: 3

@@ -14,6 +14,12 @@ import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Dataset
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # tqdm is a hard dep of the trainer; degrade to a no-op if ever absent
+    def tqdm(iterable=None, **kwargs):
+        return iterable if iterable is not None else []
+
 logger = logging.getLogger(__name__)
 
 
@@ -451,8 +457,15 @@ class ImageCacheBackend:
         random.seed(int(samples_written + 17))
         np.random.seed((int(samples_written + 17)) % (2**32 - 1))
 
+        pbar = tqdm(
+            loader,
+            total=len(loader),
+            desc=f"Caching {self.split} ({kind})",
+            unit="batch",
+            dynamic_ncols=True,
+        )
         with torch.no_grad():
-            for batch in loader:
+            for batch in pbar:
                 images, labels, sample_indices, _real_indices = batch
                 images = images.to(device=device, non_blocking=True)
                 labels = labels.to(device="cpu", dtype=torch.long)
@@ -492,6 +505,9 @@ class ImageCacheBackend:
                 total_pending = sum(int(t.size(0)) for t in pending_tokens)
                 if total_pending >= self.shard_size:
                     _flush_pending()
+
+                if hasattr(pbar, "set_postfix"):
+                    pbar.set_postfix(shards=shard_idx, written=samples_written, refresh=False)
 
             _flush_pending(final=True)
 

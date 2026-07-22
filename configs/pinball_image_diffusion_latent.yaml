@@ -1,0 +1,194 @@
+# SD-VAE LATENT diffusion run — the "original pinball" setup (proj-oc
+# enhanced_model_imagenet_diffusion_test_1d_large): pixels are encoded ONCE by a FROZEN
+# Stable-Diffusion VAE (stabilityai/sd-vae-ft-mse) into a 4-channel 32x32 latent grid, and
+# pinball runs v-prediction diffusion directly on those latents. NO learned RGB CNN bridge —
+# this is the direct counterpart of pinball_image_rgb_unet.yaml (same 256px/ds8 -> 32x32 =
+# 1024-token grid, same hierarchy + pack + curve recipe) with the token stem swapped:
+#
+#   rgb_unet : raw pixels -> learned 2D conv U-Net -> token features -> pinball -> decode -> PIXEL v-pred
+#   latent   : raw pixels -> frozen SD-VAE encode  -> 4ch latent tokens -> pinball -> LATENT v-pred (this file)
+#
+# The VAE is frozen and deterministic, so latents are CACHED (readwrite) — a one-time upfront
+# encode pass, then every training step reads latent shards (no per-step VAE forward). The
+# loss is token_epsilon + v-prediction (auto-resolved for latent mode); previews decode the
+# sampled latents back through the same VAE.
+
+model_type: pinball
+modality: image
+tokenizer_name: gpt2            # unused in image mode (features input); kept for cli defaults
+
+block_size: 1024                # synced by the cli to (image_size / image_latent_downsample)^2
+batch_size: 64                  # T=1024 latent tokens; Blackwell takes 128-256
+val_split: 0.01
+
+# Training
+train_mode: ar                  # graph flags below force bidi; this only names the text path
+learning_rate: 3e-4
+weight_decay: 0.1
+warmup_steps: 5000
+optimizer: muon_hybrid
+muon_lr_mult: 3.0
+muon_betas: [0.9, 0.95]
+muon_adjust_lr_fn: match_rms_adamw
+num_epochs: 1000
+samples_per_epoch: 6400         # ~100 steps/epoch at b64 -> preview cadence stays useful
+gradient_accumulation_steps: 1
+gradient_checkpointing: false
+train_feature_chunked_ce_enable: false
+longctx_diag_every: 0
+generate_every: 0
+save_every: 0
+checkpoint_dir: ./pinball/image_diffusion_latent/checkpoints
+
+# --- Graph / hierarchy: identical recipe to the RGB / discrete MaskGIT configs -------------
+ar_graph_causal: false          # BIDI: diffusion sees the whole (noisy) latent grid every step
+pinball_monitor_gates: true
+pinball_monitor_gates_every: 100
+ar_hier_edge_mode: none
+drop_static_cross_level_edges: true
+
+hidden_dim: 1024
+num_heads: 16
+attn_sparse_qk_mult: 1.0
+attn_sparse_v_mult: 1.0
+num_refinement_layers: 16
+num_layers: [0, 0, 0, 0]
+internal_cycles: [0, 0, 0, 0]
+refinement_style: unified
+unified_refinement_cycles: 1
+l0_cycles: 0
+iterative_refinement_cycles: 0
+local_connectivity_window_size: 0
+compression_ratios: [16, 4, 4]
+overlap_ratios: [0.5, 0.5, 0.5]
+upper_init: pooled
+upper_seed_gate_init: 1.0
+hier_upward_refresh: true
+hier_upward_refresh_every: 1
+hier_upward_refresh_gate_init: 0.1
+hier_downward_refresh: true
+hier_downward_refresh_every: 1
+hier_downward_refresh_gate_init: 0.1
+hier_refresh_compile: true
+hier_layer_compile: true
+xq_nominate_enable: false       # causal machinery; stays off in bidi
+use_hqd: false
+
+local_pack_cross_level: true
+local_pack_window: 1248          # near-global reach at 1024-token grids
+local_pack_query_levels: [0, 1, 2, 3]
+local_pack_level_bias: true
+local_pack_coarse_lane: true
+local_pack_coarse_window: 896
+local_pack_flex_union: false
+local_pack_lane_merge: false
+norm_type: layernorm
+dropout: 0.1
+gen_frontier_consistent: false
+# Per-layer conditioning: FiLM the refinement stack with the class+timestep vector at EVERY
+# layer (DiT-style AdaLN analogue) instead of only the input embedding. Zero-init = exact
+# identity at init; fresh runs only (adds params -> old ckpts need strict=False).
+refine_cond_mode: film
+
+attn_backend: flash
+qkv_sharing: shared
+cross_level_packed: false
+cross_level_qkv: shared
+per_level_ffn_dims: []
+per_level_attn_mult: []
+local_attn_head_dim: 0
+local_attn_levels: [0, 1, 2, 3]
+local_attn_windows: [128, 128, 128, 128]
+local_attn_causal_levels: [0, 1, 2, 3]
+l0_local_window: 128
+use_edge_embedding: false
+learn_edge_from_attention: false
+lateral_edge_trace_enable: false
+token_unet_enable: false        # no 1D token U-Net; the latent grid IS the token stem
+
+pinball_multirate_enable: false
+pinball_upper_refine_steps: 0
+pinball_top_refine_steps: 0
+pinball_upper_cross_attn_steps: 0
+pinball_cross_query_pairs: ["1:3", "0:3"]
+pinball_cross_query_steps: 2
+pinball_cross_query_topk: 0
+pinball_cross_query_memory_window: 32768
+pinball_cross_query_causal: true
+pinball_cross_query_shared_weights: true
+pinball_cross_query_write_scale_init: 0.1
+pinball_l3_workspace_tokens: 8
+
+use_aux_loss: true
+hier_aux_loss_mode: cosine
+lambda_hier_aux: 0.005
+hier_predaux_enable: false       # bidi attention lets predaux cheat (sees target features); causal-only
+lambda_hier_predaux: 0.05
+hier_predaux_levels: [1, 2, 3]
+hier_predaux_horizon: 0
+hier_predaux_loss_mode: cosine
+hier_predaux_predictor: mlp
+hier_predaux_directions: both
+hier_copredict_l0: false
+
+# ============================================================================
+# IMAGE MODALITY: frozen SD-VAE latents + latent-space v-prediction diffusion
+# ============================================================================
+# Spatial curve mode is unchanged from the RGB run: the 32x32 latent grid is still a 2D
+# spatial token grid, so the Hilbert reorder + axial RoPE + own-parent downward refresh all
+# apply exactly as before (they operate on the grid, not on how the tokens were produced).
+spatial_curve: hilbert
+# spatial_dims: left unset — the cli derives [image_size/ds, image_size/ds] = [32, 32]
+local_pack_rope_axial: true
+local_pack_bidirectional: true
+hier_downward_bidi_parent: true
+
+image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf #/media/david/SSD_Data/Datasets/mini-imagenet  # swap to imagenet1k_hf for the full proj-oc data
+image_size: 256
+image_num_classes: 100          # 1000 for imagenet1k
+image_objective: diffusion
+image_token_mode: latent        # <-- the swap: frozen SD-VAE latents instead of the learned rgb_unet CNN
+image_roundtrip_check: true     # frozen VAE round-trip is a meaningful init-time sanity check
+image_num_workers: 8
+# Latents are deterministic (frozen VAE) -> cacheable. readwrite builds the latent shard
+# cache ONCE upfront, then every step reads shards (no per-step VAE encode). Set to `off`
+# to skip the upfront build and encode on the fly instead (slower per step; no persistence).
+image_cache_mode: off #readwrite
+image_cache_build_batch_size: 512   # VAE-encode batch during the upfront cache build
+image_auto_prepare: true
+image_hf_dataset_id: ILSVRC/imagenet-1k #timm/mini-imagenet   # ILSVRC/imagenet-1k for the full proj-oc data
+image_prepare_streaming: true
+image_prepare_max_train: 0
+image_prepare_max_val: 0
+image_prepare_overwrite: false
+
+# Frozen Stable-Diffusion VAE (the "stable diffusion setup" from proj-oc). 256px / ds8 =>
+# 32x32 latent grid, 4 channels per position -> pinball sees [B, 1024, 4] feature tokens.
+image_latent_model_name: stabilityai/sd-vae-ft-mse
+image_latent_scaling_factor: 0.18215   # SD-VAE standard latent scale
+image_latent_channels: 4
+image_latent_downsample: 8             # 256 / 8 = 32x32 latent grid
+
+# Diffusion (LATENT-space v-prediction). For latent mode target/prediction "auto" resolve to
+# token_epsilon + v (trainer.py). Schedule/betas/steps match the proj-oc run.
+image_diffusion_steps: 1000
+image_diffusion_schedule: cosine
+image_diffusion_target: auto
+image_diffusion_prediction: auto
+image_rgb_centered_diffusion: false    # latents are NOT centered RGB (this knob is for pixel/rgb_unet mode)
+image_diffusion_min_snr_gamma: 5.0     # min-SNR-5 loss weighting (the proj-oc run used 0.0; set 0.0 to match it exactly)
+image_diffusion_beta_start: 1e-4
+image_diffusion_beta_end: 2e-2
+
+use_ema: true
+image_class_cond_drop_prob: 0.1
+
+image_preview_enable: true
+image_preview_eval_interval: 1
+image_preview_num_samples: 8
+image_preview_guidance_scale: 3.0      # real CFG (1.0 = conditional-only)
+image_preview_diffusion_steps: 250     # respaced from the 1000 train steps (proj-oc preview cadence)
+image_fid_enable: false
+image_fid_eval_interval: 0
+image_fid_num_samples: 2048
+image_fid_guidance_scale: 3.0

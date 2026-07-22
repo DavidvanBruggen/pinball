@@ -13,11 +13,11 @@ batch_size: 128
 val_split: 0.01
 
 # Training — identical to the pinball run.
-learning_rate: 1e-4
+learning_rate: 3e-4
 weight_decay: 0.1
-warmup_steps: 1000
+warmup_steps: 2000
 optimizer: muon_hybrid
-muon_lr_mult: 6.0
+muon_lr_mult: 3.0
 muon_betas: [0.9, 0.95]
 muon_adjust_lr_fn: match_rms_adamw
 num_epochs: 1000
@@ -26,7 +26,7 @@ gradient_accumulation_steps: 1
 gradient_checkpointing: false
 generate_every: 0
 save_every: 0
-checkpoint_dir: ./transformer/image_maskgit_discrete_imagenetrun/checkpoints
+checkpoint_dir: ./transformer/image_maskgit_discrete_miniimagenet/checkpoints
 
 # Transformer shape (matched to the pinball config's hidden/heads/depth).
 hidden_dim: 768
@@ -48,9 +48,9 @@ transformer_causal: false
 # ============================================================================
 # IMAGE MODALITY (discrete MaskGIT) — copied 1:1 from the pinball config
 # ============================================================================
-image_dataset_root:  /media/david/SSD_Data/Datasets/imagenet1k_hf #/media/david/SSD_Data/Datasets/imagenet1k_hf  # /media/david/SSD_Data/Datasets/tiny-imagenet # /media/david/SSD_Data/Datasets/imagenet1k_hf  # ImageFolder layout: train/ + val/ class dirs
+image_dataset_root:  /media/david/SSD_Data/Datasets/tiny-imagenet #/media/david/SSD_Data/Datasets/imagenet1k_hf  # /media/david/SSD_Data/Datasets/tiny-imagenet # /media/david/SSD_Data/Datasets/imagenet1k_hf  # ImageFolder layout: train/ + val/ class dirs
 image_size: 256 #64 #256
-image_num_classes: 1000 #200 # 1000
+image_num_classes: 100 #1000 #200
 image_objective: maskgit
 image_roundtrip_check: true
 image_num_workers: 8
@@ -58,7 +58,7 @@ image_cache_mode: readwrite                 # off | read | write | readwrite (la
 image_cache_build_batch_size: 384   # widen the VQ-encode batch during cache build
 # Auto-prepare: build the ImageFolder from a HF dataset if the root is missing/empty.
 image_auto_prepare: true
-image_hf_dataset_id: ILSVRC/imagenet-1k #timm/mini-imagenet #zh-plus/tiny-imagenet #ILSVRC/imagenet-1k
+image_hf_dataset_id: timm/mini-imagenet #timm/mini-imagenet #zh-plus/tiny-imagenet #ILSVRC/imagenet-1k
 image_prepare_streaming: true
 image_prepare_max_train: 0            # 0 = all samples
 image_prepare_max_val: 0
