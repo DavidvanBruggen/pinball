@@ -31,7 +31,7 @@ muon_lr_mult: 3.0
 muon_betas: [0.9, 0.95]
 muon_adjust_lr_fn: match_rms_adamw
 num_epochs: 1000
-samples_per_epoch: 6400         # ~100 steps/epoch at b64 -> preview cadence stays useful
+samples_per_epoch: 25600 #6400         # ~100 steps/epoch at b64 -> preview cadence stays useful
 gradient_accumulation_steps: 1
 gradient_checkpointing: false
 train_feature_chunked_ce_enable: false

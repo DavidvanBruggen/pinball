@@ -1,0 +1,113 @@
+# SD-VAE LATENT diffusion — TRANSFORMER baseline. The head-to-head counterpart of
+# pinball_image_diffusion_latent.yaml: IDENTICAL pipeline (frozen stabilityai/sd-vae-ft-mse
+# encodes pixels -> 4ch 32x32 = 1024-token latent grid, cached; latent-space v-prediction
+# diffusion; same data/optimizer/EMA/CFG/preview settings) — only the sequence model between
+# the latent tokens and the v-pred head differs:
+#
+#   pinball     : latent tokens -> curve-mode hierarchy (pack + refresh + coarse levels) -> v-pred
+#   transformer : latent tokens -> vanilla bidi transformer (1D raster RoPE + abs pos)   -> v-pred (this file)
+#
+# No RGB CNN bridge on either side. The transformer sees the latent grid as [B, 1024, 4]
+# features via a Linear stem (feature_projection), runs full bidirectional attention (diffusion
+# sees the whole noisy grid every step), and the output head projects back to the 4 latent
+# channels. Timestep + class conditioning enter via per-block FiLM on both models.
+
+model_type: transformer
+modality: image
+tokenizer_name: gpt2            # unused in image mode (features input); kept for cli defaults
+
+block_size: 1024                # synced by the cli to (image_size / image_latent_downsample)^2
+batch_size: 64                  # T=1024 latent tokens; drop to 32 + grad_accum 2 if OOM
+val_split: 0.01
+
+# Training — identical to pinball_image_diffusion_latent.yaml.
+train_mode: ar
+learning_rate: 3e-4
+weight_decay: 0.1
+warmup_steps: 5000
+optimizer: muon_hybrid
+muon_lr_mult: 3.0
+muon_betas: [0.9, 0.95]
+muon_adjust_lr_fn: match_rms_adamw
+num_epochs: 1000
+samples_per_epoch: 6400
+gradient_accumulation_steps: 1
+gradient_checkpointing: false
+train_feature_chunked_ce_enable: false
+longctx_diag_every: 0
+generate_every: 0
+save_every: 0
+checkpoint_dir: ./transformer/image_diffusion_latent/checkpoints
+
+# Transformer backbone — matched to the pinball latent config's SHAPE (hidden 1024 / 16 heads /
+# 16 layers). NOTE this is fewer params than pinball at the same shape (no hierarchy/pack extras);
+# bump transformer_n_layer if you want a matched-PARAM rather than matched-shape comparison.
+hidden_dim: 1024
+num_heads: 16
+transformer_n_layer: 16
+transformer_ffn_type: swiglu
+transformer_use_rope: true
+transformer_attn_backend: auto   # auto | flash | sdpa
+# Compile parity with pinball's hier_layer_compile + hier_refresh_compile.
+transformer_compile: true
+# Per-block FiLM conditioning (class+timestep before every block) — parity with pinball's
+# refine_cond_mode: film. Zero-init = identity at init; fresh runs only (adds params).
+transformer_block_cond_film: true
+dropout: 0.1
+norm_type: layernorm
+# Diffusion is bidirectional: the model sees the whole noisy latent grid every step.
+transformer_causal: false
+ar_graph_causal: false
+
+# ============================================================================
+# IMAGE MODALITY — copied 1:1 from pinball_image_diffusion_latent.yaml
+# ============================================================================
+image_dataset_root: /media/david/SSD_Data/Datasets/imagenet1k_hf #/media/david/SSD_Data/Datasets/mini-imagenet
+image_size: 256
+image_num_classes: 100          # 1000 for imagenet1k
+image_objective: diffusion
+image_token_mode: latent        # frozen SD-VAE latents (no rgb_unet CNN bridge is built)
+image_roundtrip_check: true     # frozen VAE round-trip is a meaningful init-time sanity check
+image_num_workers: 8
+# Latents are deterministic (frozen VAE) -> cacheable. readwrite builds the latent shard
+# cache ONCE upfront, then every step reads shards (no per-step VAE encode). Set to `off`
+# to skip the upfront build and encode on the fly instead (slower per step; no persistence).
+image_cache_mode: readwrite
+image_cache_build_batch_size: 256   # VAE-encode batch during the upfront cache build
+image_auto_prepare: true
+image_hf_dataset_id: ILSVRC/imagenet-1k #timm/mini-imagenet
+image_prepare_streaming: true
+image_prepare_max_train: 0
+image_prepare_max_val: 0
+image_prepare_overwrite: false
+
+# Frozen Stable-Diffusion VAE. 256px / ds8 => 32x32 latent grid, 4 channels per position ->
+# the transformer sees [B, 1024, 4] feature tokens (Linear stem -> hidden_dim).
+image_latent_model_name: stabilityai/sd-vae-ft-mse
+image_latent_scaling_factor: 0.18215   # SD-VAE standard latent scale
+image_latent_channels: 4
+image_latent_downsample: 8             # 256 / 8 = 32x32 latent grid
+
+# Diffusion (LATENT-space v-prediction). For latent mode target/prediction "auto" resolve to
+# token_epsilon + v (trainer.py). Schedule/betas/steps match the pinball latent config.
+image_diffusion_steps: 1000
+image_diffusion_schedule: cosine
+image_diffusion_target: auto
+image_diffusion_prediction: auto
+image_rgb_centered_diffusion: false    # latents are NOT centered RGB (this knob is for pixel/rgb_unet mode)
+image_diffusion_min_snr_gamma: 5.0     # min-SNR-5 loss weighting (the proj-oc run used 0.0; set 0.0 to match it exactly)
+image_diffusion_beta_start: 1e-4
+image_diffusion_beta_end: 2e-2
+
+use_ema: true
+image_class_cond_drop_prob: 0.1
+
+image_preview_enable: true
+image_preview_eval_interval: 1
+image_preview_num_samples: 8
+image_preview_guidance_scale: 3.0      # real CFG (1.0 = conditional-only)
+image_preview_diffusion_steps: 250     # respaced from the 1000 train steps
+image_fid_enable: false
+image_fid_eval_interval: 0
+image_fid_num_samples: 2048
+image_fid_guidance_scale: 3.0
