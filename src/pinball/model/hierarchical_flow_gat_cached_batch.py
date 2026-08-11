@@ -3433,6 +3433,8 @@ class HierarchicalFlowGAT(nn.Module):
         self._last_hqd_stage_stats: Optional[Dict[str, int]] = None
         self._last_hqd_profile_stats: Optional[Dict[str, float]] = None
         self._last_hqd_avg_l0: Optional[float] = None
+        self._last_hqd_mean_dist = None
+        self._last_hqd_local_frac = None
         self._hqd_reuse_cache: Optional[Dict[str, Any]] = None
         self._hqd_runtime_logged: bool = False
         self._hqd_skeleton_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
@@ -6662,6 +6664,17 @@ class HierarchicalFlowGAT(nn.Module):
             for k, g in self.downward_refresh_gates.items():
                 q, m = k.split(":")
                 d[f"downref.L{q}<-L{m}.gate"] = float(g.detach())
+        # HQD reach: mean selection distance in node ids (curve order for L0) and the
+        # fraction landing inside the local window, i.e. slots spent on nodes the packed
+        # attention already sees. Watch mean_dist collapsing toward the window half --
+        # that is training closing the long-range route.
+        _md = getattr(self, "_last_hqd_mean_dist", None)
+        if _md is not None:
+            d["hqd.mean_dist"] = float(_md)
+        _lf = getattr(self, "_last_hqd_local_frac", None)
+        if _lf is not None:
+            d["hqd.local_overlap"] = float(_lf)
+
         # Cross-query refiners (downward L0/L1/L2<-L3 or any query<-memory) residual write scale.
         for r in getattr(self, "pinball_cross_query_refiners", []) or []:
             d[f"crossq.L{r.query_level}<-L{r.memory_level}.write"] = float(r.write_scale.detach())
@@ -10997,6 +11010,20 @@ class HierarchicalFlowGAT(nn.Module):
                     src_out = sel_s[valid_s]
                     dst_out = dst_s[valid_s]
                 added = int(b_out.numel())
+                # Reach diagnostics. HQD has no xq-style exclude_local, so the useful
+                # numbers are how FAR selections land and how many duplicate what the
+                # local window already covers. Reduced on GPU and left as 0-dim tensors;
+                # gate_monitor pays the sync, and only on its own cadence.
+                if added > 0:
+                    _d = (src_out.float() - dst_out.float()).abs()
+                    self._last_hqd_mean_dist = _d.mean().detach()
+                    _half = float(getattr(self, "local_pack_window", 0) or 0) / 2.0
+                    self._last_hqd_local_frac = (
+                        (_d <= _half).float().mean().detach() if _half > 0 else None
+                    )
+                else:
+                    self._last_hqd_mean_dist = None
+                    self._last_hqd_local_frac = None
                 if added > 0:
                     self._hqd_reuse_cache = {
                         "b_idx": b_out.detach(), "src_idx": src_out.detach(),
