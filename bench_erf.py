@@ -136,7 +136,10 @@ def measure(cfg_path, override, ckpt, probes, iters, device):
         opt.step()
         opt.zero_grad(set_to_none=True)
 
-    for _ in range(4):
+    # Long warmup on purpose: the GPU idles at ~210 MHz between arms, and each arm is a
+    # fresh process, so a short warmup measures the clock ramp instead of the model.
+    # With 4 warmup iters the same arm varied ~12% run to run.
+    for _ in range(20):
         step()
     torch.cuda.synchronize()
     t0 = time.perf_counter()

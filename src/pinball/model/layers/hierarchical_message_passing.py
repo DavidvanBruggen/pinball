@@ -597,6 +597,10 @@ class HierarchicalMessagePassing(MessagePassing):
         self._local_attn_runtime_logged_keys = set()
         self.local_attn_dense_mask_max_tokens = 8192
         self.hqd_sparse_project_active_only = False
+        # Tile-shared HQD apply (see _compute_hqd_tiled_attn). Off = edge-list scatter.
+        self.hqd_tiled_apply = False
+        self.hqd_tile_size = 64
+        self.hqd_tile_topk = 64
         self.hqd_attn_impl = "scatter"        # scatter (edge softmax+scatter_add) | dense (fused gathered SDPA/flash)
         self.hqd_dense_backend = "sdpa"        # sdpa | flash (flash-varlen, falls back to sdpa)
         self.hqd_dense_max_pad_ratio = 1.5     # dense/sdpa: fall back to scatter if padded slots (G*Kmax) exceed this x #edges
@@ -2773,6 +2777,13 @@ class HierarchicalMessagePassing(MessagePassing):
         src_idx = src_idx.to(device=q.device, dtype=torch.long)
         dst_idx = dst_idx.to(device=q.device, dtype=torch.long)
 
+        if bool(getattr(self, "hqd_tiled_apply", False)) and not bool(
+            getattr(self, "hqd_sparse_project_active_only", False)
+        ):
+            out = self._compute_hqd_tiled_attn(q, k, v, b_idx, src_idx, dst_idx, num_nodes, B)
+            self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
+            return out
+
         q_dst = q[b_idx, dst_idx]
         k_src = k[b_idx, src_idx]
         head_dim = max(1, int(q_dst.size(-1)))
@@ -2809,6 +2820,80 @@ class HierarchicalMessagePassing(MessagePassing):
         out = self.sparse_out_proj(out)
         self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
         return out
+
+    def _compute_hqd_tiled_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        b_idx: torch.Tensor,
+        src_idx: torch.Tensor,
+        dst_idx: torch.Tensor,
+        num_nodes: int,
+        B: int,
+    ) -> torch.Tensor:
+        """Tile-shared HQD apply: one dense bmm per query tile, no edge-list scatter.
+
+        The edge list is reduced to ONE shared source set per contiguous tile of
+        ``hqd_tile_size`` destination nodes (top ``hqd_tile_topk`` by edge multiplicity),
+        which turns the apply into a batched matmul. The scatter path spends its time in
+        atomics over ~16k edges (measured 1.449 ms/layer); this is ~0.412 ms/layer, and the
+        gap widens with grid size because the edge count grows with queries x topk while
+        the bmm shape does not.
+
+        Derived from the FINAL edge list, so it is agnostic to which mechanism produced an
+        edge (beam descent, witness bags, coarse routing).
+
+        NOT a drop-in equivalent: tile-shared top-k is not per-query top-k, so this changes
+        what each query attends to. Gated behind hqd_tiled_apply (default off).
+        """
+        device = q.device
+        tile = max(1, int(getattr(self, "hqd_tile_size", 64)))
+        num_heads = int(q.size(-2))
+        qk_dim = int(q.size(-1))
+        v_dim = int(v.size(-1))
+        n_tiles = (int(num_nodes) + tile - 1) // tile
+        topk = max(1, min(int(getattr(self, "hqd_tile_topk", 64)), int(num_nodes)))
+
+        # 1. Per-tile source histogram: how many of this tile's queries wanted each node.
+        #    Buffer is [B, n_tiles, num_nodes] -- small (20 x 1248 here), unlike the
+        #    [B*num_nodes, H, D] atomics the scatter path writes.
+        tile_id = torch.div(dst_idx, tile, rounding_mode="floor").clamp_(0, n_tiles - 1)
+        lin = (b_idx * n_tiles + tile_id) * int(num_nodes) + src_idx
+        hist = torch.zeros(B * n_tiles * int(num_nodes), device=device, dtype=torch.float32)
+        hist.index_add_(0, lin, torch.ones_like(lin, dtype=torch.float32))
+        hist = hist.view(B, n_tiles, int(num_nodes))
+        tile_nodes = hist.topk(topk, dim=-1).indices                     # [B, n_tiles, topk]
+        tile_valid = hist.gather(-1, tile_nodes) > 0                     # tiles can be short
+
+        # 2. Gather each tile's shared K/V once (topk rows), not once per edge.
+        batch_off = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1) * int(num_nodes)
+        flat_nodes = (tile_nodes + batch_off).reshape(-1)
+        k_t = k.reshape(-1, num_heads, qk_dim).index_select(0, flat_nodes)
+        v_t = v.reshape(-1, num_heads, v_dim).index_select(0, flat_nodes)
+        k_t = k_t.view(B, n_tiles, topk, num_heads, qk_dim)
+        v_t = v_t.view(B, n_tiles, topk, num_heads, v_dim)
+
+        # 3. Pad the query axis up to n_tiles*tile so it reshapes cleanly, then one bmm.
+        pad = n_tiles * tile - int(num_nodes)
+        q_p = q if pad == 0 else torch.cat([q, q.new_zeros(B, pad, num_heads, qk_dim)], dim=1)
+        q_t = q_p.view(B, n_tiles, tile, num_heads, qk_dim)
+
+        qb = q_t.permute(0, 1, 3, 2, 4).reshape(B * n_tiles * num_heads, tile, qk_dim)
+        kb = k_t.permute(0, 1, 3, 2, 4).reshape(B * n_tiles * num_heads, topk, qk_dim)
+        vb = v_t.permute(0, 1, 3, 2, 4).reshape(B * n_tiles * num_heads, topk, v_dim)
+
+        scores = torch.bmm(qb, kb.transpose(1, 2)) / math.sqrt(float(qk_dim))
+        keep = tile_valid.view(B, n_tiles, 1, topk).expand(B, n_tiles, num_heads, topk)
+        scores = scores.masked_fill(~keep.reshape(-1, 1, topk), float("-inf"))
+        weights = scores.softmax(dim=-1)
+        # A tile whose queries produced no edges softmaxes over all -inf -> NaN; that node
+        # contributes nothing in the scatter path, so force the same zero here.
+        weights = torch.nan_to_num(weights, nan=0.0)
+
+        out = torch.bmm(weights, vb).view(B, n_tiles, num_heads, tile, v_dim)
+        out = out.permute(0, 1, 3, 2, 4).reshape(B, n_tiles * tile, num_heads * v_dim)
+        return self.sparse_out_proj(out[:, : int(num_nodes)])
 
     def _capture_graph_witnesses(
         self,

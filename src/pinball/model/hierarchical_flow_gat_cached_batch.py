@@ -2697,6 +2697,9 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_assume_disjoint_children: bool = False,
         hqd_validate_disjoint_children: bool = False,
         hqd_sparse_project_active_only: bool = False,
+        hqd_tiled_apply: bool = False,
+        hqd_tile_size: int = 64,
+        hqd_tile_topk: int = 64,
         hqd_attn_impl: str = "scatter",
         hqd_dense_backend: str = "sdpa",
         hqd_descent_stop_at: int = 0,
@@ -3304,6 +3307,9 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_assume_disjoint_children = bool(hqd_assume_disjoint_children)
         self.hqd_validate_disjoint_children = bool(hqd_validate_disjoint_children)
         self.hqd_sparse_project_active_only = bool(hqd_sparse_project_active_only)
+        self.hqd_tiled_apply = bool(hqd_tiled_apply)
+        self.hqd_tile_size = max(1, int(hqd_tile_size))
+        self.hqd_tile_topk = max(1, int(hqd_tile_topk))
         self.hqd_attn_impl = str(hqd_attn_impl).lower() if str(hqd_attn_impl).lower() in ("scatter", "dense") else "scatter"
         self.hqd_dense_backend = str(hqd_dense_backend).lower() if str(hqd_dense_backend).lower() in ("sdpa", "flash") else "sdpa"
         self.hqd_descent_stop_at = int(hqd_descent_stop_at) if int(hqd_descent_stop_at) in (0, 2) else 0
@@ -12088,6 +12094,9 @@ class HierarchicalFlowGAT(nn.Module):
                     mp.local_attn_runtime_level_grid_shapes = {}
                 mp.local_attn_runtime_spatial_metric = str(getattr(self, "graph_spatial_metric", "chebyshev"))
                 mp.hqd_sparse_project_active_only = bool(getattr(self, "hqd_sparse_project_active_only", False))
+                mp.hqd_tiled_apply = bool(getattr(self, "hqd_tiled_apply", False))
+                mp.hqd_tile_size = int(getattr(self, "hqd_tile_size", 64))
+                mp.hqd_tile_topk = int(getattr(self, "hqd_tile_topk", 64))
                 mp.hqd_attn_impl = str(getattr(self, "hqd_attn_impl", "scatter"))
                 mp.hqd_dense_backend = str(getattr(self, "hqd_dense_backend", "sdpa"))
                 mp.hqd_profile_enable = bool(getattr(self, "hqd_debug", False))
