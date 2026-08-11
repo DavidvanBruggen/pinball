@@ -5441,6 +5441,10 @@ class EnhancedHierarchicalTrainer:
             epoch_loss: Average loss for the epoch (per step)
         """
         self.model.train()
+        # Record the epoch we are actually in, so save_checkpoint() stamps the real number.
+        # Without this it stays at its __init__ value (0) forever and every resume restarts
+        # the epoch counter from scratch.
+        self.current_epoch = int(epoch)
         total_loss = 0.0
         steps_processed_in_epoch = 0
         last_grad_norm = 0.0 # Variable to hold the last computed grad norm for display

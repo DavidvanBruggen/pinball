@@ -20,6 +20,7 @@ objectives selected by the config's ``train_mode`` / ``train_objective_mode``.
 from __future__ import annotations
 
 import argparse
+import glob
 import logging
 import math
 import os
@@ -313,6 +314,13 @@ def main(argv=None) -> None:
     save_every = int(args.save_every if args.save_every is not None else getattr(cfg, "save_every", 0) or 0)
     if save_every > 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
+    # Rolling checkpoints. `best` only lands when val_loss improves, which late in a run can
+    # be hundreds of epochs apart -> without these, a crash loses everything since the last
+    # improvement. `last` is a single file overwritten on a fast cadence; milestones keep a
+    # short history (pruned to keep_last_milestones) so you can step back further.
+    save_last_every_epochs = int(getattr(cfg, "save_last_every_epochs", 1) or 0)
+    save_milestone_every_epochs = int(getattr(cfg, "save_milestone_every_epochs", 0) or 0)
+    keep_last_milestones = int(getattr(cfg, "keep_last_milestones", 3) or 0)
 
     optimizer = _build_optimizer(model, cfg)
     lr_scheduler = _build_scheduler(optimizer, warmup_steps, max_steps)
@@ -389,6 +397,18 @@ def main(argv=None) -> None:
         trainer.load_checkpoint(resume_path)
         resumed_steps = int(getattr(trainer, "global_step", 0))
         start_epoch = int(getattr(trainer, "current_epoch", 0))
+        # Checkpoints written before the epoch counter was tracked all carry current_epoch=0,
+        # which would restart the epoch numbering on every resume. global_step is always
+        # correct, so derive the epoch from it instead.
+        if start_epoch <= 0 and resumed_steps > 0:
+            start_epoch = resumed_steps // steps_per_epoch
+            logger.info("Checkpoint has no epoch stamp; derived epoch=%d from global_step=%d "
+                        "(%d steps/epoch)", start_epoch, resumed_steps, steps_per_epoch)
+        elif start_epoch > 0:
+            # The stamp records the epoch that was running when the checkpoint was written,
+            # and the rolling/best saves happen at epoch end -> continue with the next one.
+            start_epoch += 1
+        trainer.current_epoch = start_epoch
         logger.info("Resumed from %s  (global_step=%d, epoch=%d)",
                     resume_path, resumed_steps, start_epoch)
         if ema_model is not None:
@@ -481,20 +501,53 @@ def main(argv=None) -> None:
             if was_training:
                 model.train()
 
+    def _save_atomic(save_fn, path: str) -> bool:
+        """Write to <path>.tmp, then os.replace onto the target.
+
+        The rolling files are overwritten every few epochs, so a crash (or an OOM kill)
+        part-way through a multi-GB torch.save would otherwise truncate the only recent
+        copy. os.replace is atomic within a filesystem, so the old file survives intact
+        until the new one is complete.
+        """
+        tmp = f"{path}.tmp"
+        try:
+            save_fn(tmp)
+            os.replace(tmp, path)
+            return True
+        except Exception as exc:
+            logger.warning("checkpoint save failed for %s (%s)", path, exc)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
     def _save(tag: str) -> None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         path = os.path.join(checkpoint_dir, f"pinball_{tag}.pt")
-        try:
-            trainer.save_checkpoint(path)
+        if _save_atomic(trainer.save_checkpoint, path):
             logger.info("saved checkpoint -> %s", path)
-        except Exception as exc:
-            logger.warning("checkpoint save failed (%s)", exc)
         if getattr(trainer, "ema_model", None) is not None:
-            ema_path = os.path.join(checkpoint_dir, f"pinball_{tag}_ema.pt")
-            try:
-                trainer.save_ema_checkpoint(ema_path)
-            except Exception as exc:
-                logger.warning("EMA checkpoint save failed (%s)", exc)
+            _save_atomic(trainer.save_ema_checkpoint,
+                         os.path.join(checkpoint_dir, f"pinball_{tag}_ema.pt"))
+
+    def _prune_milestones() -> None:
+        """Keep only the newest keep_last_milestones pinball_epoch*.pt (+ EMA companions)."""
+        if keep_last_milestones <= 0:
+            return
+        try:
+            files = sorted(
+                f for f in glob.glob(os.path.join(checkpoint_dir, "pinball_epoch*.pt"))
+                if not f.endswith("_ema.pt")
+            )
+            for stale in files[:-keep_last_milestones]:
+                for victim in (stale, f"{stale[:-3]}_ema.pt"):
+                    if os.path.exists(victim):
+                        os.remove(victim)
+                logger.info("pruned old milestone %s", os.path.basename(stale))
+        except OSError as exc:
+            logger.warning("milestone prune failed (%s)", exc)
 
     # Step-based hooks: the trainer fires train_metrics_callback every
     # train_metrics_interval optimizer steps with a payload carrying global_step.
@@ -515,10 +568,12 @@ def main(argv=None) -> None:
         trainer.train_metrics_callback = _step_hook
         trainer.train_metrics_interval = max(1, interval)
 
-    logger.info("Training: objective=%s max_steps=%d epochs=%d steps/epoch=%d grad_accum=%d "
-                "generate_every=%d save_every=%d mixed_precision=%s",
-                objective, max_steps, num_epochs, steps_per_epoch, grad_accum,
-                generate_every, save_every, use_amp)
+    logger.info("Training: objective=%s epochs=%d..%d steps=%d/%d steps/epoch=%d grad_accum=%d "
+                "generate_every=%d save_every=%d save_last_every_epochs=%d "
+                "save_milestone_every_epochs=%d mixed_precision=%s",
+                objective, start_epoch, num_epochs, resumed_steps, max_steps, steps_per_epoch,
+                grad_accum, generate_every, save_every, save_last_every_epochs,
+                save_milestone_every_epochs, use_amp)
 
     # Best-checkpoint + early-stopping (monitors val_loss; lower is better).
     best_val = float("inf")
@@ -588,6 +643,13 @@ def main(argv=None) -> None:
                     if generate_every <= 0:
                         _generate(f"epoch {epoch}")
                     break
+
+        # Rolling checkpoints, independent of val_loss improving.
+        if save_last_every_epochs > 0 and (epoch + 1) % save_last_every_epochs == 0:
+            _save("last")
+        if save_milestone_every_epochs > 0 and (epoch + 1) % save_milestone_every_epochs == 0:
+            _save(f"epoch{epoch:05d}")
+            _prune_milestones()
 
         # Per-epoch generation, unless step-based generation is already running.
         if generate_every <= 0:

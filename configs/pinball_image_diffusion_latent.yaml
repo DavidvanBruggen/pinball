@@ -30,7 +30,7 @@ optimizer: muon_hybrid
 muon_lr_mult: 3.0
 muon_betas: [0.9, 0.95]
 muon_adjust_lr_fn: match_rms_adamw
-num_epochs: 1000
+num_epochs: 2000
 samples_per_epoch: 25600 #6400         # ~100 steps/epoch at b64 -> preview cadence stays useful
 gradient_accumulation_steps: 1
 gradient_checkpointing: false
@@ -38,7 +38,13 @@ train_feature_chunked_ce_enable: false
 longctx_diag_every: 0
 generate_every: 0
 save_every: 0
-checkpoint_dir: ./pinball/image_diffusion_latent/checkpoints
+# Rolling checkpoints: `best` only lands on a val_loss improvement, which late in a long run
+# can be hundreds of epochs apart. `pinball_last.pt` is one file overwritten every epoch;
+# milestones keep a short stepping-back history (newest 3 kept, older pruned).
+save_last_every_epochs: 1
+save_milestone_every_epochs: 10
+keep_last_milestones: 3
+checkpoint_dir: ./pinball/image_diffusion_latent_156window/checkpoints
 
 # --- Graph / hierarchy: identical recipe to the RGB / discrete MaskGIT configs -------------
 ar_graph_causal: false          # BIDI: diffusion sees the whole (noisy) latent grid every step
@@ -75,7 +81,7 @@ xq_nominate_enable: false       # causal machinery; stays off in bidi
 use_hqd: false
 
 local_pack_cross_level: true
-local_pack_window: 1248          # near-global reach at 1024-token grids
+local_pack_window: 156 #1248          # near-global reach at 1024-token grids
 local_pack_query_levels: [0, 1, 2, 3]
 local_pack_level_bias: true
 local_pack_coarse_lane: true
