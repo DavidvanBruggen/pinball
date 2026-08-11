@@ -360,6 +360,7 @@ def build_pinball_model(
         hqd_sparse_project_active_only=bool(getattr(args, "hqd_sparse_project_active_only", False)),
         hqd_tiled_apply=bool(getattr(args, "hqd_tiled_apply", False)),
         hqd_static_descent=bool(getattr(args, "hqd_static_descent", False)),
+        zip_max_children_per_parent=int(getattr(args, "zip_max_children_per_parent", 4)),
         hqd_static_compile=bool(getattr(args, "hqd_static_compile", False)),
         hqd_tile_size=int(getattr(args, "hqd_tile_size", 64)),
         hqd_tile_topk=int(getattr(args, "hqd_tile_topk", 64)),

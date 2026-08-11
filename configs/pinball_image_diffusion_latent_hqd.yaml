@@ -84,6 +84,15 @@ hqd_static_compile: true        # fuse the descent (needs the tiled apply to pay
 hqd_assume_disjoint_children: true   # drop the per-stage sort  [semantic change]
 hqd_tiled_apply: true           # tile-shared bmm apply        [semantic change]
 hqd_tile_size: 256
+# The descent's children tables are capped at zip_max_children_per_parent (default 4,
+# and it had NO config key until now). True fan-out is 16 L0 per L1, and the cap keeps
+# the 4 LOWEST node ids -- the same first quarter of every window, in curve order. So
+# each query could only ever reach 4 parents x 4 = 16 L0 nodes, and hqd_topk_l0: 64 was
+# inert. Raising the cap to 16 makes the full window reachable: 2x the measured reach
+# (1.647 -> 3.266 far/near) at the SAME step cost.
+zip_max_children_per_parent: 16
+hqd_topk_l0: 32                 # NOT 64: topk_l0=64 measured 12x slower (+1643%) for
+                                # the same reach. Sharp cliff -- do not raise blindly.
 xq_nominate_read_prerope: true  # NOTE: the config key is xq_nominate_read_*, the
                                 # module param is hqd_read_* -- hqd_read_prerope as a
                                 # config key is silently ignored.
