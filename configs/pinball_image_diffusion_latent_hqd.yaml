@@ -84,6 +84,20 @@ hqd_static_compile: true        # fuse the descent (needs the tiled apply to pay
 hqd_assume_disjoint_children: true   # drop the per-stage sort  [semantic change]
 hqd_tiled_apply: true           # tile-shared bmm apply        [semantic change]
 hqd_tile_size: 256
+xq_nominate_read_prerope: true  # NOTE: the config key is xq_nominate_read_*, the
+                                # module param is hqd_read_* -- hqd_read_prerope as a
+                                # config key is silently ignored.
+                                # Read on CONTENT, not RoPE rotations at 8x the
+                                # window those rotations were actually trained on
+# The sink ADDS a parameter per layer, which changes the optimizer's param-group
+# sizes -> 270k steps of Muon/AdamW moments cannot load and restart fresh. That is a
+# bigger perturbation than HQD itself. Left off for a resumed fork; enable it (with
+# resume_strict: false) on a fresh run or once this fork has settled.
+# xq_nominate_read_sink: true     # learned zero-value sink: a query that retrieved
+                                # nothing useful can no-op instead of emitting a
+                                # forced weighted average          [ADDS PARAMS]
+# resume_strict: false            # REQUIRED by hqd_read_sink: it adds one k-sink per
+                                # layer, absent from the pre-HQD checkpoint
 # --- Fast HQD (measured 2026-08-11 with bench_erf.py, init weights, 32x32) ------------
 # Long-range reach as far/near influence ratio; baseline (no HQD) = 0.142 @ ~74 ms/step:
 #   original HQD, fresh every layer ... 0.641 @ +60-62%

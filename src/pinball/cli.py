@@ -394,7 +394,8 @@ def main(argv=None) -> None:
     if resume_path:
         if not os.path.isfile(resume_path):
             raise SystemExit(f"--resume: checkpoint not found: {resume_path}")
-        trainer.load_checkpoint(resume_path)
+        resume_strict = bool(getattr(cfg, "resume_strict", True))
+        trainer.load_checkpoint(resume_path, strict=resume_strict)
         resumed_steps = int(getattr(trainer, "global_step", 0))
         start_epoch = int(getattr(trainer, "current_epoch", 0))
         # Checkpoints written before the epoch counter was tracked all carry current_epoch=0,

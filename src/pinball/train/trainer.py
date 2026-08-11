@@ -7687,22 +7687,50 @@ class EnhancedHierarchicalTrainer:
         if is_best:
             logger.info("This is a best model checkpoint")
     
-    def load_checkpoint(self, path):
+    def load_checkpoint(self, path, strict: bool = True):
         """
         Load a checkpoint.
-        
+
         Args:
             path: Path to the checkpoint
+            strict: require an exact parameter match (default). Pass False to resume
+                across an architecture change that ADDS parameters — every missing and
+                unexpected key is logged, so a genuinely mismatched checkpoint is loud
+                rather than silent.
         """
         checkpoint = torch.load(path, map_location=self.device)
-        
+
         # Load model weights
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        result = self.model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+        if not strict:
+            missing = list(getattr(result, "missing_keys", []) or [])
+            unexpected = list(getattr(result, "unexpected_keys", []) or [])
+            if missing:
+                logger.warning("resume(strict=False): %d parameter(s) NOT in the checkpoint, "
+                               "left at their fresh init: %s", len(missing), ", ".join(missing[:12]))
+            if unexpected:
+                logger.warning("resume(strict=False): %d checkpoint parameter(s) with no home "
+                               "in this model, dropped: %s", len(unexpected), ", ".join(unexpected[:12]))
+            if not missing and not unexpected:
+                logger.info("resume(strict=False): parameter sets matched exactly anyway.")
         
-        # Load optimizer state if it exists and optimizer is provided
+        # Load optimizer state if it exists and optimizer is provided.
+        # Under strict=False the model may have gained parameters, which changes the
+        # optimizer's param-group sizes and makes its state_dict unloadable. That is a
+        # real cost, not a formality: the moments carry the whole run's history, so this
+        # warns loudly rather than dropping them quietly.
         if 'optimizer_state_dict' in checkpoint and self.optimizer is not None:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except (ValueError, KeyError) as exc:
+                if strict:
+                    raise
+                logger.warning(
+                    "resume(strict=False): optimizer state could not be loaded (%s). "
+                    "Continuing with FRESH optimizer moments — expect a larger transient "
+                    "than the architecture change alone would cause.", exc,
+                )
+
         # Load scheduler state if it exists and scheduler is provided
         if 'lr_scheduler_state_dict' in checkpoint and self.lr_scheduler is not None:
             self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])

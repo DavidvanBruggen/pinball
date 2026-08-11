@@ -59,6 +59,7 @@ _NON_MODEL_KEYS = frozenset({
     "max_grad_norm", "min_lr", "mixed_precision", "modality", "muon_adjust_lr_fn",
     "keep_last_milestones", "muon_betas", "muon_lr_mult", "num_epochs", "optimizer",
     "resume_from_checkpoint", "save_last_every_epochs", "save_milestone_every_epochs",
+    "resume_strict",
     "resume_ema_from_checkpoint", "samples_per_epoch", "save_every", "seed", "text_file",
     "tokenizer_name", "train_objective_mode", "use_ema", "use_hybrid_masking", "val_split",
     "val_samples", "warmup_steps", "weight_decay", "input_mode", "model_type", "vocab_size",
