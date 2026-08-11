@@ -2698,6 +2698,8 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_validate_disjoint_children: bool = False,
         hqd_sparse_project_active_only: bool = False,
         hqd_tiled_apply: bool = False,
+        hqd_static_descent: bool = False,
+        hqd_static_compile: bool = False,
         hqd_tile_size: int = 64,
         hqd_tile_topk: int = 64,
         hqd_attn_impl: str = "scatter",
@@ -3308,6 +3310,10 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_validate_disjoint_children = bool(hqd_validate_disjoint_children)
         self.hqd_sparse_project_active_only = bool(hqd_sparse_project_active_only)
         self.hqd_tiled_apply = bool(hqd_tiled_apply)
+        self.hqd_static_descent = bool(hqd_static_descent)
+        self.hqd_static_compile = bool(hqd_static_compile)
+        self._hqd_static_compiled = None
+        self._hqd_static_fallback_logged = False
         self.hqd_tile_size = max(1, int(hqd_tile_size))
         self.hqd_tile_topk = max(1, int(hqd_tile_topk))
         self.hqd_attn_impl = str(hqd_attn_impl).lower() if str(hqd_attn_impl).lower() in ("scatter", "dense") else "scatter"
@@ -9672,6 +9678,113 @@ class HierarchicalFlowGAT(nn.Module):
         valid_children = valid_parent.unsqueeze(-1) & (children >= 0)
         return children, valid_children
 
+    def _hqd_static_descent_callable(self):
+        """torch.compile the static descent core, lazily, with the same probation policy
+        as _refresh_callable/_layer_callable: first runtime failure logs once and drops to
+        eager permanently.
+
+        This is the whole point of the fixed shapes. The stage-by-stage descent rebuilds
+        candidate sets with data-dependent shapes, so dynamo graph-breaks at every level;
+        the static core is one shape-stable graph, so the gather/mask/topk chains fuse.
+        Unlike the layer compile this is NOT gated on self.training — the descent runs
+        under no_grad in both modes and its shapes do not vary between them.
+        """
+        if not bool(getattr(self, "hqd_static_compile", False)):
+            return self._hqd_descent_static_core
+        fn = getattr(self, "_hqd_static_compiled", None)
+        if fn is None:
+            try:
+                import torch._dynamo as _dynamo
+                _dynamo.config.cache_size_limit = max(int(_dynamo.config.cache_size_limit), 64)
+                compiled = torch.compile(self._hqd_descent_static_core, dynamic=False)
+            except Exception as exc:
+                logger.warning("hqd_static_compile: torch.compile unavailable (%s); staying eager.", exc)
+                self._hqd_static_compiled = self._hqd_descent_static_core
+                return self._hqd_descent_static_core
+
+            def _probation(*args, _c=compiled, **kwargs):
+                try:
+                    return _c(*args, **kwargs)
+                except Exception as err:
+                    logger.warning(
+                        "hqd_static_compile: compiled descent failed at runtime (%s: %s); "
+                        "falling back to eager permanently.", type(err).__name__, err,
+                    )
+                    self._hqd_static_compiled = self._hqd_descent_static_core
+                    return self._hqd_descent_static_core(*args, **kwargs)
+
+            self._hqd_static_compiled = _probation
+            fn = _probation
+        return fn
+
+    def _hqd_descent_static_core(
+        self,
+        q_vec: torch.Tensor,
+        k_all: torch.Tensor,
+        l3_idx: torch.Tensor,
+        tables: Tuple[Any, Any, Any],
+        topks: Tuple[int, int, int, int],
+        query_time: torch.Tensor,
+        max_time: Any,
+        causal: bool,
+        allow_same_time: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fixed-shape 4-stage beam. Returns (nodes [B,Q,K], valid [B,Q,K]).
+
+        Every shape here is a function of (B, Q, topks, children-table widths) only — no
+        dedup, no boolean-mask compaction, no torch.cat — so the whole descent is a single
+        static graph and a legal torch.compile target. The stage-by-stage path rebuilds
+        candidate sets with data-dependent shapes at every level, which is what forces it
+        into ~13 kernels per stage and blocks fusion.
+
+        Selection matches the original when dedup is off: duplicate candidates only ever
+        consume a top-k slot, they cannot change which nodes score highest.
+
+        Levels are walked as a LOOP over (table, topk), not four unrolled blocks, so a
+        deeper hierarchy is a longer tuple rather than new code.
+        """
+        num_heads = int(q_vec.size(-2))
+        head_dim = int(q_vec.size(-1))
+        scale = float(num_heads * math.sqrt(float(head_dim)))
+        b_sz, q_sz = int(q_vec.size(0)), int(q_vec.size(1))
+
+        # Root stage: score every L3 node. This level is small by construction; it is the
+        # only stage that touches a whole level, and the reason depth must grow with N.
+        k_l3 = k_all.index_select(1, l3_idx)
+        scores = torch.einsum("bqhd,bkhd->bqk", q_vec, k_l3) / scale
+        if causal and max_time is not None:
+            t3 = max_time[3].index_select(0, l3_idx).view(1, 1, -1)
+            ok = (t3 <= query_time.unsqueeze(-1)) if allow_same_time else (t3 < query_time.unsqueeze(-1))
+            scores = scores.masked_fill(~(ok & (t3 >= 0)), float("-inf"))
+        k3 = max(1, min(int(topks[0]), int(l3_idx.numel())))
+        top_scores, top_pos = torch.topk(scores, k=k3, dim=-1, largest=True, sorted=False)
+        sel = l3_idx.index_select(0, top_pos.reshape(-1)).view(b_sz, q_sz, k3)
+        sel = torch.where(torch.isfinite(top_scores), sel, torch.full_like(sel, -1))
+
+        # Descent: expand -> score -> narrow, identical five ops per level.
+        for table, topk, lvl in zip(tables, topks[1:], (2, 1, 0)):
+            cand, cand_mask = self._hqd_expand_children_batched(sel, table)
+            cand = cand.reshape(b_sz, q_sz, -1)
+            cand_mask = cand_mask.reshape(b_sz, q_sz, -1)
+            cand = torch.where(cand_mask, cand, torch.full_like(cand, -1))
+            # Dedup is sort + compare + where -- all fixed shape, so it stays inside the
+            # static graph. Kept for exact parity with the reference descent; turn it off
+            # with hqd_assume_disjoint_children to drop the sort.
+            cand, cand_mask = self._hqd_maybe_dedup_candidates_batched(cand)
+            scores = self._hqd_score_candidates_batched(
+                query_vec=q_vec,
+                key_bank=k_all,
+                candidate_nodes=cand,
+                candidate_mask=cand_mask,
+                query_time=query_time,
+                candidate_max_time_cache=(max_time[lvl] if max_time is not None else None),
+                causal=causal,
+                allow_same_time=allow_same_time,
+            )
+            sel, _, _ = self._hqd_topk_from_scores_batched(cand, scores, int(topk))
+
+        return sel, sel >= 0
+
     def _hqd_dedup_sorted_candidates_batched(
         self,
         candidate_nodes: torch.Tensor,
@@ -10823,6 +10936,83 @@ class HierarchicalFlowGAT(nn.Module):
 
         stage_stats["queries"] = int(B * query_idx.numel())
         batch_idx = torch.arange(B, device=device, dtype=torch.long).view(B, 1, 1)
+
+        # ~~~~ Static-shape descent (hqd_static_descent) ~~~~
+        # Runs the plain 4-stage beam as ONE fixed-shape graph. Only the vanilla
+        # configuration is handled; anything using the extra routing machinery falls
+        # through to the stage-by-stage path below, which stays the reference.
+        if bool(getattr(self, "hqd_static_descent", False)):
+            simple = (
+                hqd_query_level == 0
+                and hqd_stop_level == 0
+                and shallow_read == 0
+                and hqd_global_topk == 0
+                and not hqd_handoff_to_l0
+                and not bool(getattr(self, "hqd_include_local_window", False))
+                and int(getattr(self, "hqd_local_window_size", 0)) <= 0
+                and not [l for l in getattr(self, "hqd_coarse_route_levels", []) or [] if int(l) in (1, 2, 3)]
+            )
+            if not simple:
+                if not bool(getattr(self, "_hqd_static_fallback_logged", False)):
+                    logger.warning(
+                        "hqd_static_descent is on but this HQD configuration uses the extended "
+                        "routing path (query_level=%d stop_level=%d shallow=%d global_topk=%d); "
+                        "falling back to the stage-by-stage descent.",
+                        hqd_query_level, hqd_stop_level, shallow_read, hqd_global_topk,
+                    )
+                    self._hqd_static_fallback_logged = True
+            else:
+                with torch.no_grad():
+                    # Chunked exactly like the reference path: each chunk is its own fixed
+                    # shape, so staticness is per-chunk and compile sees one graph per size.
+                    sel_parts: List[torch.Tensor] = []
+                    n_q = int(query_idx.numel())
+                    for c0 in range(0, n_q, int(query_chunk_size)):
+                        q_nodes_c = query_idx[c0 : c0 + int(query_chunk_size)]
+                        q_vec_c = q_all.index_select(1, q_nodes_c)
+                        if node_ar_time is not None and node_ar_time.numel() >= int(N):
+                            qt_c = node_ar_time.index_select(
+                                0, q_nodes_c.to(device=node_ar_time.device)
+                            ).to(device=device, dtype=torch.long)
+                        else:
+                            qt_c = level_max_time_cache[0].index_select(0, q_nodes_c)
+                        sel_c, _ = self._hqd_static_descent_callable()(
+                            q_vec=q_vec_c,
+                            k_all=k_all,
+                            l3_idx=l3_idx,
+                            tables=(l3_to_l2, l2_to_l1, l1_to_l0),
+                            topks=(hqd_topk_l3, hqd_topk_l2, hqd_topk_l1, hqd_topk_l0),
+                            query_time=qt_c.unsqueeze(0).expand(B, -1),
+                            max_time=level_max_time_cache,
+                            causal=causal,
+                            allow_same_time=allow_same_time,
+                        )
+                        sel_parts.append(sel_c)
+                    sel_s = sel_parts[0] if len(sel_parts) == 1 else torch.cat(sel_parts, dim=1)
+                    valid_s = sel_s >= 0
+                    # One compaction at the boundary (the stage path did this per level).
+                    dst_s = query_idx.view(1, -1, 1).expand(B, -1, sel_s.size(-1))
+                    b_s = batch_idx.expand_as(sel_s)
+                    b_out = b_s[valid_s]
+                    src_out = sel_s[valid_s]
+                    dst_out = dst_s[valid_s]
+                added = int(b_out.numel())
+                if added > 0:
+                    self._hqd_reuse_cache = {
+                        "b_idx": b_out.detach(), "src_idx": src_out.detach(),
+                        "dst_idx": dst_out.detach(), "B": int(B), "N": int(N),
+                        "device": str(device),
+                    }
+                else:
+                    self._hqd_reuse_cache = None
+                stage_stats["final_selected_total"] = added
+                self._last_hqd_added_total = added
+                self._last_hqd_selected_total = added
+                self._last_hqd_avg_l0 = None
+                self._last_hqd_stage_stats = dict(stage_stats)
+                self._last_hqd_profile_stats = profile_stats if profile_enabled else None
+                return b_out, src_out, dst_out, added, stage_stats
+
         selected_b: List[torch.Tensor] = []
         selected_src: List[torch.Tensor] = []
         selected_dst: List[torch.Tensor] = []

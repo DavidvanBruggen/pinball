@@ -359,6 +359,8 @@ def build_pinball_model(
         hqd_validate_disjoint_children=bool(getattr(args, "hqd_validate_disjoint_children", False)),
         hqd_sparse_project_active_only=bool(getattr(args, "hqd_sparse_project_active_only", False)),
         hqd_tiled_apply=bool(getattr(args, "hqd_tiled_apply", False)),
+        hqd_static_descent=bool(getattr(args, "hqd_static_descent", False)),
+        hqd_static_compile=bool(getattr(args, "hqd_static_compile", False)),
         hqd_tile_size=int(getattr(args, "hqd_tile_size", 64)),
         hqd_tile_topk=int(getattr(args, "hqd_tile_topk", 64)),
         hqd_attn_impl=str(getattr(args, "hqd_attn_impl", "scatter")),

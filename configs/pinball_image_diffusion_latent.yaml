@@ -79,6 +79,28 @@ hier_refresh_compile: true
 hier_layer_compile: true
 xq_nominate_enable: false       # causal machinery; stays off in bidi
 use_hqd: false
+# --- Fast HQD (measured 2026-08-11 with bench_erf.py, init weights, 32x32) ------------
+# Long-range reach as far/near influence ratio; baseline (no HQD) = 0.142 @ ~74 ms/step:
+#   original HQD, fresh every layer ... 0.641 @ +60-62%
+#   THIS BLOCK, fresh every layer ..... 0.683 @ +14-18%   <- better reach, ~4x cheaper
+#   + n4/n8 reuse on top .............. 0.436 @ +11%      <- NOT worth it any more
+# hqd_static_descent runs the 4-stage beam as one fixed-shape graph; selection is
+# VERIFIED IDENTICAL to the reference descent on every layer, with dedup on or off and
+# with compile on or off. That parity is what makes the two speedups safe:
+#   hqd_assume_disjoint_children  drops the per-stage sort      (-11 pts)
+#   hqd_static_compile            fuses the descent             (needs tiled to pay off)
+# Because fresh selection is now cheap, the reuse/staleness trade is obsolete: reuse
+# costs reach (0.683 -> 0.436) and barely saves anything. Descend every layer.
+# hqd_tiled_apply remains a SEMANTIC change (tile-shared top-k != per-query top-k) and
+# still needs a trained comparison; the static descent itself does not.
+# No parameter change in any variant -> checkpoints load across all of them.
+# DEAD END, do not retry: hqd_query_level > 0 collapses reach to baseline (0.151) at +32%.
+# hierarchical_query_descent_enable: true
+# hqd_static_descent: true
+# hqd_assume_disjoint_children: true
+# hqd_static_compile: true
+# hqd_tiled_apply: true
+# hqd_tile_size: 256
 
 local_pack_cross_level: true
 local_pack_window: 156 #1248          # near-global reach at 1024-token grids
