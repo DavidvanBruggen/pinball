@@ -1,0 +1,98 @@
+# DNA / ChromScape backbone -- loaded via build_pinball(cfg_path=..., num_tracks=<dim>).
+# ARCHITECTURE KEYS ONLY: the host harness owns the loop, data, optimizer and batching.
+#
+# LENGTH. block_size is a TOKEN count (whatever the harness feeds the backbone), NOT bp.
+# Set for 1024. If you move to 4096, THREE numbers change together -- they are derived
+# from block_size and compression_ratios, so they cannot be left stale:
+#
+#            L1    L2    L3   coarse   packed = block + coarse
+#   1024     128    64    32     224     1248     <- this file
+#   4096     512   256   128     896     4992
+#
+#   block_size            -> 4096
+#   local_pack_coarse_window -> 896   (= coarse, i.e. lane is all-to-all)
+#   local_pack_window        -> 4992  (FULL arm only; = packed)
+block_size: 1024
+model_type: pinball
+tokenizer_name: gpt2            # unused (features input); build_pinball stubs it
+
+# At 1024 tokens these ratios give a ~18% coarse fraction, the same shape the image runs
+# were tuned at. (The DNA args.json's [128, 8, 8] was sized for bp-resolution input and
+# is degenerate here: at 1024 tokens it yields L3 = 1.)
+compression_ratios: [16, 4, 4]
+overlap_ratios: [0.5, 0.5, 0.5]
+
+hidden_dim: 1024
+num_heads: 16
+num_refinement_layers: 12
+num_layers: [0, 0, 0, 0]
+internal_cycles: [0, 0, 0, 0]
+refinement_style: unified
+unified_refinement_cycles: 1
+l0_cycles: 0
+iterative_refinement_cycles: 0
+local_connectivity_window_size: 0
+dropout: 0.0
+norm_type: layernorm
+attn_backend: flash             # ALIAS -> l0_local_backend. Absent from the DNA json,
+                                # which silently left it on pyg.
+qkv_sharing: shared
+use_gradient_checkpointing: true
+
+# BIDIRECTIONAL: coverage reads the whole window, nothing to leak.
+ar_graph_causal: false
+ar_hier_edge_mode: none
+drop_static_cross_level_edges: true
+local_pack_bidirectional: true
+hier_downward_bidi_parent: true
+
+# 1D POSITIONS. Set explicitly, not left to the fallback when spatial_dims is unset.
+spatial_curve: none
+local_pack_rope_axial: false
+
+# refine_cond_mode deliberately ABSENT: the harness calls pinball(x) bare -- no
+# class_labels, no timesteps -- so per-layer FiLM would have no conditioning vector.
+
+upper_init: pooled
+upper_seed_gate_init: 1.0
+hier_upward_refresh: true
+hier_upward_refresh_every: 1
+hier_upward_refresh_gate_init: 0.1
+hier_downward_refresh: true
+hier_downward_refresh_every: 1
+hier_downward_refresh_gate_init: 0.1
+hier_refresh_compile: true
+hier_layer_compile: true
+
+local_pack_cross_level: true
+local_pack_query_levels: [0, 1, 2, 3]
+local_pack_level_bias: true
+local_pack_coarse_lane: true
+local_pack_coarse_window: 224   # = all coarse rows -> lane is all-to-all
+local_pack_flex_union: false    # causal-only; inert in a bidi run
+local_pack_lane_merge: false    # causal-only; inert in a bidi run
+
+# Source gates ON IN EVERY ARM: the arms then differ by one line rather than also by
+# parameter count, and sigmoid(hqd_source_gate_logit) reads out how much the model
+# weights HQD. Dump it from any checkpoint with tools_gate_dump.py.
+attention_source_gating_enable: true
+attention_source_gate_init_graph: 1.0
+attention_source_gate_init_local: 1.0   # NOT the 0.5 default -- that halves the main
+                                        # attention path (measured 59% output change).
+attention_source_gate_init_hqd: 0.05    # small but TRAINABLE: a sigmoid near 0 damps its
+                                        # own gradient by the same factor, and starves
+                                        # the HQD subtree of gradient too.
+attention_source_gate_debug: true       # free: 0-dim tensors, one .item() per interval
+
+xq_nominate_enable: false
+pinball_multirate_enable: false
+use_aux_loss: false
+token_unet_enable: false
+use_edge_embedding: false
+learn_edge_from_attention: false
+lateral_edge_trace_enable: false
+
+# === ARM 2/3: WINDOWED, no HQD ========================================================
+# Control for arm 3 -- differs from it by the use_hqd line alone.
+local_pack_window: 156
+use_hqd: false
