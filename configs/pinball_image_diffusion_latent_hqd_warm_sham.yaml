@@ -44,7 +44,7 @@ save_every: 0
 save_last_every_epochs: 1
 save_milestone_every_epochs: 10
 keep_last_milestones: 3
-checkpoint_dir: ./pinball/image_diffusion_latent_156window_hqd_scratch/checkpoints
+checkpoint_dir: ./pinball/image_diffusion_latent_156window_hqd_warm_sham/checkpoints
 
 # --- Graph / hierarchy: identical recipe to the RGB / discrete MaskGIT configs -------------
 ar_graph_causal: false          # BIDI: diffusion sees the whole (noisy) latent grid every step
@@ -78,7 +78,23 @@ hier_downward_refresh_gate_init: 0.1
 hier_refresh_compile: true
 hier_layer_compile: true
 xq_nominate_enable: false       # causal machinery; stays off in bidi
-use_hqd: true                   # FORK: HQD on (control run has this false)
+use_hqd: false                  # SHAM CONTROL for the warm fork. Identical in every
+                                # other respect: same resume point, same source gates (so
+                                # the SAME optimizer param-group change and therefore the
+                                # same fresh-moments shock), same step count.
+                                #
+                                # It exists because "run the HQD fork with HQD switched
+                                # off" is NOT a control. Those weights trained with HQD
+                                # contributing, so ablating it is an out-of-distribution
+                                # shock -- it measures how much the model has come to
+                                # DEPEND on HQD, which is a different question from what
+                                # the base path would have done on its own. Every
+                                # HQD-off arm measured before 2026-08-12 conflated those.
+                                #
+                                # Run this for the same number of steps as the warm fork
+                                # and compare like with like. The remaining HQD-specific
+                                # knobs below are inert with use_hqd false and are left
+                                # in place so the two files diff to one line.
 hqd_static_descent: true        # fixed-shape beam; selection verified == reference
 hqd_static_compile: true        # fuse the descent (needs the tiled apply to pay off)
 hqd_assume_disjoint_children: true   # drop the per-stage sort  [semantic change]
@@ -148,7 +164,36 @@ attention_source_gating_enable: true   # a learned sigmoid gate per attention SO
                                 # propagate through 16 LayerNorms. It also makes "is the
                                 # model actually using HQD" a readable number instead of
                                 # an inference.
-attention_source_gate_init_hqd: 0.1    # start quiet and let it earn its way up
+attention_source_gate_init_hqd: 0.05  # WARM START. Everything this config adds that
+                                # cannot be grafted -- mixed-level survivors, the read
+                                # sink, the RoPE'd read -- sits DOWNSTREAM of this gate,
+                                # so a small init lets all of it enter gently.
+                                #
+                                # WAS 0.0001 and that was WRONG in two ways. A sigmoid at
+                                # 1e-4 has derivative s(1-s) ~= 1e-4, so the gate damps
+                                # its OWN gradient by 10^4: measured, it moved 0.000100 ->
+                                # 0.000106 in 400 steps and would never realistically
+                                # open. And at a gate of exactly ~0 the whole HQD subtree
+                                # (read projections, sink) receives NO gradient either, so
+                                # nothing co-adapts while you wait.
+                                #
+                                # 0.05 costs a 6.35% output change against the control --
+                                # mild next to perturbations this model has demonstrably
+                                # absorbed (fork B recovered a 6.5x |near| collapse in
+                                # 1600 steps) -- and buys 475x the gate gradient.
+                                # Measured rel-change / gradient-vs-1e-4: 0.01 -> 1.6%/99x,
+                                # 0.03 -> 3.7%/291x, 0.05 -> 6.4%/475x, 0.1 -> 11.6%/900x.
+                                # Drop to 0.03 if the loss transient looks too large.
+attention_source_gate_init_local: 1.0  # CRITICAL, and NOT the 0.5 default. The local gate
+                                # multiplies the packed/local attention output, so enabling
+                                # source gating on a warm start with the default would
+                                # HALVE the main attention path of a 307k-step model.
+attention_source_gate_init_graph: 1.0  # identity (this one matches the default)
+resume_strict: false            # the gates and the sink are absent from the pre-HQD
+                                # checkpoint; load_checkpoint logs every missing key and
+                                # continues. NOTE it also cannot load the optimizer state
+                                # (the new params change the param-group sizes), so Muon/
+                                # AdamW moments restart fresh -- the one real cost here.
 attention_source_gate_debug: true      # FREE now: the layers stash 0-dim TENSORS and
                                 # gate_monitor() does the single .item() once per
                                 # pinball_monitor_gates_every. It used to call .item() per

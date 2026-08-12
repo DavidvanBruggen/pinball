@@ -432,6 +432,9 @@ class HierarchicalMessagePassing(MessagePassing):
         # queries (LSE merge of the two calls) instead of adding the two attention outputs;
         # see _apply_local_pack_out. False = additive combine (previous behavior).
         local_pack_lane_merge: bool = False,
+        local_pack_coarse_global: bool = False,
+        hqd_keep_stage_survivors: bool = False,
+        local_pack_coarse_global_gate_init: float = 0.0,
         # ONE flex_attention call with the block-sparse union mask (see model spec builder).
         local_pack_flex_union: bool = False,
         # Bidirectional pack (MaskGIT/diffusion): when the runtime causal flags are OFF,
@@ -538,6 +541,16 @@ class HierarchicalMessagePassing(MessagePassing):
         # the output carry its source level). Zero init = bit-identical to untagged at start.
         self.local_pack_level_bias = bool(local_pack_level_bias)
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
+        self.hqd_keep_stage_survivors = bool(hqd_keep_stage_survivors)
+        self.local_pack_coarse_global = bool(local_pack_coarse_global)
+        if self.local_pack_coarse_global:
+            # Raw scalar, NOT a sigmoid: init 0.0 must be EXACT identity so a warm start
+            # is bit-identical to the flag being off. Grafting this term ungated onto
+            # trained weights collapsed |near| by 1128x (bench_erf, 2026-08-12) -- the
+            # same failure as the ungated HQD read. A gate the model opens itself is the
+            # only way it can be introduced to weights that did not train with it.
+            self.coarse_global_gate = nn.Parameter(
+                torch.full((), float(local_pack_coarse_global_gate_init)))
         self.local_pack_flex_union = bool(local_pack_flex_union)
         self.local_pack_bidirectional = bool(local_pack_bidirectional)
         self.local_pack_rope_axial = bool(local_pack_rope_axial)
@@ -842,9 +855,13 @@ class HierarchicalMessagePassing(MessagePassing):
             "hqd": torch.sigmoid(self.hqd_source_gate_logit).to(device=ref.device, dtype=ref.dtype),
         }
         if bool(getattr(self, "attention_source_gate_debug", False)):
+            # Store DETACHED 0-dim TENSORS, never floats. float(x.item()) is a GPU sync,
+            # and under hier_layer_compile it is a torch.compile graph break on every
+            # layer of every step -- paid unconditionally, in the hot path, for a number
+            # nobody reads until the monitor interval. Same rule as _last_hqd_mean_dist:
+            # keep it on-device and let gate_monitor() do the single .item() it needs.
             self._last_attention_source_gates = {
-                name: float(value.detach().float().item())
-                for name, value in gates.items()
+                name: value.detach() for name, value in gates.items()
             }
         return gates
 
@@ -2342,6 +2359,21 @@ class HierarchicalMessagePassing(MessagePassing):
         q_hqd, k_hqd = q, k
         if bool(getattr(self, "hqd_read_prerope", False)) and q_prerope is not None:
             q_hqd, k_hqd = q_prerope, k_prerope
+
+        # With hqd_keep_stage_survivors the fetched set spans L0..L3, and nothing else in
+        # the HQD read distinguishes a 16-token L1 summary from a raw L0 token -- the
+        # packed path's level tags are added to kp/vp inside _apply_local_pack_out and
+        # never reach here. Reuse the SAME embeddings so "which level is this" means the
+        # same thing on both paths. Parameter-free; no-op when the fetch is L0-only.
+        if (
+            bool(getattr(self, "hqd_keep_stage_survivors", False))
+            and bool(getattr(self, "local_pack_level_bias", False))
+            and node_level is not None
+            and int(node_level.numel()) == int(num_nodes)
+        ):
+            _nl = node_level.to(device=k_hqd.device, dtype=torch.long).clamp(0, 3)
+            k_hqd = k_hqd + self.local_pack_level_k_emb.index_select(0, _nl).unsqueeze(0).to(k_hqd.dtype)
+            v_hqd = v_hqd + self.local_pack_level_v_emb.index_select(0, _nl).unsqueeze(0).to(v_hqd.dtype)
 
         if hqd_edges is not None:
             hqd_b_idx, hqd_src_idx, hqd_dst_idx = hqd_edges
@@ -3889,6 +3921,57 @@ class HierarchicalMessagePassing(MessagePassing):
                 if source_gates is not None:
                     lane_contrib = source_gates["local"] * lane_contrib
                 out.index_add_(1, spec["lane_query_nodes"], lane_contrib.to(dtype=out.dtype))
+
+        # L0 -> ALL COARSE (local_pack_coarse_global). The coarse lane above restores wide
+        # LATERAL reach, but its QUERY set is coarse-only -- lane_q_levels drops level 0 and
+        # the flex-union mask spells the same thing out as "both-coarse". So an L0 query
+        # still sees only the coarse rows inside its own mixed window, which (because coarse
+        # rows are ordered by position too) summarise the span that window already covers:
+        # at window 156 over a 1248-row pack, ~4 of 32 L3 nodes, ~22% of the image.
+        #
+        # This term closes exactly that gap: every L0 query reads the WHOLE coarse bank in
+        # one dense cross-attention. Cheap, because the bank is the small side of the
+        # hierarchy (224 rows against 1024 tokens here) and the cost is O(n_l0 * n_coarse)
+        # regardless of window.
+        #
+        # Deliberately ADDITIVE, matching the lane: a separate softmax summed in, not an
+        # LSE merge. The merge path double-counts keys present in both windows (a +ln2 bias)
+        # and measured WORSE than additive late in training on text. Additive also makes the
+        # overlap a non-issue: the ~28 coarse rows an L0 query already saw in its mixed
+        # window are re-read here, which is duplicated FLOPs, not double-counted weight.
+        # That duplication is bounded by the coarse bank being small and is not worth a
+        # dedup mask.
+        #
+        # Reuses the mixed packing's already-RoPE'd, already level-tagged qp/kp/vp, so it
+        # costs no extra projection or position bookkeeping. It is NOT free to graft: added
+        # ungated to trained weights it collapsed |near| 1128x (7.21e-01 -> 6.39e-04) and
+        # far/near "rose" to 0.215 purely from that denominator -- the same artifact as the
+        # RoPE'd HQD read. Hence coarse_global_gate, raw scalar, init 0.0 = exact identity.
+        if bool(getattr(self, "local_pack_coarse_global", False)) and lvl_packed is not None:
+            l0_rows = (lvl_packed == 0).nonzero(as_tuple=False).view(-1)
+            cs_rows = (lvl_packed > 0).nonzero(as_tuple=False).view(-1)
+            if l0_rows.numel() > 0 and cs_rows.numel() > 0:
+                q_g = qp.index_select(1, l0_rows).permute(0, 2, 1, 3)
+                k_g = kp.index_select(1, cs_rows).permute(0, 2, 1, 3)
+                v_g = vp.index_select(1, cs_rows).permute(0, 2, 1, 3)
+                bias = None
+                if pack_causal:
+                    # Packed rows are in ar_time close order, so "key row <= query row" is
+                    # the same causality the windowed path enforces by construction.
+                    bias = (cs_rows.view(1, -1) <= l0_rows.view(-1, 1)).view(
+                        1, 1, int(l0_rows.numel()), int(cs_rows.numel()))
+                out_g = F.scaled_dot_product_attention(
+                    q_g, k_g, v_g, attn_mask=bias,
+                    dropout_p=float(self.dropout.p) if self.training else 0.0,
+                )
+                # An early causal query can have NO visible coarse row -> all-masked softmax
+                # -> NaN. Those rows contribute nothing in the windowed path; match that.
+                out_g = torch.nan_to_num(out_g, nan=0.0)
+                out_g = out_g.permute(0, 2, 1, 3).reshape(B, int(l0_rows.numel()), -1)
+                contrib_g = self.out_proj(out_g) * self.coarse_global_gate.to(out_g.dtype)
+                if source_gates is not None:
+                    contrib_g = source_gates["local"] * contrib_g
+                out.index_add_(1, perm.index_select(0, l0_rows), contrib_g.to(dtype=out.dtype))
         return query_levels
 
     def _compute_level_local_out_batched(
@@ -4478,6 +4561,9 @@ class HierarchicalTransformerLayer(nn.Module):
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
         local_pack_lane_merge: bool = False,  # LSE-merge the mixed window + coarse lane (unified softmax)
+        local_pack_coarse_global: bool = False,  # every L0 query also reads the WHOLE coarse bank
+        hqd_keep_stage_survivors: bool = False,  # HQD fetch is mixed-level -> tag k/v by level
+        local_pack_coarse_global_gate_init: float = 0.0,  # 0.0 = exact identity (warm-start safe)
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
         local_pack_bidirectional: bool = False,  # bidi (MaskGIT/diffusion): two-sided packed windows
         local_pack_rope_axial: bool = False,  # axial ND RoPE on the packed path (curve-mode coords)
@@ -4563,6 +4649,9 @@ class HierarchicalTransformerLayer(nn.Module):
             local_attn_head_dim=local_attn_head_dim,
             local_pack_level_bias=local_pack_level_bias,
             local_pack_lane_merge=local_pack_lane_merge,
+            local_pack_coarse_global=local_pack_coarse_global,
+            hqd_keep_stage_survivors=hqd_keep_stage_survivors,
+            local_pack_coarse_global_gate_init=local_pack_coarse_global_gate_init,
             local_pack_flex_union=local_pack_flex_union,
             local_pack_bidirectional=local_pack_bidirectional,
             local_pack_rope_axial=local_pack_rope_axial,

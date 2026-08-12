@@ -125,7 +125,11 @@ def measure(cfg_path, override, ckpt, probes, iters, device):
         # far/near is a RATIO, so it also rises when the near field shrinks. Keep the
         # unnormalised magnitudes so a denominator collapse can't be read as reach.
         # Only comparable between arms sharing weights and input (e.g. one flag flipped).
-        per_probe_abs.append((base, infl[d > 8].mean().item()))
+        # |all| = mean influence over EVERY input token: the total gradient "budget".
+        # Without it you cannot tell REDISTRIBUTION (far gains at near's expense, budget
+        # flat -- what LayerNorm's renormalisation would produce on its own) from a real
+        # INCREASE in long-range signal. Only comparable within one run's lineage.
+        per_probe_abs.append((base, infl[d > 8].mean().item(), infl.mean().item()))
         row = []
         for lo, hi in BANDS:
             m = (d >= lo) & (d <= hi)
@@ -140,8 +144,9 @@ def measure(cfg_path, override, ckpt, probes, iters, device):
 
     bands = [_nanmean([r[i] for r in per_probe_bands]) for i in range(len(BANDS))]
     far = _nanmean(per_probe_far)
-    near_abs = _nanmean([a for a, _ in per_probe_abs])
-    far_abs = _nanmean([f for _, f in per_probe_abs])
+    near_abs = _nanmean([a for a, _, _ in per_probe_abs])
+    far_abs = _nanmean([f for _, f, _ in per_probe_abs])
+    all_abs = _nanmean([t for _, _, t in per_probe_abs])
 
     # --- step cost (fwd + bwd, same shape) ---
     model.train()
@@ -171,7 +176,7 @@ def measure(cfg_path, override, ckpt, probes, iters, device):
     n_par = sum(p.numel() for p in model.parameters())
     del model, x, opt
     torch.cuda.empty_cache()
-    return bands, far, ms, n_par, near_abs, far_abs
+    return bands, far, ms, n_par, near_abs, far_abs, all_abs
 
 
 def main():
@@ -200,17 +205,17 @@ def main():
     # through torch._dynamo's recompile limit, after which frames silently fall back
     # to eager and every later arm's timing is wrong.
     if a.single is not None:
-        bands, far, ms, n_par, near_abs, far_abs = measure(
+        bands, far, ms, n_par, near_abs, far_abs, all_abs = measure(
             a.config, json.loads(a.single), a.ckpt, probes, a.iters, torch.device(a.device))
         print("__RESULT__" + json.dumps({"bands": bands, "far": far, "ms": ms, "params": n_par,
-                                         "near_abs": near_abs, "far_abs": far_abs}))
+                                         "near_abs": near_abs, "far_abs": far_abs, "all_abs": all_abs}))
         return
 
     import subprocess
     arms = json.loads(a.arms) if a.arms else DEFAULT_ARMS
     hdr = " ".join(f"{lo}-{hi:<3}" for lo, hi in BANDS)
     print(f"\nconfig={a.config}  probes={probes}  ckpt={a.ckpt or 'init weights'}")
-    print(f"{'arm':26} {hdr}  far/near  |near|    |far|    ms/step   params")
+    print(f"{'arm':26} {hdr}  far/near  |near|    |far|    |all|    ms/step   params")
     base_ms = None
     for name, ov in arms.items():
         cmd = [sys.executable, __file__, "--config", a.config, "--device", a.device,
@@ -225,7 +230,7 @@ def main():
         r = json.loads(line[len("__RESULT__"):])
         base_ms = r["ms"] if base_ms is None else base_ms
         print(f"{name:26} " + " ".join(f"{b:5.3f}" for b in r["bands"])
-              + f"  {r['far']:8.3f}  {r['near_abs']:.2e} {r['far_abs']:.2e}"
+              + f"  {r['far']:8.3f}  {r['near_abs']:.2e} {r['far_abs']:.2e} {r['all_abs']:.2e}"
               + f"  {r['ms']:7.1f} ({r['ms'] / base_ms - 1:+6.1%})  {r['params'] / 1e6:7.2f}M")
 
 

@@ -7775,24 +7775,32 @@ class EnhancedHierarchicalTrainer:
         if is_best:
             logger.info("This is a best ema model checkpoint")
     
-    def load_ema_checkpoint(self, path):
-        """
-        Load a checkpoint.
-        
-        Args:
-            path: Path to the checkpoint
+    def load_ema_checkpoint(self, path, strict: bool = True):
+        """Load the EMA shadow weights from a companion checkpoint.
+
+        WEIGHTS ONLY. This deliberately does NOT touch current_epoch / global_step /
+        train_losses / val_losses: the caller derives those from the MAIN checkpoint
+        (and increments the epoch, since the stamp is the last COMPLETED epoch), and
+        this used to overwrite them with the companion's raw stamp afterwards --
+        silently re-running one already-finished epoch on every resume.
+
+        strict=False is what makes a warm start across an architecture change work:
+        params the old EMA file has never seen (source gates, the read sink) keep the
+        constructor init already in the freshly-built ema_model, which is exactly the
+        near-identity state the live model starts from.
         """
         checkpoint = torch.load(path, map_location=self.device)
-        
-        # Load model weights
-        self.ema_model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Load training state
-        self.current_epoch = checkpoint.get('current_epoch', 0)
-        self.global_step = checkpoint.get('global_step', 0)
-        self.train_losses = checkpoint.get('train_losses', [])
-        self.val_losses = checkpoint.get('val_losses', [])
-        
-        logger.info(f"Loaded checkpoint from {path}, current epoch: {self.current_epoch}")
-        
+
+        missing, unexpected = self.ema_model.load_state_dict(
+            checkpoint['model_state_dict'], strict=bool(strict))
+        if missing:
+            logger.warning("EMA checkpoint missing %d key(s); keeping freshly-initialised "
+                           "values for them: %s%s", len(missing), ", ".join(missing[:6]),
+                           " ..." if len(missing) > 6 else "")
+        if unexpected:
+            logger.warning("EMA checkpoint has %d unexpected key(s) (ignored): %s%s",
+                           len(unexpected), ", ".join(unexpected[:6]),
+                           " ..." if len(unexpected) > 6 else "")
+
+        logger.info("Loaded EMA weights from %s", path)
         return checkpoint

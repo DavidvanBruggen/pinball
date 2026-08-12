@@ -418,7 +418,7 @@ def main(argv=None) -> None:
             root, ext = os.path.splitext(resume_path)
             ema_path = f"{root}_ema{ext}"
             if os.path.isfile(ema_path):
-                trainer.load_ema_checkpoint(ema_path)
+                trainer.load_ema_checkpoint(ema_path, strict=resume_strict)
                 logger.info("Resumed EMA weights from %s", ema_path)
             else:
                 trainer.ema_model.load_state_dict(trainer.model.state_dict())

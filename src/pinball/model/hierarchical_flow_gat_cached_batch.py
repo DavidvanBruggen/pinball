@@ -2418,6 +2418,8 @@ class HierarchicalFlowGAT(nn.Module):
         # windows (the ~most recent coarse rows) are counted twice (+ln2 logit bias).
         # False = additive combine (previous behavior, bit-identical).
         local_pack_lane_merge: bool = False,
+        local_pack_coarse_global: bool = False,
+        local_pack_coarse_global_gate_init: float = 0.0,
         # ONE flex_attention call with a block-sparse union mask replaces the mixed call +
         # lane + merge (exact-dedup unified softmax, no LSE recompute). Needs torch>=2.5,
         # all levels in query_levels, and the coarse lane on. Falls back to merge/additive
@@ -2692,6 +2694,7 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_query_chunk_size: int = 524288,
         hqd_query_level: int = 0,
         hqd_stop_level: int = 0,
+        hqd_keep_stage_survivors: bool = False,
         hqd_handoff_to_l0: bool = False,
         hqd_global_topk: int = 0,
         hqd_assume_disjoint_children: bool = False,
@@ -2809,6 +2812,8 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_coarse_lane = bool(local_pack_coarse_lane)
         self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
+        self.local_pack_coarse_global = bool(local_pack_coarse_global)
+        self.local_pack_coarse_global_gate_init = float(local_pack_coarse_global_gate_init)
         self.local_pack_flex_union = bool(local_pack_flex_union)
         self.local_pack_bidirectional = bool(local_pack_bidirectional)
         self.xq_nominate_read_prerope = bool(xq_nominate_read_prerope)
@@ -3301,6 +3306,13 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_query_chunk_size = max(1, int(hqd_query_chunk_size))
         self.hqd_query_level = max(0, min(2, int(hqd_query_level)))
         self.hqd_stop_level = max(0, min(2, int(hqd_stop_level)))
+        self.hqd_keep_stage_survivors = bool(hqd_keep_stage_survivors)
+        if self.hqd_keep_stage_survivors and not bool(getattr(self, "hqd_static_descent", False)):
+            # Only the static core accumulates survivors; the stage-by-stage reference
+            # descent rebuilds candidate sets per level and would silently ignore this.
+            logger.warning(
+                "hqd_keep_stage_survivors requires hqd_static_descent=True; "
+                "the reference descent ignores it and will read L0 only.")
         if self.hqd_stop_level > self.hqd_query_level:
             logger.warning("hqd_stop_level=%d > hqd_query_level=%d; clamping stop_level to query_level", self.hqd_stop_level, self.hqd_query_level)
             self.hqd_stop_level = self.hqd_query_level
@@ -3613,6 +3625,9 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
+                        local_pack_coarse_global=bool(getattr(self, "local_pack_coarse_global", False)),
+                        hqd_keep_stage_survivors=bool(getattr(self, "hqd_keep_stage_survivors", False)),
+                        local_pack_coarse_global_gate_init=float(getattr(self, "local_pack_coarse_global_gate_init", 0.0)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
                         local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
@@ -3699,6 +3714,9 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
+                        local_pack_coarse_global=bool(getattr(self, "local_pack_coarse_global", False)),
+                        hqd_keep_stage_survivors=bool(getattr(self, "hqd_keep_stage_survivors", False)),
+                        local_pack_coarse_global_gate_init=float(getattr(self, "local_pack_coarse_global_gate_init", 0.0)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
                         local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
@@ -6674,6 +6692,26 @@ class HierarchicalFlowGAT(nn.Module):
         _lf = getattr(self, "_last_hqd_local_frac", None)
         if _lf is not None:
             d["hqd.local_overlap"] = float(_lf)
+        # Attention source gates (attention_source_gating_enable + _debug): the layers
+        # stash 0-dim tensors, so this is the ONLY sync and it happens once per monitor
+        # interval. sigmoid(hqd) is the most direct "is the model choosing to use HQD"
+        # readout there is -- every pre-gate run had to infer it from ERF instead.
+        _sg: Dict[str, List[float]] = {}
+        for _blk in getattr(self, "refinement_transformers", []) or []:
+            _st = getattr(getattr(_blk, "message_passing", None), "_last_attention_source_gates", None)
+            if isinstance(_st, dict):
+                for _n, _v in _st.items():
+                    _sg.setdefault(_n, []).append(float(_v))
+        for _n, _vals in _sg.items():
+            if _vals:
+                d[f"srcgate.{_n}.mean"] = sum(_vals) / len(_vals)
+                d[f"srcgate.{_n}.max"] = max(_vals)
+                # min too: for a gate starting uniform, max-min IS the signal. A mean
+                # that falls while the spread widens is the mechanism SPECIALISING by
+                # depth (earning its place in some layers, correctly rejected in others);
+                # a mean that falls with the spread staying tight is plain rejection.
+                # Those two look identical in the mean alone.
+                d[f"srcgate.{_n}.min"] = min(_vals)
 
         # Cross-query refiners (downward L0/L1/L2<-L3 or any query<-memory) residual write scale.
         for r in getattr(self, "pinball_cross_query_refiners", []) or []:
@@ -9774,6 +9812,24 @@ class HierarchicalFlowGAT(nn.Module):
         sel = l3_idx.index_select(0, top_pos.reshape(-1)).view(b_sz, q_sz, k3)
         sel = torch.where(torch.isfinite(top_scores), sel, torch.full_like(sel, -1))
 
+        # hqd_keep_stage_survivors: the descent already scores and ranks a top-k at EVERY
+        # level and then throws all of it away except the final L0 set. Keeping the
+        # survivors costs nothing to produce and turns the read from "32 distant raw
+        # tokens" into a MIXED-LEVEL set: 4 L3 + 4 L2 + 4 L1 + 32 L0 = 44 rows whose
+        # combined span is ~672 L0-token-equivalents instead of 32, for +37% rows.
+        #
+        # Motivated by bench_pack_read.py: an L0 query spends ~42% of its packed-window
+        # mass on coarse rows in BOTH the windowed and full-window runs, but the
+        # full-window run (the one that composes) spends it on distant L1 (0.288) while
+        # the windowed one leans on L3 (0.092). It wants distant SUMMARIES, not only
+        # distant tokens -- and it still puts 0.58 on L0, so fetching L1 alone
+        # (hqd_stop_level: 1) would trade one starvation for another.
+        #
+        # Static-shape safe: every stage's top-k is a fixed [B,Q,k], so the cat is a
+        # fixed [B,Q,sum(k)] and the whole descent stays one compilable graph.
+        keep_survivors = bool(getattr(self, "hqd_keep_stage_survivors", False))
+        survivors: List[torch.Tensor] = [sel] if keep_survivors else []
+
         # Descent: expand -> score -> narrow, identical five ops per level.
         for table, topk, lvl in zip(tables, topks[1:], (2, 1, 0)):
             cand, cand_mask = self._hqd_expand_children_batched(sel, table)
@@ -9795,7 +9851,13 @@ class HierarchicalFlowGAT(nn.Module):
                 allow_same_time=allow_same_time,
             )
             sel, _, _ = self._hqd_topk_from_scores_batched(cand, scores, int(topk))
+            if keep_survivors:
+                survivors.append(sel)
 
+        if keep_survivors:
+            # Levels occupy disjoint node-id ranges, so the union needs no dedup: an L0
+            # survivor can never collide with its own L1 parent.
+            sel = torch.cat(survivors, dim=-1)
         return sel, sel >= 0
 
     def _hqd_dedup_sorted_candidates_batched(
