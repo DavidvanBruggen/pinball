@@ -20,8 +20,19 @@ WHAT IT DOES AND DOES NOT TELL YOU
   It measures whether a route EXISTS and carries signal through the architecture.
   It does NOT tell you the trained model will USE that route -- gates can and do
   close routes during training. Treat a flat ERF as necessary, not sufficient.
-  Absolute values are not meaningful (LayerNorm/residual diffuse gradients); only
-  compare arms measured in the same run.
+
+  ALWAYS READ |near| AND |far| BEFORE BELIEVING A far/near CHANGE. far/near is a
+  ratio, so it also rises when the NEAR field collapses -- which looks identical
+  to reach in the normalised band columns (they are all 1.000 at 0-2 by
+  construction). This is not hypothetical: on 2026-08-12 a config flip measured
+  0.062 -> 0.223 far/near and was shipped as "3.7x reach", when |far| had in fact
+  FALLEN 11% and |near| had collapsed 6.5x. The unnormalised columns exist to
+  make that visible. They are only comparable between arms sharing weights and
+  input (e.g. one flag flipped); across architectures or seeds they are not.
+
+  It also cannot tell precise long-range retrieval apart from uniform attention
+  over distant junk -- both raise far-field gradient, so a NOISIER mechanism
+  scores higher. Use bench_hqd_read.py (read entropy, paired) for that.
 
 USAGE
   python bench_erf.py --config configs/pinball_image_diffusion_latent.yaml
@@ -75,7 +86,11 @@ def measure(cfg_path, override, ckpt, probes, iters, device):
     override = dict(override)
     # An arm may point at a DIFFERENT config file (e.g. the transformer baseline)
     # via the reserved "__config" key, so unlike architectures land in one table.
+    # "__ckpt" likewise overrides --ckpt per arm, so several runs' trained weights
+    # can be compared side by side; "__ckpt": null forces INIT weights for that arm.
     cfg_path = override.pop("__config", cfg_path)
+    if "__ckpt" in override:
+        ckpt = override.pop("__ckpt")
     model, _, args, dev = build_pinball(
         cfg_path=cfg_path, device=device, override=override,
         set_global_seed=True, warn_unused_keys=False,
@@ -93,7 +108,7 @@ def measure(cfg_path, override, ckpt, probes, iters, device):
     # distances mispairs the data -- each probe has a different distance field.)
     model.eval()
     idx = torch.arange(n_tok)
-    per_probe_bands, per_probe_far = [], []
+    per_probe_bands, per_probe_far, per_probe_abs = [], [], []
     for (pr, pc) in probes:
         torch.manual_seed(1234)
         x = torch.randn(1, n_tok, feat, device=dev, requires_grad=True)
@@ -107,6 +122,10 @@ def measure(cfg_path, override, ckpt, probes, iters, device):
         base = infl[(d >= BANDS[0][0]) & (d <= BANDS[0][1])].mean().item()
         if not base:
             continue
+        # far/near is a RATIO, so it also rises when the near field shrinks. Keep the
+        # unnormalised magnitudes so a denominator collapse can't be read as reach.
+        # Only comparable between arms sharing weights and input (e.g. one flag flipped).
+        per_probe_abs.append((base, infl[d > 8].mean().item()))
         row = []
         for lo, hi in BANDS:
             m = (d >= lo) & (d <= hi)
@@ -121,6 +140,8 @@ def measure(cfg_path, override, ckpt, probes, iters, device):
 
     bands = [_nanmean([r[i] for r in per_probe_bands]) for i in range(len(BANDS))]
     far = _nanmean(per_probe_far)
+    near_abs = _nanmean([a for a, _ in per_probe_abs])
+    far_abs = _nanmean([f for _, f in per_probe_abs])
 
     # --- step cost (fwd + bwd, same shape) ---
     model.train()
@@ -150,7 +171,7 @@ def measure(cfg_path, override, ckpt, probes, iters, device):
     n_par = sum(p.numel() for p in model.parameters())
     del model, x, opt
     torch.cuda.empty_cache()
-    return bands, far, ms, n_par
+    return bands, far, ms, n_par, near_abs, far_abs
 
 
 def main():
@@ -160,7 +181,16 @@ def main():
     p.add_argument("--ckpt", default=None, help="optional checkpoint to load (strict=False)")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--iters", type=int, default=15)
-    p.add_argument("--probes", default="16,16;8,20;24,10", help='"r,c;r,c" probe token positions')
+    # 12 probes, not 3. far/near is a mean of PER-PROBE ratios, and with 3 probes one
+    # anomalous probe swings it badly: the same forkB checkpoint measured 0.099 on 3
+    # probes and 0.061 on 12, and pinball-full went 0.273 -> 0.228. Absolute |near|
+    # varies even more across probes (same ckpt, 1.10e-01 vs 7.22e-01), which is why
+    # |near|/|far| are only a within-checkpoint flag-flip check and NOT a substitute
+    # estimator. Probes avoid the extreme corners; note the centre probe (16,16) can
+    # only reach distance 16, so band 17-24 draws on the off-centre probes only.
+    p.add_argument("--probes",
+                   default="16,16;8,20;24,10;5,5;26,26;5,26;26,5;16,5;5,16;26,16;16,26;11,21",
+                   help='"r,c;r,c" probe token positions')
     p.add_argument("--single", default=None, help=argparse.SUPPRESS)  # internal: one arm, JSON out
     a = p.parse_args()
 
@@ -170,16 +200,17 @@ def main():
     # through torch._dynamo's recompile limit, after which frames silently fall back
     # to eager and every later arm's timing is wrong.
     if a.single is not None:
-        bands, far, ms, n_par = measure(
+        bands, far, ms, n_par, near_abs, far_abs = measure(
             a.config, json.loads(a.single), a.ckpt, probes, a.iters, torch.device(a.device))
-        print("__RESULT__" + json.dumps({"bands": bands, "far": far, "ms": ms, "params": n_par}))
+        print("__RESULT__" + json.dumps({"bands": bands, "far": far, "ms": ms, "params": n_par,
+                                         "near_abs": near_abs, "far_abs": far_abs}))
         return
 
     import subprocess
     arms = json.loads(a.arms) if a.arms else DEFAULT_ARMS
     hdr = " ".join(f"{lo}-{hi:<3}" for lo, hi in BANDS)
     print(f"\nconfig={a.config}  probes={probes}  ckpt={a.ckpt or 'init weights'}")
-    print(f"{'arm':26} {hdr}  far/near   ms/step   params")
+    print(f"{'arm':26} {hdr}  far/near  |near|    |far|    ms/step   params")
     base_ms = None
     for name, ov in arms.items():
         cmd = [sys.executable, __file__, "--config", a.config, "--device", a.device,
@@ -194,7 +225,8 @@ def main():
         r = json.loads(line[len("__RESULT__"):])
         base_ms = r["ms"] if base_ms is None else base_ms
         print(f"{name:26} " + " ".join(f"{b:5.3f}" for b in r["bands"])
-              + f"  {r['far']:8.3f}  {r['ms']:7.1f} ({r['ms'] / base_ms - 1:+6.1%})  {r['params'] / 1e6:7.2f}M")
+              + f"  {r['far']:8.3f}  {r['near_abs']:.2e} {r['far_abs']:.2e}"
+              + f"  {r['ms']:7.1f} ({r['ms'] / base_ms - 1:+6.1%})  {r['params'] / 1e6:7.2f}M")
 
 
 if __name__ == "__main__":

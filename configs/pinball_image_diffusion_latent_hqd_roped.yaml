@@ -44,7 +44,7 @@ save_every: 0
 save_last_every_epochs: 1
 save_milestone_every_epochs: 10
 keep_last_milestones: 3
-checkpoint_dir: ./pinball/image_diffusion_latent_156window_hqd/checkpoints
+checkpoint_dir: ./pinball/image_diffusion_latent_156window_hqd_roped/checkpoints
 
 # --- Graph / hierarchy: identical recipe to the RGB / discrete MaskGIT configs -------------
 ar_graph_causal: false          # BIDI: diffusion sees the whole (noisy) latent grid every step
@@ -93,43 +93,35 @@ hqd_tile_size: 256
 zip_max_children_per_parent: 16
 hqd_topk_l0: 32                 # NOT 64: topk_l0=64 measured 12x slower (+1643%) for
                                 # the same reach. Sharp cliff -- do not raise blindly.
-xq_nominate_read_prerope: true  # NOTE: the config key is xq_nominate_read_*, the
+xq_nominate_read_prerope: false # FORK B: RoPE the HQD read (fork A keeps it pre-RoPE).
+                                # NOTE: the config key is xq_nominate_read_*, the
                                 # module param is hqd_read_* -- hqd_read_prerope as a
                                 # config key is silently ignored.
                                 #
-                                # Read on CONTENT, not RoPE rotations far outside the
-                                # window those rotations were trained on.
+                                # This file exists so the two forks cannot share one
+                                # config: toggling this flag mid-run changes what every
+                                # HQD read matches on, which is not a resumable edit.
                                 #
-                                # Flipped to false on 2026-08-12 and REVERTED the same
-                                # day. The evidence for flipping was far/near 0.061 ->
-                                # 0.224 on this fork's step-335600 weights. That number
-                                # is an ARTIFACT: far/near is a ratio, and exposing the
-                                # unnormalised magnitudes showed the far field FELL
-                                # while the near field collapsed.
-                                #        far/near    |near|     |far|
-                                #   pre-RoPE  0.062  2.97e-01  1.70e-02
-                                #   RoPE'd    0.223  4.59e-02  1.52e-02   <- -11% far
-                                # Mechanism is NOT a flatter read -- bench_hqd_read.py
-                                # (paired, real val latents) shows the RoPE'd read stays
-                                # sharp: eff_k 0.98x, top-1 weight +10%, s_dist control
-                                # 1.00. RoPE'd q/k inject a component these weights were
-                                # never trained to receive, HQD is summed into the
-                                # residual stream UNGATED (attention_source_gating_enable
-                                # is off), and 16 LayerNorms renormalise around it,
-                                # suppressing every other path -- near field worst.
+                                # Grafting it onto fork A's pre-RoPE-trained weights
+                                # looked catastrophic -- |near| collapsed 6.5x, and the
+                                # far/near "3.7x gain" was only that collapsed
+                                # denominator. That shock is TRANSIENT. Measured after
+                                # 1600 steps of actual roped training (step 309200):
+                                #            far/near   |near|     |far|
+                                #   graft      0.223   4.59e-02  1.52e-02
+                                #   +1600 st   0.099   2.43e-01  1.42e-02   <- |near| back
+                                # and bench_hqd_read.py shows the read SHARPENING into
+                                # the rotated metric: vs the pre-RoPE alternative on the
+                                # same weights, eff_k 0.77x and top-1 weight 2.13x (on
+                                # fork A's weights the two were interchangeable, 0.98x).
+                                # The model is specialising for it. Whether that buys
+                                # absolute far-field influence is still open -- |far| has
+                                # not risen yet. That is what this fork is for.
                                 #
-                                # That graft shock turned out to be TRANSIENT: fork B
-                                # (pinball_image_diffusion_latent_hqd_roped.yaml) trained
-                                # RoPE'd reads for 1600 steps and |near| came back to
-                                # 2.43e-01 while its read SHARPENED into the rotated
-                                # metric. So this file is not "the correct setting" --
-                                # it is the pre-RoPE ARM of a two-fork A/B, and fork B
-                                # is the one still deciding it.
-                                #
-                                # Whatever is tried: do NOT put RoPE in the DESCENT.
-                                # RoPE'd dots decay with distance, so a RoPE'd selector
-                                # goes distance-biased and would collapse hqd.mean_dist
-                                # (~400 = 5x the 78-token window half) toward local.
+                                # Do NOT put RoPE in the DESCENT. RoPE'd dots decay with
+                                # distance, so a RoPE'd selector goes distance-biased and
+                                # would collapse hqd.mean_dist (~400 = 5x the 78-token
+                                # window half) toward the local window.
 # The sink ADDS a parameter per layer, which changes the optimizer's param-group
 # sizes -> 270k steps of Muon/AdamW moments cannot load and restart fresh. That is a
 # bigger perturbation than HQD itself. Left off for a resumed fork; enable it (with
