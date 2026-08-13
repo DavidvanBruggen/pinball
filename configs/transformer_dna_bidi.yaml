@@ -1,0 +1,39 @@
+# DNA backbone -- TRANSFORMER control. Loaded exactly like the pinball arms:
+#   build_pinball(cfg_path=..., num_tracks=<dim>, tie_weights=False)  ->  [B, L, dim]
+#
+# The counterpart of pinball_dna_bidi_{full,windowed,windowed_hqd,windowed_flexhier}.yaml.
+# The host harness owns the loop, data, optimizer and batching, so swapping this file for a
+# pinball one changes the sequence model and nothing else.
+#
+# Matched to the pinball arms: block_size, hidden_dim, num_heads, dropout, norm, direction,
+# gradient checkpointing, compile, no conditioning, features in / features out.
+#
+# Positions: 1D RoPE. The pinball arms use plain 1D positions too on DNA (spatial_curve:
+# none, local_pack_rope_axial: false), so receptive-field comparisons against this control
+# are not confounded by the positional prior the way they are on 2D image runs.
+model_type: transformer
+block_size: 1024
+tokenizer_name: gpt2            # unused in features mode; build_pinball stubs it
+
+hidden_dim: 1024
+num_heads: 16
+transformer_n_layer: 15         # param-matched to the pinball arms (~192M), not shape-
+                                # matched: depth 12 would equal num_refinement_layers but
+                                # leaves the control ~18% short on capacity. Set 12 for the
+                                # shape-matched reading instead, and say which you used.
+transformer_ffn_type: swiglu
+transformer_use_rope: true
+transformer_attn_backend: auto  # auto | flash | sdpa
+transformer_compile: true
+
+# Bidirectional: coverage reads the whole window, nothing to leak.
+transformer_causal: false
+ar_graph_causal: false
+
+# transformer_block_cond_film is deliberately absent, mirroring the pinball arms omitting
+# refine_cond_mode: the harness calls the model bare, so FiLM would have no conditioning
+# vector to read and would add parameters to this arm alone.
+
+dropout: 0.0
+norm_type: layernorm
+use_gradient_checkpointing: true

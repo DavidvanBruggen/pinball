@@ -22,7 +22,7 @@ from transformers import PreTrainedTokenizerBase
 import math
 import time
 import logging
-from typing import Optional, Dict, List, Tuple, Union, Any
+from typing import Optional, Dict, List, Tuple, Union, Any, Sequence
 
 from .layers.positional_encoding import RotaryPositionalEncoding, LagrangianPositionalEncoding
 from .layers.normalization import RMSNorm, make_norm
@@ -2419,6 +2419,11 @@ class HierarchicalFlowGAT(nn.Module):
         # False = additive combine (previous behavior, bit-identical).
         local_pack_lane_merge: bool = False,
         local_pack_coarse_global: bool = False,
+        local_pack_l0_coarse_bands: bool = False,
+        local_pack_l0_window: int = 0,
+        local_pack_l0_coarse_windows: Optional[List[int]] = None,
+        local_pack_l0_bands_checkpoint: bool = False,
+        local_pack_l0_coarse_rank_window: int = 0,
         local_pack_coarse_global_gate_init: float = 0.0,
         # ONE flex_attention call with a block-sparse union mask replaces the mixed call +
         # lane + merge (exact-dedup unified softmax, no LSE recompute). Needs torch>=2.5,
@@ -2426,6 +2431,10 @@ class HierarchicalFlowGAT(nn.Module):
         # on any failure. NOTE: flex has no attention-prob dropout (residual/FFN dropout
         # unaffected).
         local_pack_flex_union: bool = False,
+        # DropNode on the hierarchy: zero a coarse row's VALUE in the packed K/V set per
+        # (batch, row, step). L0 never dropped; residual stream and refresh paths untouched.
+        hier_node_dropout: float = 0.0,
+        hier_node_dropout_per_level: Optional[Sequence[float]] = None,
         # Bidi pack (MaskGIT/diffusion): when the runtime causal flags are off, run the packed
         # windows two-sided instead of skipping pack. flex_union/lane_merge -> additive in bidi.
         local_pack_bidirectional: bool = False,
@@ -2813,8 +2822,16 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.local_pack_coarse_global = bool(local_pack_coarse_global)
+        self.local_pack_l0_coarse_bands = bool(local_pack_l0_coarse_bands)
+        self.local_pack_l0_window = int(local_pack_l0_window or 0)
+        self.local_pack_l0_bands_checkpoint = bool(local_pack_l0_bands_checkpoint)
+        self.local_pack_l0_coarse_rank_window = int(local_pack_l0_coarse_rank_window or 0)
+        self.local_pack_l0_coarse_windows = list(local_pack_l0_coarse_windows or [])
         self.local_pack_coarse_global_gate_init = float(local_pack_coarse_global_gate_init)
         self.local_pack_flex_union = bool(local_pack_flex_union)
+        self.hier_node_dropout = float(hier_node_dropout)
+        self.hier_node_dropout_per_level = (
+            list(hier_node_dropout_per_level) if hier_node_dropout_per_level is not None else None)
         self.local_pack_bidirectional = bool(local_pack_bidirectional)
         self.xq_nominate_read_prerope = bool(xq_nominate_read_prerope)
         self.xq_nominate_read_sink = bool(xq_nominate_read_sink)
@@ -3307,7 +3324,10 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_query_level = max(0, min(2, int(hqd_query_level)))
         self.hqd_stop_level = max(0, min(2, int(hqd_stop_level)))
         self.hqd_keep_stage_survivors = bool(hqd_keep_stage_survivors)
-        if self.hqd_keep_stage_survivors and not bool(getattr(self, "hqd_static_descent", False)):
+        # Read the PARAMETER, not self: self.hqd_static_descent is not assigned until ~15
+        # lines below, so a getattr here always fell through to False and warned that the
+        # descent "will read L0 only" on every config that enabled survivors.
+        if self.hqd_keep_stage_survivors and not bool(hqd_static_descent):
             # Only the static core accumulates survivors; the stage-by-stage reference
             # descent rebuilds candidate sets per level and would silently ignore this.
             logger.warning(
@@ -3626,9 +3646,16 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_coarse_global=bool(getattr(self, "local_pack_coarse_global", False)),
+                        local_pack_l0_coarse_bands=bool(getattr(self, "local_pack_l0_coarse_bands", False)),
+                        local_pack_l0_window=int(getattr(self, "local_pack_l0_window", 0)),
+                        local_pack_l0_coarse_windows=list(getattr(self, "local_pack_l0_coarse_windows", []) or []),
+                        local_pack_l0_bands_checkpoint=bool(getattr(self, "local_pack_l0_bands_checkpoint", False)),
+                        local_pack_l0_coarse_rank_window=int(getattr(self, "local_pack_l0_coarse_rank_window", 0)),
                         hqd_keep_stage_survivors=bool(getattr(self, "hqd_keep_stage_survivors", False)),
                         local_pack_coarse_global_gate_init=float(getattr(self, "local_pack_coarse_global_gate_init", 0.0)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
+                        hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
+                        hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
                         local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
                         local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
@@ -3715,9 +3742,16 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_coarse_global=bool(getattr(self, "local_pack_coarse_global", False)),
+                        local_pack_l0_coarse_bands=bool(getattr(self, "local_pack_l0_coarse_bands", False)),
+                        local_pack_l0_window=int(getattr(self, "local_pack_l0_window", 0)),
+                        local_pack_l0_coarse_windows=list(getattr(self, "local_pack_l0_coarse_windows", []) or []),
+                        local_pack_l0_bands_checkpoint=bool(getattr(self, "local_pack_l0_bands_checkpoint", False)),
+                        local_pack_l0_coarse_rank_window=int(getattr(self, "local_pack_l0_coarse_rank_window", 0)),
                         hqd_keep_stage_survivors=bool(getattr(self, "hqd_keep_stage_survivors", False)),
                         local_pack_coarse_global_gate_init=float(getattr(self, "local_pack_coarse_global_gate_init", 0.0)),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
+                        hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
+                        hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
                         local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
                         local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
@@ -5573,6 +5607,15 @@ class HierarchicalFlowGAT(nn.Module):
             "perm": perm,
             "pos": pos,
             "levels": lvl_packed.clamp(0, 3).contiguous(),  # per packed row, for the K/V level tags
+            # Packed ROW indices per level, precomputed once per skeleton. Consumers must
+            # use these rather than calling (levels == L).nonzero() in the layer loop:
+            # nonzero() has a data-dependent output shape, so it forces a torch.compile
+            # graph break, and it would re-derive a constant on every layer of every step.
+            # Same reason lane_perm is built here instead of in _apply_local_pack_out.
+            "level_rows": [
+                (lvl_packed == L).nonzero(as_tuple=False).view(-1).contiguous()
+                for L in range(4)
+            ],
             "query_sel": sel,
             "query_nodes": perm.index_select(0, sel),
             "query_levels": q_levels,
@@ -5605,6 +5648,10 @@ class HierarchicalFlowGAT(nn.Module):
                 lane_sel = torch.nonzero(lane_sel_mask, as_tuple=False).view(-1)
                 lane_perm = perm.index_select(0, lane_rows).contiguous()
                 spec["lane_perm"] = lane_perm
+                # Lane row -> packed row. Needed so hier_node_dropout can drop the SAME
+                # node in the lane as in the mixed window; precomputed here for the same
+                # reason as level_rows (nonzero() in the layer loop breaks the graph).
+                spec["lane_rows"] = lane_rows.contiguous()
                 spec["lane_pos"] = pos.index_select(0, lane_rows).contiguous()
                 if "pos_nd" in spec:
                     spec["lane_pos_nd"] = spec["pos_nd"].index_select(0, lane_rows).contiguous()
@@ -5639,6 +5686,21 @@ class HierarchicalFlowGAT(nn.Module):
                     spec["flex_is_coarse"] = ar_split < n_lane_rows
                     spec["flex_query_nodes"] = perm.index_select(0, flex_perm_local)
                     spec["flex_n_lane"] = n_lane_rows
+                    # COARSE RANK FOR *EVERY* ROW, not just coarse ones. flex_lane_rank
+                    # above is 0 for token rows, which is fine while the union's coarse
+                    # clause is gated on is_coarse[QUERY] -- but it makes the clause
+                    # unusable for L0 queries. This is the count of coarse rows at or
+                    # before each row in MIXED order, so an L0 query gets the coarse rank
+                    # nearest its own position and a radius in coarse-rank space means
+                    # the same thing for every query level. Coarse rows are sparse in
+                    # position (~1 per 5.6 packed slots here), so R coarse ranks span
+                    # ~5.6*R packed slots -- that is the whole point: reach per key is
+                    # far cheaper on coarse rows than on tokens.
+                    crank_mixed = (lvl_packed > 0).to(torch.long).cumsum(0) - 1
+                    spec["flex_crank"] = crank_mixed.clamp_min(0).index_select(
+                        0, flex_perm_local).contiguous()
+                    spec["flex_levels"] = lvl_packed.clamp(0, 3).index_select(
+                        0, flex_perm_local).contiguous()
         self._local_pack_spec_cache = (key, spec)
         return spec
 

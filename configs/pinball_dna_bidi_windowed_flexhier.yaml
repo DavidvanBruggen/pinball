@@ -69,7 +69,13 @@ local_pack_level_bias: true
 local_pack_coarse_lane: true
 local_pack_coarse_window: 896   # +-W in COARSE slots; >= the coarse row count makes the
                                 # lane all-to-all (224 rows at 1024, 896 at 4096)
-local_pack_flex_union: false    # see the flexhier arm
+# One flex_attention call whose block-sparse mask is "within local_pack_window mixed slots
+# OR both-coarse within local_pack_l0_coarse_rank_window coarse slots" -- an exact set union
+# under a single softmax. The second clause is what defines this arm: an L0 query reads every
+# coarse row while its token reach stays at local_pack_window. flex_attention has no
+# dropout_p, so this path applies token-wise V dropout instead.
+local_pack_flex_union: true
+local_pack_l0_coarse_rank_window: 224   # = all coarse rows
 local_pack_lane_merge: false    # causal-only; inert in a bidi run
 
 # Source gating is on in every arm so the arms differ by mechanism, not parameter count.
@@ -91,7 +97,7 @@ use_edge_embedding: false
 learn_edge_from_attention: false
 lateral_edge_trace_enable: false
 
-# === ARM 2/4: WINDOWED ================================================================
-# Control for arms 3 and 4: differs from each by one mechanism line.
+# === ARM 4/4: WINDOWED + FLEXHIER =====================================================
+# Differs from the windowed control by the local_pack_flex_union block above alone.
 local_pack_window: 156
 use_hqd: false

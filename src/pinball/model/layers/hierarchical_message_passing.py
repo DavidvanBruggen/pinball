@@ -29,7 +29,7 @@ import math
 from .positional_encoding import RotaryPositionalEncoding
 from .normalization import make_norm
 from ...utils.amp import bf16_supported
-from typing import Optional, Dict, Any, Tuple, List, Callable
+from typing import Optional, Dict, Any, Tuple, List, Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,84 @@ def pick_attention_backend(device: Optional[torch.device] = None) -> Tuple[str, 
     cap_major, cap_minor = torch.cuda.get_device_capability(device_index)
     out = _pick_attention_backend_cached(device_index, int(cap_major), int(cap_minor))
     _BACKEND_RESOLVED[device_index] = out
+    return out
+
+
+def _flash_win_lse(flash_fn, q, k, v, window, causal, dropout_p=0.0):
+    """Sliding-window flash returning (out [B,S,H,D], lse [B,H,S])."""
+    ws = (int(window), 0) if causal else (int(window), int(window))
+    out, lse, _ = flash_fn(q, k, v, causal=bool(causal), window_size=ws,
+                           dropout_p=float(dropout_p), return_attn_probs=True)
+    return out, lse
+
+
+def _flash_band_lse(flash_fn, q, k, v, stride, w_blocks, causal, dropout_p=0.0):
+    """L0 queries x one coarse level, banded, on FLASH.
+
+    The constraint we want is |stride*m - p| <= W for query p and level node m --
+    a band of slope 1/stride. Flash only expresses slope 1. Folding the stride into
+    the BATCH dimension makes the query index a block index, and n_blocks == n_L by
+    construction, so the band becomes |block - node| <= W/stride, which is a native
+    sliding window. Nothing [n_q, n_k]-shaped is materialised, so it stays as sparse
+    as flash always is -- the dense-mask alternative is n_q*n_L, which at 131k tokens
+    is 4 GB per level per layer.
+
+    APPROXIMATION: the `stride` queries inside a block share one key window (half a
+    stride of slop), the same coarsening the hierarchy already applies by pooling
+    those tokens into one node. Verified against a dense reference by
+    bench_coarse_window.py (rel err ~3e-4 at fp16, flat in N).
+    """
+    B, N, H, D = q.shape
+    n_L = int(k.size(1))
+    if n_L <= 0 or stride <= 0 or N % stride != 0 or (N // stride) != n_L:
+        return None
+
+    # FULL-COVERAGE SHORTCUT. When the radius spans the level there is no band left to
+    # express, and plain cross-attention (which flash does natively with unequal
+    # seqlens) gives the identical result for free. Worth a special case because the
+    # fold below is EXPENSIVE: stride * n_L == N, so the replicated k and v are each
+    # exactly q-sized, and with the permuted copy of q that is 3 q-sized tensors per
+    # level held for backward -- ~19 GB at batch 64, 1024 tokens, 3 levels, 16 layers.
+    # The fold only earns its memory when the radius is a small fraction of the level.
+    if not causal and (2 * int(w_blocks) + 1) >= n_L:
+        out, lse, _ = flash_fn(q, k, v, causal=False, dropout_p=float(dropout_p),
+                               return_attn_probs=True)
+        return out, lse
+
+    nb = N // stride
+    qb = q.view(B, nb, stride, H, D).permute(0, 2, 1, 3, 4).reshape(B * stride, nb, H, D)
+    kb = k.unsqueeze(1).expand(B, stride, n_L, H, D).reshape(B * stride, n_L, H, D)
+    vb = v.unsqueeze(1).expand(B, stride, n_L, H, D).reshape(B * stride, n_L, H, D)
+    ws = (int(w_blocks), 0) if causal else (int(w_blocks), int(w_blocks))
+    out, lse, _ = flash_fn(qb.contiguous(), kb.contiguous(), vb.contiguous(),
+                           causal=bool(causal), window_size=ws,
+                           dropout_p=float(dropout_p), return_attn_probs=True)
+    out = out.view(B, stride, nb, H, D).permute(0, 2, 1, 3, 4).reshape(B, N, H, D)
+    lse = lse.view(B, stride, H, nb).permute(0, 2, 3, 1).reshape(B, H, N)
+    return out, lse
+
+
+def _lse_union(parts):
+    """ONE softmax over the union of DISJOINT key sets, from per-part (out, lse).
+
+    With Z = exp(lse), (sum_i Z_i * out_i) / (sum_i Z_i) is exactly the softmax over
+    the concatenated key list. Disjointness is required and is why the caller splits
+    L0-keys from coarse-keys rather than reusing the mixed window, whose coarse rows
+    inside +-W would be counted twice (the +ln2 bias that afflicts lane_merge).
+
+    ON DROPOUT: each part applies attention dropout inside its own flash call, so the
+    masks are independent per part rather than drawn once over the union. That is an
+    approximation of "one softmax then dropout", but an unbiased one -- and it is the
+    difference that matters, because flex_union has NO attention dropout at all and
+    that is the leading suspect for why it lost to the additive path late in training.
+    """
+    lses = torch.stack([p[1] for p in parts], 0)                       # [P,B,H,S]
+    w = (lses - lses.max(dim=0, keepdim=True).values).exp()
+    w = w / w.sum(dim=0, keepdim=True).clamp_min(1e-20)
+    out = None
+    for i, (o, _) in enumerate(parts):
+        term = o * w[i].permute(0, 2, 1).unsqueeze(-1).to(o.dtype)     # [B,H,S]->[B,S,H,1]
+        out = term if out is None else out + term
     return out
 
 
@@ -433,10 +511,22 @@ class HierarchicalMessagePassing(MessagePassing):
         # see _apply_local_pack_out. False = additive combine (previous behavior).
         local_pack_lane_merge: bool = False,
         local_pack_coarse_global: bool = False,
+        local_pack_l0_coarse_bands: bool = False,
+        local_pack_l0_window: int = 0,
+        local_pack_l0_coarse_windows: Optional[List[int]] = None,
+        local_pack_l0_bands_checkpoint: bool = False,
+        local_pack_l0_coarse_rank_window: int = 0,
         hqd_keep_stage_survivors: bool = False,
         local_pack_coarse_global_gate_init: float = 0.0,
         # ONE flex_attention call with the block-sparse union mask (see model spec builder).
         local_pack_flex_union: bool = False,
+        # DropNode on the hierarchy: per (batch, coarse row) each step, zero the row's VALUE
+        # in the packed key/value set so nothing can read its content this step. L0 is never
+        # dropped, and the residual stream is untouched -- the node still exists and the
+        # upward/downward refresh paths still see it, so this regularises what READS the
+        # hierarchy without starving what BUILDS it.
+        hier_node_dropout: float = 0.0,
+        hier_node_dropout_per_level: Optional[Sequence[float]] = None,
         # Bidirectional pack (MaskGIT/diffusion): when the runtime causal flags are OFF,
         # run the packed mixed window + coarse lane as symmetric two-sided windows instead
         # of skipping pack entirely. Bidi has no AR order to leak, so the "closed window"
@@ -543,6 +633,13 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.hqd_keep_stage_survivors = bool(hqd_keep_stage_survivors)
         self.local_pack_coarse_global = bool(local_pack_coarse_global)
+        self.local_pack_l0_coarse_bands = bool(local_pack_l0_coarse_bands)
+        self.local_pack_l0_window = int(local_pack_l0_window or 0)
+        self.local_pack_l0_bands_checkpoint = bool(local_pack_l0_bands_checkpoint)
+        self.local_pack_l0_coarse_rank_window = int(local_pack_l0_coarse_rank_window or 0)
+        self.local_pack_l0_coarse_windows = (
+            [int(x) for x in local_pack_l0_coarse_windows]
+            if local_pack_l0_coarse_windows else [])
         if self.local_pack_coarse_global:
             # Raw scalar, NOT a sigmoid: init 0.0 must be EXACT identity so a warm start
             # is bit-identical to the flag being off. Grafting this term ungated onto
@@ -552,6 +649,20 @@ class HierarchicalMessagePassing(MessagePassing):
             self.coarse_global_gate = nn.Parameter(
                 torch.full((), float(local_pack_coarse_global_gate_init)))
         self.local_pack_flex_union = bool(local_pack_flex_union)
+        # Per-level DropNode rates, always length 4 with L0 pinned to 0.0. A scalar rate
+        # applies to L1-L3 only; an explicit per-level list overrides it and its L0 entry
+        # is forced to 0 regardless of what the config says (dropping L0 would delete the
+        # token content itself, not the hierarchy's summary of it).
+        _nd = [0.0, 0.0, 0.0, 0.0]
+        _base = max(0.0, min(1.0, float(hier_node_dropout)))
+        if _base > 0.0:
+            _nd = [0.0, _base, _base, _base]
+        if hier_node_dropout_per_level is not None:
+            _pl = list(hier_node_dropout_per_level)
+            _nd = [0.0 if i == 0 else max(0.0, min(1.0, float(_pl[i])))
+                   if i < len(_pl) else 0.0 for i in range(4)]
+        self.hier_node_dropout_rates = _nd
+        self.hier_node_dropout_active = any(r > 0.0 for r in _nd)
         self.local_pack_bidirectional = bool(local_pack_bidirectional)
         self.local_pack_rope_axial = bool(local_pack_rope_axial)
         if self.local_pack_level_bias:
@@ -3649,8 +3760,47 @@ class HierarchicalMessagePassing(MessagePassing):
                 pieces.append(chunk_fn(q_sel[:, c0:c1], ks, pos_v, col, w, scale))
         return torch.cat(pieces, dim=1)
 
+    def _hier_node_keep(self, B, lvl_packed, device, dtype):
+        """DropNode on the hierarchy: per (batch, packed row) keep multiplier for VALUES.
+
+        Returns [B, N, 1, 1] broadcastable over (heads, head_dim), or None when inactive
+        or in eval -- None keeps the tensor out of the graph entirely rather than
+        multiplying by ones.
+
+        WHY VALUES AND NOT KEYS. Masking the key would be the cleaner "node is absent"
+        semantics (mass redistributes over survivors), but an additive key mask sets
+        force_sdpa=True in _compute_local_attn_from_qkv, which drops the packed attention
+        off flash -- the memory profile the windowed arms exist to protect. Zeroing the
+        KEY instead is not a substitute and is actively wrong: q.0 = 0 is a mid-range
+        logit, not -inf, so against typically-negative logits a zeroed key would attract
+        MORE mass than it started with and dropped nodes would get louder.
+
+        So the dropped row keeps its key and loses its content. It still absorbs softmax
+        mass; the coarse pathway attenuates instead of redistributing. That is the same
+        semantics as ordinary post-softmax attention dropout, which does not renormalise
+        either.
+
+        Survivors are scaled by 1/(1-p) (inverted dropout) so E[sum_j a_j v_j] is
+        unchanged and eval sees the coarse contribution it trained against. Without it
+        the hierarchy would be systematically louder at eval than at any training step.
+        """
+        if not self.training or not getattr(self, "hier_node_dropout_active", False):
+            return None
+        if lvl_packed is None:
+            return None
+        rates = self.hier_node_dropout_rates
+        # Per-row rate, gathered from the level table. L0's entry is pinned to 0.0 in
+        # __init__, so L0 rows get keep_prob 1 and scale 1 with no special-casing here.
+        rate_t = torch.tensor(rates, device=device, dtype=torch.float32)
+        p_row = rate_t.index_select(0, lvl_packed).view(1, -1)             # [1, N]
+        keep = (torch.rand(B, int(lvl_packed.numel()), device=device,
+                           dtype=torch.float32) >= p_row).to(torch.float32)
+        keep = keep / (1.0 - p_row).clamp_min(1e-6)
+        return keep.view(B, -1, 1, 1).to(dtype)
+
     def _flex_union_attn(
-        self, qp: torch.Tensor, kp: torch.Tensor, vp: torch.Tensor, spec: Dict
+        self, qp: torch.Tensor, kp: torch.Tensor, vp: torch.Tensor, spec: Dict,
+        causal: bool = True,
     ) -> torch.Tensor:
         """One flex_attention call over the [coarse | tokens] split layout with the
         block-sparse union mask. Inputs are the mixed-order RoPE'd/tagged q/k/v
@@ -3660,7 +3810,10 @@ class HierarchicalMessagePassing(MessagePassing):
         from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
         perm = spec["flex_perm"]
-        bm = spec.get("flex_block_mask")
+        # Cache per (causal, coarse-rank radius): both change the mask, and the spec
+        # itself is cached per skeleton so a stale BlockMask would silently survive.
+        _bm_key = (bool(causal), int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0))
+        bm = spec.get("flex_block_mask") if spec.get("flex_block_mask_key") == _bm_key else None
         if bm is None:
             r = spec["flex_r_mixed"]
             lane = spec["flex_lane_rank"]
@@ -3668,21 +3821,73 @@ class HierarchicalMessagePassing(MessagePassing):
             w_mix = int(spec["window"])
             w_lane = int(spec["lane_window"])
 
-            def mask_mod(b, h, qi, ki):
-                dr = r[qi] - r[ki]
-                band = (dr >= 0) & (dr <= w_mix)
-                dl = lane[qi] - lane[ki]
-                coarse = isc[qi] & isc[ki] & (dl >= 0) & (dl <= w_lane) & (dr >= 0)
-                return band | coarse
+            crank = spec.get("flex_crank", None)
+            w_l0c = int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0)
+            causal_mask = bool(causal)
+
+            if crank is not None and w_l0c > 0:
+                # GENERALISED UNION. Two changes from the original clause:
+                #   isc[qi] & isc[ki]  ->  isc[ki]      L0 queries may read coarse too
+                #   one-sided dr/dl    ->  |dr|, |dl|   two-sided when the pack is bidi
+                # The coarse radius is in COARSE-RANK space (flex_crank), which is what
+                # decouples an L0 query's coarse reach from its token reach: the mixed
+                # window ties them together, so seeing further coarse costs you all the
+                # tokens in between. OR semantics give exact set-union -- a coarse row
+                # that also falls inside the local window is ONE key, not two with a
+                # +ln2 advantage, which is the bias the additive/LSE paths carry.
+                def mask_mod(b, h, qi, ki):
+                    dr = r[qi] - r[ki]
+                    band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
+                    dc = crank[qi] - crank[ki]
+                    if causal_mask:
+                        coarse = isc[ki] & (dc >= 0) & (dc <= w_l0c) & (dr >= 0)
+                    else:
+                        coarse = isc[ki] & (dc.abs() <= w_l0c)
+                    return band | coarse
+            else:
+                def mask_mod(b, h, qi, ki):
+                    dr = r[qi] - r[ki]
+                    band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
+                    dl = lane[qi] - lane[ki]
+                    if causal_mask:
+                        coarse = isc[qi] & isc[ki] & (dl >= 0) & (dl <= w_lane) & (dr >= 0)
+                    else:
+                        coarse = isc[qi] & isc[ki] & (dl.abs() <= w_lane)
+                    return band | coarse
 
             n = int(perm.numel())
             bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n,
                                    device=str(perm.device))
             spec["flex_block_mask"] = bm
+            spec["flex_block_mask_key"] = _bm_key
 
         q_s = qp.index_select(1, perm).transpose(1, 2)  # [B, H, N, D]
         k_s = kp.index_select(1, perm).transpose(1, 2)
         v_s = vp.index_select(1, perm).transpose(1, 2)
+
+        # TOKEN-WISE V DROPOUT. flex_attention has no dropout_p (verified: torch 2.7.1
+        # exposes score_mod/mask_mod/block_mask/return_lse and nothing else), so this path
+        # would otherwise train with NO attention regularisation while the additive path
+        # gets 0.1 -- the leading suspect for flex losing to additive late in training on
+        # text. This is not the same operator, but it preserves the invariant that
+        # matters: dropping whole KEY tokens from V gives E[V~] = V, hence E[P V~] = P V,
+        # exactly as post-softmax dropout does. One mask per (batch, head, key token), so
+        # a dropped token is absent for every query in that head -- coarser than true
+        # attention dropout, which resamples per (q,k) edge.
+        #
+        # NOT done by randomising mask_mod: that yields softmax(S + M), which RENORMALISES
+        # over the survivors, whereas dropout scales post-softmax probabilities by
+        # 1/(1-p). Those are different operators, and the block mask is cached anyway.
+        # Exact post-softmax dropout IS reconstructible from two flex passes via
+        # O_drop = O_D * exp(L_D - L) / (1-p) using return_lse -- but randomising the
+        # scores needs either a materialised [B,H,N,N] noise tensor (1.6e9 elements at
+        # b64, the very thing flex avoids) or an in-kernel PRNG. Not worth it here.
+        _p = float(self.dropout.p) if self.training else 0.0
+        if _p > 0.0:
+            _keep = torch.rand(v_s.shape[0], v_s.shape[1], v_s.shape[2], 1,
+                               device=v_s.device, dtype=torch.float32) >= _p
+            v_s = v_s * (_keep.to(v_s.dtype) / (1.0 - _p))
+
         # Compiled kernel only for real graphs: the inductor lowering asserts on tiny
         # sequences (< one mask block, e.g. generation-prefix graphs), and eager flex
         # (math composite, O(n^2) but n is tiny there) is fine for those.
@@ -3694,6 +3899,72 @@ class HierarchicalMessagePassing(MessagePassing):
         else:
             out = flex_attention(q_s, k_s, v_s, block_mask=bm)
         return out.transpose(1, 2)  # [B, N, H, D] split order
+
+
+    def _l0_bands_block(self, qp, kp, vp, l0rows, lvlrows, w0, dp, causal, flash_fn):
+        """L0 window UNION per-level coarse fields, as ONE softmax. Returns [B,n0,D].
+
+        Factored out so it can be wrapped in torch.utils.checkpoint: the block is pure
+        given (qp, kp, vp) and holds two attention outputs plus the gathered L0 q/k/v
+        for backward (~14 GB at b64 over 16 layers). Unlike the mixed window -- ONE
+        flash pass over one q matrix -- this cannot collapse into a single call, because
+        flash's mask is a single band and this needs a window AND an unrestricted key
+        set at once. Recomputing is therefore the only way to get the memory back.
+        """
+        q0 = qp.index_select(1, l0rows).contiguous()
+        parts = [_flash_win_lse(
+            flash_fn, q0,
+            kp.index_select(1, l0rows).contiguous(),
+            vp.index_select(1, l0rows).contiguous(), w0, causal, dp)]
+        radii = list(getattr(self, "local_pack_l0_coarse_windows", []) or [])
+        n0 = int(l0rows.numel())
+        # Levels whose radius spans the whole level have no band left, so
+        # their key sets are unmasked -- and a softmax over (L1 u L2 u L3) is
+        # identical whether computed as one attention over the concatenated
+        # rows or as three LSE-merged parts. Fusing them is therefore EXACT,
+        # and each part avoided is one [B,N,H,D] output not held for backward
+        # (134 MB/layer at b64, 2.1 GB over 16 layers). Genuinely banded
+        # levels cannot fuse -- their masks differ -- and stay separate below.
+        # Track fused levels by LEVEL INDEX, never by tensor identity:
+        # data_ptr() is a host-side pointer query that dynamo cannot trace, and
+        # using it here graph-broke the compiled region on every layer (it
+        # surfaced as the "cannot trace Tensor.index_add_" warning, which the
+        # control config does not emit). These ints are static at trace time.
+        fusedlv = []
+        for lv in (1, 2, 3):
+            n = int(lvlrows[lv].numel())
+            rr = radii[lv - 1] if len(radii) >= lv else max(1, n // 4)
+            if n > 0 and int(rr) > 0 and not causal and (2 * int(rr) + 1) >= n:
+                fusedlv.append(lv)
+        if len(fusedlv) > 1:
+            fr = torch.cat([lvlrows[i] for i in fusedlv])
+            parts.append(_flash_win_lse(
+                flash_fn, q0,
+                kp.index_select(1, fr).contiguous(),
+                vp.index_select(1, fr).contiguous(),
+                int(fr.numel()), False, dp))
+        else:
+            fusedlv = []
+        for lv in (1, 2, 3):
+            if lv in fusedlv:
+                continue
+            rows = lvlrows[lv]
+            nl = int(rows.numel())
+            if nl <= 0 or n0 % nl != 0:
+                continue
+            stride = n0 // nl
+            r = radii[lv - 1] if len(radii) >= lv else max(1, nl // 4)
+            if int(r) <= 0:
+                continue
+            p = _flash_band_lse(
+                flash_fn, q0,
+                kp.index_select(1, rows).contiguous(),
+                vp.index_select(1, rows).contiguous(),
+                stride, int(r), causal, dp)
+            if p is not None:
+                parts.append(p)
+        merged = _lse_union(parts)
+        return self.out_proj(merged.reshape(int(qp.size(0)), int(l0rows.numel()), -1))
 
     def _apply_local_pack_out(
         self,
@@ -3730,9 +4001,10 @@ class HierarchicalMessagePassing(MessagePassing):
                 if bool(getattr(self, "local_pack_flex_union", False)) or bool(
                     getattr(self, "local_pack_lane_merge", False)
                 ):
-                    self._local_pack_log_once(
-                        "bidirectional pack: flex_union/lane_merge are causal-only; additive combine"
-                    )
+                    if bool(getattr(self, "local_pack_lane_merge", False)):
+                        self._local_pack_log_once(
+                            "bidirectional pack: lane_merge is causal-only; additive combine"
+                        )
             else:
                 self._local_pack_log_once("non-causal runtime flags; packed cross-level local skipped")
                 return set()
@@ -3784,6 +4056,15 @@ class HierarchicalMessagePassing(MessagePassing):
         if getattr(self, "local_pack_level_bias", False) and lvl_packed is not None:
             kp = kp + self.local_pack_level_k_emb.index_select(0, lvl_packed).unsqueeze(0).to(kp.dtype)
             vp = vp + self.local_pack_level_v_emb.index_select(0, lvl_packed).unsqueeze(0).to(vp.dtype)
+        # DropNode (hier_node_dropout). AFTER the level tag on purpose: a dropped row must
+        # contribute nothing at all, including its level_v_emb. The mask is built once here
+        # and reused by the coarse lane below, so a node dropped for the mixed window is the
+        # same node dropped in the lane -- otherwise a "dropped" summary would still be
+        # readable through the other path. vp also feeds the flex-union call, so that path
+        # inherits this with no extra work.
+        node_keep = self._hier_node_keep(B, lvl_packed, vp.device, vp.dtype)
+        if node_keep is not None:
+            vp = vp * node_keep
         # FLEX UNION (local_pack_flex_union): ONE flex_attention call over the block-
         # coherent split layout replaces the mixed call + lane + merge — the block-sparse
         # mask ("within W mixed slots OR both-coarse within lane_window coarse slots") IS
@@ -3794,12 +4075,12 @@ class HierarchicalMessagePassing(MessagePassing):
         if (
             bool(getattr(self, "local_pack_flex_union", False))
             and "flex_perm" in spec
-            and pack_causal  # flex mask encodes the causal window; bidi -> additive path
+            # (bidi is supported now: the mask below is two-sided when causal is False)
             and not getattr(self, "_flex_union_failed", False)
         ):
             if set(int(l) for l in spec.get("query_levels", ())) >= {0, 1, 2, 3}:
                 try:
-                    out_flex = self._flex_union_attn(qp, kp, vp, spec)
+                    out_flex = self._flex_union_attn(qp, kp, vp, spec, pack_causal)
                     contrib = self.out_proj(out_flex.reshape(B, out_flex.size(1), -1))
                     if source_gates is not None:
                         contrib = source_gates["local"] * contrib
@@ -3845,10 +4126,27 @@ class HierarchicalMessagePassing(MessagePassing):
             )
             if out_pack is None:
                 return set()
+        pack_causal_unsupported_flag = False
         contrib = out_pack.index_select(1, sel)
         if source_gates is not None:
             contrib = source_gates["local"] * contrib
-        out.index_add_(1, tgt, contrib.to(dtype=out.dtype))
+        # local_pack_l0_coarse_bands: L0 queries are served by the LSE-unified band path
+        # below instead. Their mixed-window contribution is dropped HERE rather than the
+        # band path being added on top, because the two key sets overlap (the mixed
+        # window already contains the coarse rows inside +-W) and a union softmax is only
+        # exact over DISJOINT sets. Coarse queries keep the mixed window unchanged.
+        _l0_bands = (
+            bool(getattr(self, "local_pack_l0_coarse_bands", False))
+            and lvl_packed is not None
+            and not pack_causal_unsupported_flag
+        )
+        if _l0_bands:
+            _coarse_q = lvl_packed.index_select(0, sel) > 0
+            if bool(_coarse_q.any()):
+                out.index_add_(1, tgt[_coarse_q],
+                               contrib[:, _coarse_q].to(dtype=out.dtype))
+        else:
+            out.index_add_(1, tgt, contrib.to(dtype=out.dtype))
 
         # Coarse lane: second packed window (causal in AR mode, two-sided in bidi) over ONLY
         # the coarse rows (close-time order preserved by construction), restoring wide coarse
@@ -3882,6 +4180,11 @@ class HierarchicalMessagePassing(MessagePassing):
             if getattr(self, "local_pack_level_bias", False) and lane_levels is not None:
                 kl = kl + self.local_pack_level_k_emb.index_select(0, lane_levels).unsqueeze(0).to(kl.dtype)
                 vl = vl + self.local_pack_level_v_emb.index_select(0, lane_levels).unsqueeze(0).to(vl.dtype)
+            # Same DropNode decision as the mixed window: lane_rows maps lane rows -> packed
+            # rows, precomputed in the spec (a nonzero() here would be a compile graph break).
+            lane_rows_idx = spec.get("lane_rows", None)
+            if node_keep is not None and lane_rows_idx is not None:
+                vl = vl * node_keep.index_select(1, lane_rows_idx)
             lane_window = int(spec.get("lane_window", 0))
             out_lane = self._compute_local_attn_from_qkv(
                 q_lvl=ql, k_lvl=kl, v_lvl=vl,
@@ -3947,6 +4250,61 @@ class HierarchicalMessagePassing(MessagePassing):
         # ungated to trained weights it collapsed |near| 1128x (7.21e-01 -> 6.39e-04) and
         # far/near "rose" to 0.215 purely from that denominator -- the same artifact as the
         # RoPE'd HQD read. Hence coarse_global_gate, raw scalar, init 0.0 = exact identity.
+        # L0 queries: L0-window UNION per-level coarse bands, as ONE softmax.
+        # Coarse rows are sparse in position (level L has stride N/n_L), so a fixed
+        # count of them spans much further than the same count of L0 tokens -- an L1
+        # radius of R nodes reaches R*stride tokens for R keys. That decouples L0's
+        # coarse reach from its L0 reach, which the single mixed window welds together.
+        # Linear in N at fixed radii, and flash-sparse throughout (see _flash_band_lse).
+        if _l0_bands:
+            # Precomputed in the cached pack spec, NOT derived here: (levels == L).nonzero()
+            # has a data-dependent shape, so calling it in the layer loop forces a
+            # torch.compile graph break on every layer of every step and re-derives a
+            # constant 64x per forward.
+            _lvl_rows = spec.get("level_rows", None)
+            _l0_rows = _lvl_rows[0] if _lvl_rows else None
+            _bk, _flash_fn = pick_attention_backend(qp.device)
+            _ok = (
+                _flash_fn is not None and _bk in {"fa2", "fa3"}
+                and qp.dtype in (torch.float16, torch.bfloat16)
+                and _l0_rows is not None and int(_l0_rows.numel()) > 1
+                and not getattr(self, "_l0_bands_failed", False)
+            )
+            if not _ok:
+                self._local_pack_log_once(
+                    "local_pack_l0_coarse_bands needs a flash backend and fp16/bf16 q/k; "
+                    "L0 rows fall back to the mixed window")
+            else:
+                # No try/except here: dynamo cannot trace arbitrary exception handling,
+                # and runtime failures are already covered one level up by
+                # hier_layer_compile's probation, which falls the layer back to eager
+                # permanently and logs once.
+                #
+                # local_pack_l0_bands_checkpoint recomputes this whole block in the
+                # backward instead of storing it. The union's memory is inherent -- two
+                # attention outputs plus the gathered L0 q/k/v, ~14 GB at b64 over 16
+                # layers -- and unlike the mixed window (ONE pass, one q matrix) it
+                # cannot be folded into a single flash call, because flash's mask is a
+                # single band and this needs a window AND an unrestricted key set. What
+                # it CAN be is recomputed: the block is pure given (qp, kp, vp), so
+                # checkpointing trades that memory for one extra forward.
+                _w0 = int(getattr(self, "local_pack_l0_window", 0) or 0) or int(window)
+                _dp = float(self.dropout.p) if self.training else 0.0
+                if bool(getattr(self, "local_pack_l0_bands_checkpoint", False)) and self.training:
+                    _c = torch.utils.checkpoint.checkpoint(
+                        self._l0_bands_block, qp, kp, vp, _l0_rows, _lvl_rows,
+                        _w0, _dp, pack_causal, _flash_fn,
+                        use_reentrant=False)
+                    if source_gates is not None:
+                        _c = source_gates["local"] * _c
+                    out.index_add_(1, perm.index_select(0, _l0_rows), _c.to(dtype=out.dtype))
+                    return query_levels
+                _c = self._l0_bands_block(qp, kp, vp, _l0_rows, _lvl_rows,
+                                          _w0, _dp, pack_causal, _flash_fn)
+                if source_gates is not None:
+                    _c = source_gates["local"] * _c
+                out.index_add_(1, perm.index_select(0, _l0_rows), _c.to(dtype=out.dtype))
+
         if bool(getattr(self, "local_pack_coarse_global", False)) and lvl_packed is not None:
             l0_rows = (lvl_packed == 0).nonzero(as_tuple=False).view(-1)
             cs_rows = (lvl_packed > 0).nonzero(as_tuple=False).view(-1)
@@ -4562,9 +4920,16 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
         local_pack_lane_merge: bool = False,  # LSE-merge the mixed window + coarse lane (unified softmax)
         local_pack_coarse_global: bool = False,  # every L0 query also reads the WHOLE coarse bank
+        local_pack_l0_coarse_bands: bool = False,  # per-level banded coarse window, LSE-unified
+        local_pack_l0_window: int = 0,             # L0<->L0 radius (0 = local_pack_window)
+        local_pack_l0_coarse_windows: Optional[List[int]] = None,  # radius per level, in NODES
+        local_pack_l0_bands_checkpoint: bool = False,  # recompute the band block in backward
+        local_pack_l0_coarse_rank_window: int = 0,  # flex union: L0 coarse radius, coarse-rank units
         hqd_keep_stage_survivors: bool = False,  # HQD fetch is mixed-level -> tag k/v by level
         local_pack_coarse_global_gate_init: float = 0.0,  # 0.0 = exact identity (warm-start safe)
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
+        hier_node_dropout: float = 0.0,  # DropNode on coarse rows (value-side, L0 exempt)
+        hier_node_dropout_per_level: Optional[Sequence[float]] = None,  # overrides the scalar
         local_pack_bidirectional: bool = False,  # bidi (MaskGIT/diffusion): two-sided packed windows
         local_pack_rope_axial: bool = False,  # axial ND RoPE on the packed path (curve-mode coords)
         hqd_read_prerope: bool = False,   # xq/HQD fetch read + stage-3 score on PRE-RoPE q/k (content-only)
@@ -4650,9 +5015,16 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_level_bias=local_pack_level_bias,
             local_pack_lane_merge=local_pack_lane_merge,
             local_pack_coarse_global=local_pack_coarse_global,
+            local_pack_l0_coarse_bands=local_pack_l0_coarse_bands,
+            local_pack_l0_window=local_pack_l0_window,
+            local_pack_l0_coarse_windows=local_pack_l0_coarse_windows,
+            local_pack_l0_bands_checkpoint=local_pack_l0_bands_checkpoint,
+            local_pack_l0_coarse_rank_window=local_pack_l0_coarse_rank_window,
             hqd_keep_stage_survivors=hqd_keep_stage_survivors,
             local_pack_coarse_global_gate_init=local_pack_coarse_global_gate_init,
             local_pack_flex_union=local_pack_flex_union,
+            hier_node_dropout=hier_node_dropout,
+            hier_node_dropout_per_level=hier_node_dropout_per_level,
             local_pack_bidirectional=local_pack_bidirectional,
             local_pack_rope_axial=local_pack_rope_axial,
             hqd_read_prerope=hqd_read_prerope,
