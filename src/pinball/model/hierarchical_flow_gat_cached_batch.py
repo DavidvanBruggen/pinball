@@ -3324,9 +3324,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_query_level = max(0, min(2, int(hqd_query_level)))
         self.hqd_stop_level = max(0, min(2, int(hqd_stop_level)))
         self.hqd_keep_stage_survivors = bool(hqd_keep_stage_survivors)
-        # Read the PARAMETER, not self: self.hqd_static_descent is not assigned until ~15
-        # lines below, so a getattr here always fell through to False and warned that the
-        # descent "will read L0 only" on every config that enabled survivors.
+        # Read the parameter, not self: self.hqd_static_descent is assigned further below.
         if self.hqd_keep_stage_survivors and not bool(hqd_static_descent):
             # Only the static core accumulates survivors; the stage-by-stage reference
             # descent rebuilds candidate sets per level and would silently ignore this.
@@ -5648,9 +5646,9 @@ class HierarchicalFlowGAT(nn.Module):
                 lane_sel = torch.nonzero(lane_sel_mask, as_tuple=False).view(-1)
                 lane_perm = perm.index_select(0, lane_rows).contiguous()
                 spec["lane_perm"] = lane_perm
-                # Lane row -> packed row. Needed so hier_node_dropout can drop the SAME
-                # node in the lane as in the mixed window; precomputed here for the same
-                # reason as level_rows (nonzero() in the layer loop breaks the graph).
+                # Lane row -> packed row, so hier_node_dropout drops the same node in the
+                # lane as in the mixed window. Precomputed here for the same reason as
+                # level_rows: nonzero() in the layer loop breaks the graph.
                 spec["lane_rows"] = lane_rows.contiguous()
                 spec["lane_pos"] = pos.index_select(0, lane_rows).contiguous()
                 if "pos_nd" in spec:

@@ -520,11 +520,12 @@ class HierarchicalMessagePassing(MessagePassing):
         local_pack_coarse_global_gate_init: float = 0.0,
         # ONE flex_attention call with the block-sparse union mask (see model spec builder).
         local_pack_flex_union: bool = False,
-        # DropNode on the hierarchy: per (batch, coarse row) each step, zero the row's VALUE
-        # in the packed key/value set so nothing can read its content this step. L0 is never
-        # dropped, and the residual stream is untouched -- the node still exists and the
-        # upward/downward refresh paths still see it, so this regularises what READS the
-        # hierarchy without starving what BUILDS it.
+        # DropNode on the hierarchy: per (batch, coarse row) each step, zero that row's
+        # VALUE in the packed key/value set so nothing reads its content this step. L0 is
+        # never dropped and the residual stream is untouched, so the upward/downward refresh
+        # paths still see every node: this regularises what READS the hierarchy without
+        # starving what BUILDS it. Scalar rate applies to L1-L3; the per-level list
+        # overrides it and its L0 entry is forced to 0.
         hier_node_dropout: float = 0.0,
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,
         # Bidirectional pack (MaskGIT/diffusion): when the runtime causal flags are OFF,
@@ -649,10 +650,9 @@ class HierarchicalMessagePassing(MessagePassing):
             self.coarse_global_gate = nn.Parameter(
                 torch.full((), float(local_pack_coarse_global_gate_init)))
         self.local_pack_flex_union = bool(local_pack_flex_union)
-        # Per-level DropNode rates, always length 4 with L0 pinned to 0.0. A scalar rate
-        # applies to L1-L3 only; an explicit per-level list overrides it and its L0 entry
-        # is forced to 0 regardless of what the config says (dropping L0 would delete the
-        # token content itself, not the hierarchy's summary of it).
+        # Per-level DropNode rates, always length 4 with L0 pinned to 0.0 whatever the
+        # config says: dropping L0 would delete the token content itself rather than the
+        # hierarchy's summary of it.
         _nd = [0.0, 0.0, 0.0, 0.0]
         _base = max(0.0, min(1.0, float(hier_node_dropout)))
         if _base > 0.0:
@@ -3763,34 +3763,27 @@ class HierarchicalMessagePassing(MessagePassing):
     def _hier_node_keep(self, B, lvl_packed, device, dtype):
         """DropNode on the hierarchy: per (batch, packed row) keep multiplier for VALUES.
 
-        Returns [B, N, 1, 1] broadcastable over (heads, head_dim), or None when inactive
-        or in eval -- None keeps the tensor out of the graph entirely rather than
-        multiplying by ones.
+        Returns [B, N, 1, 1], broadcast over heads and head_dim, or None when the feature
+        is off or the module is in eval.
 
-        WHY VALUES AND NOT KEYS. Masking the key would be the cleaner "node is absent"
-        semantics (mass redistributes over survivors), but an additive key mask sets
-        force_sdpa=True in _compute_local_attn_from_qkv, which drops the packed attention
-        off flash -- the memory profile the windowed arms exist to protect. Zeroing the
-        KEY instead is not a substitute and is actively wrong: q.0 = 0 is a mid-range
-        logit, not -inf, so against typically-negative logits a zeroed key would attract
-        MORE mass than it started with and dropped nodes would get louder.
+        The dropped row keeps its KEY and loses its VALUE, so it still absorbs softmax
+        mass but contributes nothing -- the same semantics as ordinary post-softmax
+        attention dropout. Two constraints on any change here:
 
-        So the dropped row keeps its key and loses its content. It still absorbs softmax
-        mass; the coarse pathway attenuates instead of redistributing. That is the same
-        semantics as ordinary post-softmax attention dropout, which does not renormalise
-        either.
-
-        Survivors are scaled by 1/(1-p) (inverted dropout) so E[sum_j a_j v_j] is
-        unchanged and eval sees the coarse contribution it trained against. Without it
-        the hierarchy would be systematically louder at eval than at any training step.
+          * Drop values, never keys. An additive key mask forces the SDPA path (see
+            _compute_local_attn_from_qkv), and zeroing a key is worse than useless:
+            q.0 = 0 is a mid-range logit, not -inf, so a "dropped" key can attract more
+            mass than it started with.
+          * Keep the 1/(1-p) scaling. It holds E[sum_j a_j v_j] fixed, so eval sees the
+            coarse contribution the model trained against.
         """
         if not self.training or not getattr(self, "hier_node_dropout_active", False):
             return None
         if lvl_packed is None:
             return None
         rates = self.hier_node_dropout_rates
-        # Per-row rate, gathered from the level table. L0's entry is pinned to 0.0 in
-        # __init__, so L0 rows get keep_prob 1 and scale 1 with no special-casing here.
+        # L0's rate is pinned to 0.0 in __init__, so L0 rows get keep 1 and scale 1 here
+        # without special-casing.
         rate_t = torch.tensor(rates, device=device, dtype=torch.float32)
         p_row = rate_t.index_select(0, lvl_packed).view(1, -1)             # [1, N]
         keep = (torch.rand(B, int(lvl_packed.numel()), device=device,
@@ -4056,12 +4049,10 @@ class HierarchicalMessagePassing(MessagePassing):
         if getattr(self, "local_pack_level_bias", False) and lvl_packed is not None:
             kp = kp + self.local_pack_level_k_emb.index_select(0, lvl_packed).unsqueeze(0).to(kp.dtype)
             vp = vp + self.local_pack_level_v_emb.index_select(0, lvl_packed).unsqueeze(0).to(vp.dtype)
-        # DropNode (hier_node_dropout). AFTER the level tag on purpose: a dropped row must
-        # contribute nothing at all, including its level_v_emb. The mask is built once here
-        # and reused by the coarse lane below, so a node dropped for the mixed window is the
-        # same node dropped in the lane -- otherwise a "dropped" summary would still be
-        # readable through the other path. vp also feeds the flex-union call, so that path
-        # inherits this with no extra work.
+        # DropNode (hier_node_dropout), applied after the level tag so a dropped row
+        # contributes nothing at all, including its level_v_emb. Built once here and reused
+        # by the coarse lane below so the same node is dropped in both paths; vp also feeds
+        # the flex-union call, which inherits it.
         node_keep = self._hier_node_keep(B, lvl_packed, vp.device, vp.dtype)
         if node_keep is not None:
             vp = vp * node_keep
@@ -4180,8 +4171,8 @@ class HierarchicalMessagePassing(MessagePassing):
             if getattr(self, "local_pack_level_bias", False) and lane_levels is not None:
                 kl = kl + self.local_pack_level_k_emb.index_select(0, lane_levels).unsqueeze(0).to(kl.dtype)
                 vl = vl + self.local_pack_level_v_emb.index_select(0, lane_levels).unsqueeze(0).to(vl.dtype)
-            # Same DropNode decision as the mixed window: lane_rows maps lane rows -> packed
-            # rows, precomputed in the spec (a nonzero() here would be a compile graph break).
+            # Same DropNode decision as the mixed window. lane_rows maps lane rows -> packed
+            # rows and is precomputed in the spec: a nonzero() here would break the graph.
             lane_rows_idx = spec.get("lane_rows", None)
             if node_keep is not None and lane_rows_idx is not None:
                 vl = vl * node_keep.index_select(1, lane_rows_idx)
