@@ -9,7 +9,7 @@
 #   4096     512   256   128     896     4992
 #
 # At 4096: block_size -> 4096, and local_pack_window -> 4992 on the full arm.
-block_size: 1024
+block_size: 4096
 model_type: pinball
 tokenizer_name: gpt2            # unused in features mode; build_pinball stubs it
 
@@ -27,7 +27,7 @@ unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0
-dropout: 0.0
+dropout: 0.1
 norm_type: layernorm
 attn_backend: flash             # alias -> l0_local_backend
 qkv_sharing: shared
@@ -92,5 +92,5 @@ learn_edge_from_attention: false
 lateral_edge_trace_enable: false
 
 # === ARM 1/4: FULL ATTENTION over the packed sequence =================================
-local_pack_window: 1248          # = packed length (1024 L0 + 224 coarse)
+local_pack_window: 4992 #1248          # = packed length (1024 L0 + 224 coarse), 4096 block_size -> 4096 L0 + 896 coarse
 use_hqd: false

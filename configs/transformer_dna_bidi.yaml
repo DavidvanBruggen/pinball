@@ -12,7 +12,7 @@
 # none, local_pack_rope_axial: false), so receptive-field comparisons against this control
 # are not confounded by the positional prior the way they are on 2D image runs.
 model_type: transformer
-block_size: 1024
+block_size: 4096
 tokenizer_name: gpt2            # unused in features mode; build_pinball stubs it
 
 hidden_dim: 1024
@@ -34,6 +34,6 @@ ar_graph_causal: false
 # refine_cond_mode: the harness calls the model bare, so FiLM would have no conditioning
 # vector to read and would add parameters to this arm alone.
 
-dropout: 0.0
+dropout: 0.1
 norm_type: layernorm
 use_gradient_checkpointing: true
