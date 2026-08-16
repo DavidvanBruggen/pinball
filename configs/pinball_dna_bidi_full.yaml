@@ -75,7 +75,7 @@ local_pack_lane_merge: false    # causal-only; inert in a bidi run
 # Source gating is on in every arm so the arms differ by mechanism, not parameter count.
 # sigmoid(hqd_source_gate_logit) reads out how much the model weights HQD; dump it from a
 # checkpoint with tools_gate_dump.py.
-attention_source_gating_enable: true
+attention_source_gating_enable: false
 attention_source_gate_init_graph: 1.0
 attention_source_gate_init_local: 1.0   # 1.0, not the 0.5 default, which halves the main
                                         # attention path
