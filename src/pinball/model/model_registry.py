@@ -188,6 +188,11 @@ def build_pinball_model(
         drop_static_cross_level_edges=bool(getattr(args, "drop_static_cross_level_edges", False)),
         hier_refresh_compile=bool(getattr(args, "hier_refresh_compile", False)),
         hier_layer_compile=bool(getattr(args, "hier_layer_compile", False)),
+        # Default ON: both are stability fixes, not experiments. Set either to false in a
+        # config to reproduce a checkpoint trained before they became the default.
+        final_norm_fast_path=bool(getattr(args, "final_norm_fast_path", True)),
+        qk_norm=bool(getattr(args, "qk_norm", True)),
+        qk_norm_type=str(getattr(args, "qk_norm_type", "rms")),
         xq_nominate_enable=bool(getattr(args, "xq_nominate_enable", False)),
         xq_nominate_topk_l3=int(getattr(args, "xq_nominate_topk_l3", 2)),
         xq_nominate_topk_l1=int(getattr(args, "xq_nominate_topk_l1", 2)),

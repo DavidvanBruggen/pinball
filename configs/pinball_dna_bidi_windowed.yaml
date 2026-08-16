@@ -58,6 +58,16 @@ hier_downward_refresh_gate_init: 0.1
 hier_refresh_compile: true
 hier_layer_compile: true
 
+# Stability normalizations (both default ON; set false only to reproduce a checkpoint
+# trained before they existed). final_norm_fast_path re-applies the terminal norm on exit
+# from the refinement loop, which the fast path had lost -- without it nothing renormalizes
+# the residual stream before output_projection. qk_norm normalizes q/k over head_dim before
+# the dot product, bounding the attention logits; it matters most here because one softmax
+# spans all four levels at once. Cost of both together is within noise (~1-2%).
+final_norm_fast_path: true
+qk_norm: true
+qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
+
 # Required: these populate local_attn_config, which gates the packed cross-level path.
 # Without them every local_pack_* key below is silently inert.
 local_attn_windows: [128, 128, 128, 128]

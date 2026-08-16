@@ -2113,19 +2113,16 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 #     L2L3_iters=1,
                 # )
 
-                # if self.final_norm.weight.device != x_final.device:
-                #     self.final_norm = self.final_norm.to(x_final.device)
-                
-                # x_final = self.final_norm(x_final)
-                # torch.cuda.reset_peak_memory_stats(device)
-                # torch.cuda.synchronize(device)
-                # torch.cuda.empty_cache()
-                # alloc = torch.cuda.memory_allocated(device) / 1e9
-                # peak  = torch.cuda.max_memory_allocated(device) / 1e9
-                # print(f"[MEM] post-refinement: alloc={alloc:.2f} GB, peak={peak:.2f} GB")
-                # Predict from L0 slice (x_final is CPU)
-                #print(f"x_final shape: {x_final.shape}")
-                #print(seq_len, " seq_len value")
+                # Terminal norm on exit from the refinement loop (final_norm_fast_path).
+                # The refinement stack is pre-norm, so nothing renormalizes the residual
+                # stream between the last layer and output_projection; its scale is free to
+                # drift over training. The slow path has always applied this; the fast path
+                # dropped it, leaving self.final_norm allocated but receiving no gradient.
+                # Default off because switching it on changes the output scale of every
+                # existing checkpoint (a LayerNorm at weight=1/bias=0 normalizes, it is not
+                # the identity) -- fresh runs only.
+                if getattr(self, "final_norm_fast_path", False):
+                    x_final = self.final_norm(x_final)
                 token_features_graph = x_final[:, :seq_len_graph, :]
                 token_features = token_features_graph.to(self.output_projection.weight.device, non_blocking=True)
                 # Coarse co-prediction: fold the strictly-past L1/L2/L3 summaries into L0's

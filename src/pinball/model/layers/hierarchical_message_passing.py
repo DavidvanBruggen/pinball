@@ -506,6 +506,13 @@ class HierarchicalMessagePassing(MessagePassing):
         per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
+        # QK normalization over head_dim, applied to q and k right after their projections
+        # and so inherited by every consumer (packed window, coarse lane, per-level local,
+        # graph scatter, HQD). Bounds the attention logits structurally. Applied BEFORE RoPE
+        # and before the level tags, so the rotation and the tags act on a normalized vector.
+        # LEGACY: false reproduces pre-default checkpoints (this adds weights per layer).
+        qk_norm: bool = True,
+        qk_norm_type: str = "rms",  # "rms" (nn.RMSNorm) | "layer" (nn.LayerNorm)
         # Unified-softmax combination of the mixed window and the coarse lane for coarse
         # queries (LSE merge of the two calls) instead of adding the two attention outputs;
         # see _apply_local_pack_out. False = additive combine (previous behavior).
@@ -631,6 +638,17 @@ class HierarchicalMessagePassing(MessagePassing):
         # q·e_level a query-dependent level bias inside the same softmax (and the V tag lets
         # the output carry its source level). Zero init = bit-identical to untagged at start.
         self.local_pack_level_bias = bool(local_pack_level_bias)
+        # One weight vector of length head_dim, shared across heads (the common formulation).
+        self.qk_norm_enable = bool(qk_norm)
+        if self.qk_norm_enable:
+            self.q_head_norm = make_norm(
+                self.head_dim,
+                norm_type="layernorm" if str(qk_norm_type).lower().startswith("layer") else "rmsnorm",
+                eps=1e-6)
+            self.k_head_norm = make_norm(
+                self.head_dim,
+                norm_type="layernorm" if str(qk_norm_type).lower().startswith("layer") else "rmsnorm",
+                eps=1e-6)
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.hqd_keep_stage_survivors = bool(hqd_keep_stage_survivors)
         self.local_pack_coarse_global = bool(local_pack_coarse_global)
@@ -2187,6 +2205,12 @@ class HierarchicalMessagePassing(MessagePassing):
         q = self.q_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
+        # QK norm (qk_norm), before RoPE and before the packed level tags so every path
+        # below -- pack, lane, per-level local, graph scatter, HQD -- reads normalized q/k.
+        # Cast back: autocast runs norms in fp32, and the flash kernels reject fp32 q/k.
+        if getattr(self, "qk_norm_enable", False):
+            q = self.q_head_norm(q).to(q.dtype)
+            k = self.k_head_norm(k).to(k.dtype)
 
         # Packed cross-level local attention (model-injected spec; consumed in the local
         # block below by _apply_local_pack_out). Keep PRE-RoPE q/k references: the packed
@@ -4909,6 +4933,8 @@ class HierarchicalTransformerLayer(nn.Module):
         per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
+        qk_norm: bool = True,
+        qk_norm_type: str = "rms",
         local_pack_lane_merge: bool = False,  # LSE-merge the mixed window + coarse lane (unified softmax)
         local_pack_coarse_global: bool = False,  # every L0 query also reads the WHOLE coarse bank
         local_pack_l0_coarse_bands: bool = False,  # per-level banded coarse window, LSE-unified
@@ -5004,6 +5030,8 @@ class HierarchicalTransformerLayer(nn.Module):
             per_level_attn_mult=per_level_attn_mult,
             local_attn_head_dim=local_attn_head_dim,
             local_pack_level_bias=local_pack_level_bias,
+            qk_norm=qk_norm,
+            qk_norm_type=qk_norm_type,
             local_pack_lane_merge=local_pack_lane_merge,
             local_pack_coarse_global=local_pack_coarse_global,
             local_pack_l0_coarse_bands=local_pack_l0_coarse_bands,

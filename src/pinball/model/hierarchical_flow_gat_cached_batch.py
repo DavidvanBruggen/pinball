@@ -2327,6 +2327,26 @@ class HierarchicalFlowGAT(nn.Module):
         # probation fallback to eager on first runtime failure (same policy as
         # hier_refresh_compile; both knobs compose — the refreshes live outside the layers).
         hier_layer_compile: bool = False,
+        # Apply self.final_norm on exit from the refinement loop. The stack is pre-norm, so
+        # without this nothing renormalizes the residual stream before output_projection and
+        # its scale is free to drift over training. The slow path has always done this; the
+        # fast path lost it, leaving final_norm allocated but never receiving a gradient.
+        # LEGACY: set false to reproduce a checkpoint trained before this became the default.
+        # It is not a no-op — a LayerNorm at weight=1/bias=0 normalizes rather than passing
+        # through, so an old checkpoint reloaded with this ON sees a different output scale.
+        final_norm_fast_path: bool = True,
+        # QK normalization: normalize each head's q and k over head_dim before the dot
+        # product, bounding the attention logits instead of relying on the LR staying below
+        # the point where they grow. Matters most where one softmax spans several levels at
+        # once (local_pack_cross_level), since a drift there can hand one level all the mass.
+        # qk_norm_type picks the operator: "rms" (nn.RMSNorm) or "layer" (nn.LayerNorm);
+        # both measured within noise of no-op at head_dim 64, and both fuse under
+        # hier_layer_compile. Does NOT remove the cardinality prior (mass in proportion to
+        # each level's key count) — that is what local_pack_level_bias learns.
+        # LEGACY: set false for checkpoints trained before this became the default. ON adds
+        # q_head_norm/k_head_norm weights per layer, so an old state dict needs strict=False.
+        qk_norm: bool = True,
+        qk_norm_type: str = "rms",
         # HQD v2 — cross-query-guided nomination (NSA-style selective sparse attention). At the
         # multirate midpoint, each L0 query scores the CLOSED L3 windows using the 0:3
         # cross-query refiner's TRAINED q/k (per-query, causal — never global_mean), descends
@@ -3642,6 +3662,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_level_role_bias_scale=self.local_attn_level_role_bias_scale,
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
+                        qk_norm=bool(qk_norm),
+                        qk_norm_type=str(qk_norm_type),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_coarse_global=bool(getattr(self, "local_pack_coarse_global", False)),
                         local_pack_l0_coarse_bands=bool(getattr(self, "local_pack_l0_coarse_bands", False)),
@@ -3738,6 +3760,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_attn_level_role_bias_scale=self.local_attn_level_role_bias_scale,
                         local_attn_flash_dtype_cast=self.local_attn_flash_dtype_cast,
                         local_pack_level_bias=bool(getattr(self, "local_pack_level_bias", False)),
+                        qk_norm=bool(qk_norm),
+                        qk_norm_type=str(qk_norm_type),
                         local_pack_lane_merge=bool(getattr(self, "local_pack_lane_merge", False)),
                         local_pack_coarse_global=bool(getattr(self, "local_pack_coarse_global", False)),
                         local_pack_l0_coarse_bands=bool(getattr(self, "local_pack_l0_coarse_bands", False)),
@@ -4029,6 +4053,9 @@ class HierarchicalFlowGAT(nn.Module):
                         pair_keys, self.hier_downward_refresh_every, float(hier_downward_refresh_gate_init))
         self.hier_refresh_compile = bool(hier_refresh_compile)
         self.hier_layer_compile = bool(hier_layer_compile)
+        self.final_norm_fast_path = bool(final_norm_fast_path)
+        if self.final_norm_fast_path:
+            logger.info("Terminal norm active on the fast path (final_norm_fast_path).")
 
         # --- HQD v2: cross-query-guided nomination (see _cross_query_nominate) ---
         self.xq_nominate_enable = bool(xq_nominate_enable)
