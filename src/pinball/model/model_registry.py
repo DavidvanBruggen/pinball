@@ -336,6 +336,11 @@ def build_pinball_model(
         # --- Hierarchy auxiliary (reconstruction) loss ---
         use_aux_loss=bool(getattr(args, "use_aux_loss", False)),
         lambda_hier_aux=float(getattr(args, "lambda_hier_aux", 0.1)),
+        # "jepa_mlp" (default) allocates a 2-layer predictor MLP per level pair whether
+        # or not use_aux_loss is on -- 16.8M params at hidden 1024, dead unless the aux
+        # runs. "mean_mse" allocates none. Was reachable only as a constructor arg until
+        # now, so setting it in a config silently did nothing.
+        hier_aux_mode=str(getattr(args, "hier_aux_mode", "jepa_mlp")),
         hier_aux_loss_mode=str(getattr(args, "hier_aux_loss_mode", "mse")),
         hier_aux_unit_norm=bool(getattr(args, "hier_aux_unit_norm", False)),
         hier_aux_link_l0_target=bool(getattr(args, "hier_aux_link_l0_target", False)),

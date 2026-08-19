@@ -96,6 +96,7 @@ attention_source_gate_debug: true       # 0-dim tensors, one sync per logging in
 xq_nominate_enable: false
 pinball_multirate_enable: false
 use_aux_loss: false
+hier_aux_mode: mean_mse # prevents unused parameters
 token_unet_enable: false
 use_edge_embedding: false
 learn_edge_from_attention: false
