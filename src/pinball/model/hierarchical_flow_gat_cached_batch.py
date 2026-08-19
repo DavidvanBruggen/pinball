@@ -5841,33 +5841,52 @@ class HierarchicalFlowGAT(nn.Module):
                     _tok_rows = torch.nonzero(lvl_packed == 0, as_tuple=False).view(-1)
                     _gm = spec.get("global_block_mask", None)
                     if _gm is not None:
-                        _lane_is_blk = _gm.index_select(0, lane_rows)
-                        flex_perm_local = torch.cat([
-                            lane_rows[_lane_is_blk], lane_rows[~_lane_is_blk], _tok_rows])
+                        # NO LAYOUT AT ALL. The band clause is |r_q - r_k| <= W with
+                        # r = mixed row, so in packed order it already IS the diagonal --
+                        # the only thing a permutation buys is putting the ~170 block rows
+                        # in one contiguous KV run. Prepending them to K/V buys that
+                        # without touching the other 20k rows: key j < G is block row j,
+                        # key j >= G is packed row j-G, and the band clause drops in-block
+                        # keys so each block row is reachable through the prefix only (the
+                        # same exact dedup the OR mask gave). Queries need no gather and
+                        # the output needs no un-permute.
+                        # KV blocks of 64 at N=16384: 3768 for the coarse|token split
+                        # below, 3441 r-sorted with the block moved to the front, 3138
+                        # here. Same harness, r-sorted vs prefix, per layer: 0.675 -> 0.442
+                        # ms fwd, 2.618 -> 2.008 fwd+bwd. The prefix form agrees with the
+                        # permuted one to 1 bf16 ulp and their key sets are exactly equal
+                        # (verified pairwise, both parities of `causal`).
+                        flex_perm_local = torch.arange(int(lvl_packed.numel()),
+                                                       device=perm.device)
+                        spec["flex_kv_prefix"] = spec["global_block"]["rows"]
                     else:
                         flex_perm_local = torch.cat([lane_rows, _tok_rows])
                     spec["flex_perm"] = flex_perm_local.contiguous()          # split pos -> mixed row
                     spec["flex_r_mixed"] = flex_perm_local.contiguous()      # mixed rank per split pos
                     n_lane_rows = int(lane_rows.numel())
-                    ar_split = torch.arange(flex_perm_local.numel(), device=perm.device)
-                    spec["flex_lane_rank"] = torch.where(
-                        ar_split < n_lane_rows, ar_split, torch.zeros_like(ar_split))
-                    spec["flex_is_coarse"] = ar_split < n_lane_rows
+                    # LAYOUT-AGNOSTIC. Derived from the mixed arrays rather than from
+                    # "coarse rows come first", so the band-coherent layout above stays
+                    # correct. Bit-identical to the old positional forms under the
+                    # coarse-first layout: lane_rows is ascending, so a coarse row's split
+                    # position IS its coarse rank, and is_coarse IS position < n_lane.
+                    _crank_all = (lvl_packed > 0).to(torch.long).cumsum(0) - 1
+                    spec["flex_lane_rank"] = _crank_all.clamp_min(0).index_select(
+                        0, flex_perm_local).contiguous()
+                    spec["flex_is_coarse"] = (lvl_packed > 0).index_select(
+                        0, flex_perm_local).contiguous()
                     spec["flex_query_nodes"] = perm.index_select(0, flex_perm_local)
                     spec["flex_n_lane"] = n_lane_rows
-                    # COARSE RANK FOR *EVERY* ROW, not just coarse ones. flex_lane_rank
-                    # above is 0 for token rows, which is fine while the union's coarse
-                    # clause is gated on is_coarse[QUERY] -- but it makes the clause
-                    # unusable for L0 queries. This is the count of coarse rows at or
+                    # COARSE RANK FOR *EVERY* ROW, not just coarse ones -- the same array
+                    # as flex_lane_rank now that it is derived from the mixed cumsum
+                    # instead of split position (which was 0 on token rows and so unusable
+                    # for L0 queries). This is the count of coarse rows at or
                     # before each row in MIXED order, so an L0 query gets the coarse rank
                     # nearest its own position and a radius in coarse-rank space means
                     # the same thing for every query level. Coarse rows are sparse in
                     # position (~1 per 5.6 packed slots here), so R coarse ranks span
                     # ~5.6*R packed slots -- that is the whole point: reach per key is
                     # far cheaper on coarse rows than on tokens.
-                    crank_mixed = (lvl_packed > 0).to(torch.long).cumsum(0) - 1
-                    spec["flex_crank"] = crank_mixed.clamp_min(0).index_select(
-                        0, flex_perm_local).contiguous()
+                    spec["flex_crank"] = spec["flex_lane_rank"]
                     # Global block in SPLIT order, for the unified-softmax clause.
                     if "global_block_mask" in spec:
                         spec["flex_in_global"] = spec["global_block_mask"].index_select(

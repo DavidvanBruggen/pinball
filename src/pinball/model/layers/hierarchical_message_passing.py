@@ -3864,7 +3864,31 @@ class HierarchicalMessagePassing(MessagePassing):
             causal_mask = bool(causal)
             in_glob = spec.get("flex_in_global", None)
 
-            if in_glob is not None:
+            kv_pre = spec.get("flex_kv_prefix", None)
+            if kv_pre is not None and in_glob is not None:
+                # UNIFIED SOFTMAX, PERMUTATION-FREE. Queries stay in packed order (so r is
+                # the row index itself and no gather is needed); K/V get the G block rows
+                # prepended, so key j < G is block row j and key j >= G is packed row j-G.
+                # The band clause drops in-block keys, so each block row is reachable
+                # through the prefix ONLY -- one key, not two, exactly as the OR-dedup in
+                # the permuted form below. Same softmax, one fewer full-size gather in
+                # forward and one fewer scatter in backward.
+                _G = int(kv_pre.numel())
+                _nq = int(perm.numel())
+
+                def mask_mod(b, h, qi, ki):
+                    is_pre = ki < _G
+                    p = (ki - _G).clamp(0, _nq - 1)
+                    dr = qi - p
+                    band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
+                    band = band & (~in_glob[p])
+                    if causal_mask:
+                        # A block row is visible once it has closed (its own packed rank).
+                        glob = qi >= kv_pre[ki.clamp(0, _G - 1)]
+                    else:
+                        glob = ki >= 0
+                    return torch.where(is_pre, glob, band)
+            elif in_glob is not None:
                 # UNIFIED SOFTMAX with a fixed GLOBAL BLOCK. One normalisation over
                 # "local window OR global block". The block is a constant number of rows
                 # (whole levels taken top-down), so this is linear in N -- unlike the
@@ -3914,18 +3938,35 @@ class HierarchicalMessagePassing(MessagePassing):
             # is what produced a 28.1 GiB one-time spike at N=32768 (40272 packed rows) --
             # steady state there is only 12.6 GiB, so the spike, not the kernel, was setting
             # peak memory. Private API, so fall back if the running torch lacks it.
+            # MASK GRANULARITY MUST MATCH THE KERNEL TILE. create_block_mask defaults to
+            # 128, but the kernel below is pinned to 64x64 tiles (shared-memory cap), so a
+            # 128-wide mask block makes the kernel walk 128 keys wherever ANY of them is
+            # live -- half the work in a partial block is thrown away. Matching them cut
+            # computed pairs 20.5M -> 14.1M at N=16384 (2.12x -> 1.46x over the ideal
+            # 9.7M) and the kernel 0.82 -> 0.55 ms fwd, 2.28 -> 1.62 fwd+bwd. Finer still
+            # is not available: BLOCK_N=32 has no valid Triton config on sm_120.
+            _bs = 64 if (perm.is_cuda and n >= 512) else None
+            _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
+            _nkv = n + (int(kv_pre.numel()) if kv_pre is not None else 0)
             try:
-                bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n,
-                                       device=str(perm.device), _compile=True)
+                bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=_nkv,
+                                       device=str(perm.device), _compile=True, **_kw)
             except TypeError:
-                bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n,
-                                       device=str(perm.device))
+                bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=_nkv,
+                                       device=str(perm.device), **_kw)
             spec["flex_block_mask"] = bm
             spec["flex_block_mask_key"] = _bm_key
 
-        q_s = qp.index_select(1, perm).transpose(1, 2)  # [B, H, N, D]
-        k_s = kp.index_select(1, perm).transpose(1, 2)
-        v_s = vp.index_select(1, perm).transpose(1, 2)
+        _pre = spec.get("flex_kv_prefix", None)
+        if _pre is not None:
+            # Identity layout: no q gather, K/V carry the block rows as a prefix.
+            q_s = qp.transpose(1, 2)                                   # [B, H, N, D]
+            k_s = torch.cat([kp.index_select(1, _pre), kp], 1).transpose(1, 2)
+            v_s = torch.cat([vp.index_select(1, _pre), vp], 1).transpose(1, 2)
+        else:
+            q_s = qp.index_select(1, perm).transpose(1, 2)  # [B, H, N, D]
+            k_s = kp.index_select(1, perm).transpose(1, 2)
+            v_s = vp.index_select(1, perm).transpose(1, 2)
 
         # TOKEN-WISE V DROPOUT. flex_attention has no dropout_p (verified: torch 2.7.1
         # exposes score_mod/mask_mod/block_mask/return_lse and nothing else), so this path
