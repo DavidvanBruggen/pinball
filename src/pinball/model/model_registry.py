@@ -210,7 +210,12 @@ def build_pinball_model(
                                  if getattr(args, "local_pack_query_levels", None) else None),
         local_pack_level_bias=bool(getattr(args, "local_pack_level_bias", False)),
         local_pack_coarse_lane=bool(getattr(args, "local_pack_coarse_lane", False)),
-        local_pack_coarse_window=int(getattr(args, "local_pack_coarse_window", 512)),
+        # int (shared window over the whole coarse bank) or list (per-coarse-level radius,
+        # 0 = global for that level). int() here would raise on the list form.
+        local_pack_coarse_window=(
+            list(getattr(args, "local_pack_coarse_window"))
+            if isinstance(getattr(args, "local_pack_coarse_window", None), (list, tuple))
+            else int(getattr(args, "local_pack_coarse_window", 512) or 0)),
         local_pack_coarse_global=bool(getattr(args, "local_pack_coarse_global", False)),
         local_pack_l0_coarse_bands=bool(getattr(args, "local_pack_l0_coarse_bands", False)),
         local_pack_l0_window=int(getattr(args, "local_pack_l0_window", 0)),
@@ -492,6 +497,44 @@ def build_pinball_model(
         int(getattr(args, "num_heads", 6)),
         int(max_seq_len),
     )
+    # Hierarchy sizing / attention-cost audit. Advisory only -- it never raises and never
+    # changes the model. It exists because the coarse bank is a fixed FRACTION of N, so an
+    # all-to-all coarse lane is quadratic however deep the hierarchy is; whether that bites
+    # depends entirely on the configured compression/overlap, which is too settings-specific
+    # to leave to a rule of thumb. See model/hierarchy_plan.py for the derivation.
+    try:
+        from .hierarchy_plan import plan_hierarchy, format_plan
+
+        _plan = plan_hierarchy(
+            n_tokens=int(max_seq_len),
+            compression_ratios=getattr(args, "compression_ratios", [128, 16, 8]),
+            overlap_ratios=getattr(args, "overlap_ratios", [0.5, 0.5, 0.5]),
+            local_pack_window=int(getattr(args, "local_pack_window", 0) or 0),
+            local_pack_coarse_window=(
+                getattr(args, "local_pack_coarse_window", None)
+                if bool(getattr(args, "local_pack_coarse_lane", False)) else None),
+        )
+        logger.info(format_plan(_plan))
+        for _w in _plan.warnings:
+            logger.warning("hierarchy: %s", _w)
+        # local_pack_query_levels must cover the hierarchy. A level that is not a query level
+        # still gets built and still contributes KEYS, but never attends -- so it receives no
+        # packed update at all. Easy to miss when a config written for 4 levels is reused on a
+        # deeper one, and it silently removes the top levels from the model.
+        if bool(getattr(args, "local_pack_cross_level", False)):
+            _n_lvl = len(_plan.sizes)
+            _ql = getattr(args, "local_pack_query_levels", None)
+            _ql = [int(v) for v in _ql] if _ql else [0]
+            _missing = [l for l in range(_n_lvl) if l not in _ql]
+            if _missing:
+                logger.warning(
+                    "hierarchy: local_pack_query_levels=%s omits level(s) %s of %d. Those "
+                    "levels are built and supply keys but never attend, so the packed "
+                    "attention never updates them. Set local_pack_query_levels: %s",
+                    _ql, _missing, _n_lvl, list(range(_n_lvl)))
+    except Exception as _exc:  # pragma: no cover - advisory only, must never break a build
+        logger.debug("hierarchy plan audit skipped: %s", _exc)
+
     model.unified_skeleton_device_cache_enable = bool(getattr(args, "unified_skeleton_device_cache_enable", True))
     if not model.unified_skeleton_device_cache_enable and hasattr(model, "_unified_skeleton_device_cache"):
         model._unified_skeleton_device_cache.clear()

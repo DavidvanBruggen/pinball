@@ -2429,7 +2429,12 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_coarse_lane: bool = False,
         # Lane window in COARSE slots (L1+L2+L3 rows). 896 ~= 4096 tokens of span at
         # strides 8/16/32 (128 L3 + 256 L2 + 512 L1 per span).
-        local_pack_coarse_window: int = 512,
+        # int -> ONE shared window over the whole interleaved coarse bank (legacy).
+        # list -> per-coarse-level radius in that LEVEL's own rank space, 0 = unrestricted.
+        # The list form is what makes global attention affordable: give the intermediate
+        # levels a fixed radius (linear) and leave only the TOP level global, whose n_top^2
+        # stays inside the O(N) budget when n_top <= sqrt(N). See model/hierarchy_plan.py.
+        local_pack_coarse_window: Union[int, List[int], None] = 512,
         # Combine the mixed window + coarse lane for coarse queries as ONE unified softmax
         # over the union of both key sets (log-sum-exp merge of the two flash calls),
         # instead of adding two independently-normalized outputs. Parameter-free and
@@ -2839,7 +2844,21 @@ class HierarchicalFlowGAT(nn.Module):
         ]
         self.local_pack_level_bias = bool(local_pack_level_bias)
         self.local_pack_coarse_lane = bool(local_pack_coarse_lane)
-        self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
+        if isinstance(local_pack_coarse_window, (list, tuple)):
+            # One radius per coarse level; padded/truncated to the configured depth so a
+            # config written for 3 coarse levels still resolves on a deeper hierarchy.
+            _cw = [max(0, int(v)) for v in local_pack_coarse_window]
+            _ncoarse = max(0, int(self.num_hier_levels) - 1)
+            if _ncoarse and _cw:
+                _cw = (_cw + [_cw[-1]] * _ncoarse)[:_ncoarse]
+            self.local_pack_coarse_window_per_level: Optional[List[int]] = _cw
+            # Representative scalar kept for logging/back-compat probes only.
+            self.local_pack_coarse_window = max(_cw) if _cw else 0
+            logger.info(
+                "Packed coarse lane: PER-LEVEL windows %s (0 = global for that level).", _cw)
+        else:
+            self.local_pack_coarse_window_per_level = None
+            self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.local_pack_coarse_global = bool(local_pack_coarse_global)
         self.local_pack_l0_coarse_bands = bool(local_pack_l0_coarse_bands)
@@ -3372,7 +3391,8 @@ class HierarchicalFlowGAT(nn.Module):
         self.hqd_shallow_read_level = int(hqd_shallow_read_level) if int(hqd_shallow_read_level) in (0, 2, 3) else 0
         # Bidirectional coarse routing (option 2): coarse nodes attend among themselves and
         # surface bag<->bag L0 edges. NOT AR-causal (coarse-as-query). Bidi/masked-diffusion only.
-        self.hqd_coarse_route_levels = sorted({int(l) for l in (hqd_coarse_route_levels or []) if int(l) in (1, 2, 3)})
+        self.hqd_coarse_route_levels = sorted({int(l) for l in (hqd_coarse_route_levels or [])
+                                               if 1 <= int(l) < self.num_hier_levels})
         self.hqd_coarse_route_topk = max(1, int(hqd_coarse_route_topk))
         self.hqd_select_inside_message_passing = bool(hqd_select_inside_message_passing)
         self.hqd_graph_witness_enable = bool(hqd_graph_witness_enable)
@@ -3404,12 +3424,15 @@ class HierarchicalFlowGAT(nn.Module):
         # Which parent levels expose L0 bags. [1] = today (L1->L0 direct children).
         # [1,2,3] also builds cross-level L2->L0 / L3->L0 bags so a coarse node can be
         # read and reach its important L0 descendants without descending.
-        self.witness_levels = sorted({int(l) for l in (witness_levels or [1]) if int(l) in (1, 2, 3)}) or [1]
+        self.witness_levels = sorted({int(l) for l in (witness_levels or [1])
+                                     if 1 <= int(l) < self.num_hier_levels}) or [1]
         self.witness_lambda_rare = float(witness_lambda_rare)
         self.witness_score_bias = float(witness_score_bias)
         _read_levels = hqd_read_levels if hqd_read_levels is not None else [0]
-        self.hqd_read_levels = sorted({int(l) for l in _read_levels if 0 <= int(l) <= 3}) or [0]
-        self.hqd_window_bag_levels = sorted({int(l) for l in (hqd_window_bag_levels or []) if int(l) in (1, 2, 3)})
+        self.hqd_read_levels = sorted({int(l) for l in _read_levels
+                                       if 0 <= int(l) < self.num_hier_levels}) or [0]
+        self.hqd_window_bag_levels = sorted({int(l) for l in (hqd_window_bag_levels or [])
+                                             if 1 <= int(l) < self.num_hier_levels})
         _bag_routing = str(hqd_window_bag_routing).strip().lower()
         self.hqd_window_bag_routing = _bag_routing if _bag_routing in {"global", "per_position"} else "global"
         self.hqd_window_bag_topk = max(0, int(hqd_window_bag_topk))
@@ -4036,7 +4059,23 @@ class HierarchicalFlowGAT(nn.Module):
         self.drop_static_cross_level_edges = bool(drop_static_cross_level_edges)
         if self.hier_downward_refresh:
             if hier_downward_refresh_pairs is None:
-                pair_keys = [f"{q}:{m}" for q in range(num_levels - 1) for m in range(q + 1, num_levels)]
+                # All-pairs is O(L^2) projections (6 at 4 levels, 36 at 9 -- 37.8M params at
+                # hidden 1024). Beyond 4 levels, default to the pairs that measurably survive
+                # training instead: gates read off three trained DNA checkpoints show the
+                # 0:m pairs (L0 reading coarse) holding at 0.034-0.090 from an init of 0.1,
+                # while coarse<-coarse decays toward zero and is dead in the longest-trained
+                # run (1:2 = +0.0005, 2:3 = -0.0001). That is the pack already supplying
+                # coarse<->coarse attention, so the gather is redundant there but not into L0.
+                # NOTE this is receiver-based, not adjacency: q:q+1 would keep the dead pairs
+                # and drop the live ones. Set hier_downward_refresh_pairs explicitly to override.
+                if int(num_levels) > 4:
+                    pair_keys = [f"0:{m}" for m in range(1, num_levels)]
+                    logger.info(
+                        "Downward refresh: %d levels -> defaulting to 0:m pairs (%d projections "
+                        "instead of %d all-pairs); coarse<-coarse measured dead.",
+                        int(num_levels), len(pair_keys), num_levels * (num_levels - 1) // 2)
+                else:
+                    pair_keys = [f"{q}:{m}" for q in range(num_levels - 1) for m in range(q + 1, num_levels)]
             else:
                 pair_keys = []
                 for p in hier_downward_refresh_pairs:
@@ -5608,6 +5647,11 @@ class HierarchicalFlowGAT(nn.Module):
         if int(lvl.numel()) != n_total or n_total <= 1:
             return None
         num_levels = max(1, int(lvl.max().item()) + 1)
+        # Level count for the spec's per-level arrays. Prefer the CONFIGURED count over the
+        # observed max: a short input can leave the top levels empty, and sizing level_rows
+        # by the observed max would silently drop them from the packed attention.
+        _n_lvl = max(int(getattr(self, "num_hier_levels", num_levels)), num_levels)
+        _max_lvl = _n_lvl - 1
         if bool(getattr(self, "hier_ar_allow_same_time", True)):
             # coarse first at equal close time: L1 < L2 < L3 < L0-token
             tie = torch.where(lvl > 0, lvl - 1, torch.full_like(lvl, num_levels - 1))
@@ -5631,7 +5675,9 @@ class HierarchicalFlowGAT(nn.Module):
             "num_nodes": n_total,
             "perm": perm,
             "pos": pos,
-            "levels": lvl_packed.clamp(0, 3).contiguous(),  # per packed row, for the K/V level tags
+            # per packed row, for the K/V level tags. Clamped to the configured level
+            # count (was a hardcoded 3, which silently merged L4+ into L3 on a deep hierarchy).
+            "levels": lvl_packed.clamp(0, _max_lvl).contiguous(),
             # Packed ROW indices per level, precomputed once per skeleton. Consumers must
             # use these rather than calling (levels == L).nonzero() in the layer loop:
             # nonzero() has a data-dependent output shape, so it forces a torch.compile
@@ -5639,7 +5685,7 @@ class HierarchicalFlowGAT(nn.Module):
             # Same reason lane_perm is built here instead of in _apply_local_pack_out.
             "level_rows": [
                 (lvl_packed == L).nonzero(as_tuple=False).view(-1).contiguous()
-                for L in range(4)
+                for L in range(_n_lvl)
             ],
             "query_sel": sel,
             "query_nodes": perm.index_select(0, sel),
@@ -5659,14 +5705,48 @@ class HierarchicalFlowGAT(nn.Module):
         # lane window is denominated in COARSE slots — wide lateral reach at coarse density
         # prices. Queries: coarse levels that are packed-mode (in query_levels); keys: all.
         lane_q_levels = tuple(l for l in q_levels if int(l) > 0)
+        # PER-LEVEL LANE (local_pack_coarse_window as a list). One same-level attention per
+        # coarse level, with its radius in that level's OWN rank space; radius 0 = global.
+        # This is what decouples cost from depth: intermediate levels stay linear at a fixed
+        # radius, and only the top level is all-to-all, costing n_top^2 -- affordable exactly
+        # when n_top <= sqrt(N). The shared-window branch below is the legacy path and is
+        # kept bit-identical for reproducing existing checkpoints.
+        #
+        # level_rows is already the per-level packed-row list in close-time order, so a row's
+        # index WITHIN it is its rank at that level -- no extra bookkeeping, and no nonzero()
+        # in the layer loop (data-dependent shape -> compile graph break).
+        _cw_per_level = getattr(self, "local_pack_coarse_window_per_level", None)
         if (
+            bool(getattr(self, "local_pack_coarse_lane", False))
+            and len(lane_q_levels) > 0
+            and _cw_per_level is not None
+        ):
+            plans = []
+            for lv in lane_q_levels:
+                rows_l = spec["level_rows"][int(lv)] if int(lv) < len(spec["level_rows"]) else None
+                if rows_l is None or int(rows_l.numel()) <= 1:
+                    continue  # empty or single-node level: nothing to attend over
+                r = int(_cw_per_level[int(lv) - 1]) if int(lv) - 1 < len(_cw_per_level) else 0
+                plans.append({
+                    "level": int(lv),
+                    "rows": rows_l,                                   # packed rows, level order
+                    "nodes": perm.index_select(0, rows_l),            # -> original node ids
+                    "pos": pos.index_select(0, rows_l).contiguous(),
+                    "window": int(r) if r > 0 else int(rows_l.numel()),  # 0 -> global
+                    "global": r <= 0,
+                })
+                if "pos_nd" in spec:
+                    plans[-1]["pos_nd"] = spec["pos_nd"].index_select(0, rows_l).contiguous()
+            if plans:
+                spec["lane_per_level"] = plans
+        elif (
             bool(getattr(self, "local_pack_coarse_lane", False))
             and len(lane_q_levels) > 0
             and int(getattr(self, "local_pack_coarse_window", 0)) > 0
         ):
             lane_rows = torch.nonzero(lvl_packed > 0, as_tuple=False).view(-1)
             if lane_rows.numel() > 1:
-                lane_levels = lvl_packed.index_select(0, lane_rows).clamp(0, 3).contiguous()
+                lane_levels = lvl_packed.index_select(0, lane_rows).clamp(0, _max_lvl).contiguous()
                 lane_sel_mask = torch.zeros_like(lane_levels, dtype=torch.bool)
                 for l in lane_q_levels:
                     lane_sel_mask |= lane_levels == int(l)
@@ -5724,7 +5804,7 @@ class HierarchicalFlowGAT(nn.Module):
                     crank_mixed = (lvl_packed > 0).to(torch.long).cumsum(0) - 1
                     spec["flex_crank"] = crank_mixed.clamp_min(0).index_select(
                         0, flex_perm_local).contiguous()
-                    spec["flex_levels"] = lvl_packed.clamp(0, 3).index_select(
+                    spec["flex_levels"] = lvl_packed.clamp(0, _max_lvl).index_select(
                         0, flex_perm_local).contiguous()
         self._local_pack_spec_cache = (key, spec)
         return spec
@@ -10569,7 +10649,10 @@ class HierarchicalFlowGAT(nn.Module):
             direct = latest[1] if fresh else None
         else:
             direct = getattr(mp, "_last_graph_witness_ids", None) if mp is not None else None
-        if not isinstance(direct, dict) or not all(level in direct for level in (1, 2, 3)):
+        # Every coarse level must be present (a partial-active-levels layer may not produce
+        # every level's block). Bound by the configured depth, not a hardcoded 1..3.
+        _need = range(1, int(getattr(self, "num_hier_levels", 4)))
+        if not isinstance(direct, dict) or not all(level in direct for level in _need):
             return None
 
         device = x_bnh.device
@@ -11001,10 +11084,12 @@ class HierarchicalFlowGAT(nn.Module):
         # Witness packets: per-L1-node L0 pointers, recomputed each call from current
         # features (NOT cached in the feature-agnostic skeleton). Force-included into the
         # final-stage candidate scores so important/rare children survive top-k pruning.
-        read_coarse_levels = {int(l) for l in getattr(self, "hqd_read_levels", [0]) if int(l) in (1, 2, 3)}
+        read_coarse_levels = {int(l) for l in getattr(self, "hqd_read_levels", [0])
+                              if 1 <= int(l) < self.num_hier_levels}
         # Per-level window bag (lateral reach): accumulate the L0 routing's per-level
         # selections, then scatter them back to each level's own nodes after the loop.
-        bag_levels = [int(l) for l in getattr(self, "hqd_window_bag_levels", []) if int(l) in (1, 2, 3)] if hqd_query_level == 0 else []
+        bag_levels = ([int(l) for l in getattr(self, "hqd_window_bag_levels", [])
+                       if 1 <= int(l) < self.num_hier_levels] if hqd_query_level == 0 else [])
         bag_routing = str(getattr(self, "hqd_window_bag_routing", "global"))
         if bag_levels and bag_routing == "global" and causal and not bool(getattr(self, "_hqd_bag_global_causal_warned", False)):
             logger.warning(
@@ -11112,7 +11197,8 @@ class HierarchicalFlowGAT(nn.Module):
                 and not hqd_handoff_to_l0
                 and not bool(getattr(self, "hqd_include_local_window", False))
                 and int(getattr(self, "hqd_local_window_size", 0)) <= 0
-                and not [l for l in getattr(self, "hqd_coarse_route_levels", []) or [] if int(l) in (1, 2, 3)]
+                and not [l for l in getattr(self, "hqd_coarse_route_levels", []) or []
+                     if 1 <= int(l) < self.num_hier_levels]
             )
             if not simple:
                 if not bool(getattr(self, "_hqd_static_fallback_logged", False)):
@@ -11635,7 +11721,8 @@ class HierarchicalFlowGAT(nn.Module):
         # same-level neighbours (cheap: few nodes), and matched pairs surface bag<->bag L0
         # edges. NOT AR-causal (a coarse node queries with its full-span vector), so it is
         # gated to non-causal (masked-diffusion / bidirectional) runs only.
-        coarse_route_levels = [int(l) for l in getattr(self, "hqd_coarse_route_levels", []) if int(l) in (1, 2, 3)]
+        coarse_route_levels = [int(l) for l in getattr(self, "hqd_coarse_route_levels", [])
+                               if 1 <= int(l) < self.num_hier_levels]
         if coarse_route_levels and causal:
             if not bool(getattr(self, "_hqd_coarse_route_causal_warned", False)):
                 logger.warning(
@@ -13103,12 +13190,13 @@ class HierarchicalFlowGAT(nn.Module):
                 # Harvest the packed lane's backbone witness capture (detached ids/logits),
                 # stamped with this forward's witness epoch so later HQD layers can build
                 # their table from it and a stale capture (previous step) is never used.
-                # Levels 1..3 must all be present (a partial-active-levels layer may not
-                # produce every level's block).
+                # Every coarse level must be present (a partial-active-levels layer may
+                # not produce every level's block).
                 mp_h = getattr(transformer, "message_passing", None)
                 if mp_h is not None and bool(getattr(mp_h, "hqd_backbone_witness_capture", False)):
                     _cap_ids = getattr(mp_h, "_last_backbone_witness_ids", None)
-                    if isinstance(_cap_ids, dict) and all(l in _cap_ids for l in (1, 2, 3)):
+                    _need_l = range(1, int(getattr(self, "num_hier_levels", 4)))
+                    if isinstance(_cap_ids, dict) and all(l in _cap_ids for l in _need_l):
                         self._backbone_witness_latest = (
                             int(getattr(self, "_witness_build_epoch", 0)),
                             _cap_ids,

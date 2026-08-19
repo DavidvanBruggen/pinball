@@ -673,19 +673,22 @@ class HierarchicalMessagePassing(MessagePassing):
         # hierarchy's summary of it.
         _nd = [0.0, 0.0, 0.0, 0.0]
         _base = max(0.0, min(1.0, float(hier_node_dropout)))
+        _nlev = max(1, int(num_local_levels))
         if _base > 0.0:
-            _nd = [0.0, _base, _base, _base]
+            _nd = [0.0] + [_base] * (_nlev - 1)
         if hier_node_dropout_per_level is not None:
             _pl = list(hier_node_dropout_per_level)
             _nd = [0.0 if i == 0 else max(0.0, min(1.0, float(_pl[i])))
-                   if i < len(_pl) else 0.0 for i in range(4)]
+                   if i < len(_pl) else 0.0 for i in range(_nlev)]
         self.hier_node_dropout_rates = _nd
         self.hier_node_dropout_active = any(r > 0.0 for r in _nd)
         self.local_pack_bidirectional = bool(local_pack_bidirectional)
         self.local_pack_rope_axial = bool(local_pack_rope_axial)
         if self.local_pack_level_bias:
-            self.local_pack_level_k_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
-            self.local_pack_level_v_emb = nn.Parameter(torch.zeros(4, self.num_heads, self.head_dim))
+            self.local_pack_level_k_emb = nn.Parameter(
+                torch.zeros(_nlev, self.num_heads, self.head_dim))
+            self.local_pack_level_v_emb = nn.Parameter(
+                torch.zeros(_nlev, self.num_heads, self.head_dim))
         self.hqd_read_prerope = bool(hqd_read_prerope)
         # Zero-value sink key for the packed fetch read: zero init = sink logit 0 for every
         # query (a neutral extra softmax slot), so the model learns per-head/per-query how
@@ -881,7 +884,9 @@ class HierarchicalMessagePassing(MessagePassing):
                 self.out_proj_attn_level.append(nn.Linear(d, hidden_dim))
 
         # Level embedding
-        self.level_embedding = nn.Embedding(4, level_dim)  # 4 levels: L0, L1, L2, L3
+        # One row per hierarchy level (was hardcoded to 4). Identical at the 4-level
+        # default; deeper hierarchies need the extra rows.
+        self.level_embedding = nn.Embedding(max(1, int(num_local_levels)), level_dim)
 
         # Per-level cross-level (backbone + HQD) Q/K/V. Default "shared" reuses the single
         # q/k/v_proj (current behaviour). The other modes route each node through its LEVEL's
@@ -2506,7 +2511,8 @@ class HierarchicalMessagePassing(MessagePassing):
             and node_level is not None
             and int(node_level.numel()) == int(num_nodes)
         ):
-            _nl = node_level.to(device=k_hqd.device, dtype=torch.long).clamp(0, 3)
+            _nl = node_level.to(device=k_hqd.device, dtype=torch.long).clamp(
+                0, int(self.num_local_levels) - 1)
             k_hqd = k_hqd + self.local_pack_level_k_emb.index_select(0, _nl).unsqueeze(0).to(k_hqd.dtype)
             v_hqd = v_hqd + self.local_pack_level_v_emb.index_select(0, _nl).unsqueeze(0).to(v_hqd.dtype)
 
@@ -3096,7 +3102,7 @@ class HierarchicalMessagePassing(MessagePassing):
             score_e = weights.detach().mean(dim=-1)  # [B, E]
             ids_by_level: Dict[int, torch.Tensor] = {}
             scores_by_level: Dict[int, torch.Tensor] = {}
-            for level in (1, 2, 3):
+            for level in range(1, int(self.num_local_levels)):
                 mask = (dst_l == int(level)) & (src_l == int(level - 1))
                 if not bool(mask.any()):
                     continue
@@ -3948,7 +3954,8 @@ class HierarchicalMessagePassing(MessagePassing):
         # surfaced as the "cannot trace Tensor.index_add_" warning, which the
         # control config does not emit). These ints are static at trace time.
         fusedlv = []
-        for lv in (1, 2, 3):
+        _coarse_lvs = tuple(range(1, min(int(self.num_local_levels), len(lvlrows))))
+        for lv in _coarse_lvs:
             n = int(lvlrows[lv].numel())
             rr = radii[lv - 1] if len(radii) >= lv else max(1, n // 4)
             if n > 0 and int(rr) > 0 and not causal and (2 * int(rr) + 1) >= n:
@@ -3962,7 +3969,7 @@ class HierarchicalMessagePassing(MessagePassing):
                 int(fr.numel()), False, dp))
         else:
             fusedlv = []
-        for lv in (1, 2, 3):
+        for lv in _coarse_lvs:
             if lv in fusedlv:
                 continue
             rows = lvlrows[lv]
@@ -4162,6 +4169,67 @@ class HierarchicalMessagePassing(MessagePassing):
                                contrib[:, _coarse_q].to(dtype=out.dtype))
         else:
             out.index_add_(1, tgt, contrib.to(dtype=out.dtype))
+
+        # PER-LEVEL COARSE LANE (local_pack_coarse_window given as a list). One same-level
+        # attention per coarse level, each with its radius in that LEVEL's own rank space and
+        # radius 0 meaning global. Replaces the single shared-bank lane below.
+        #
+        # Why per level rather than one window over the interleaved bank: the bank is a fixed
+        # FRACTION of N, so one all-to-all window over it is quadratic no matter how deep the
+        # hierarchy goes. Windowing each level and leaving only the TOP global costs
+        # sum(n_l * w_l) + n_top^2, which is linear whenever n_top <= sqrt(N).
+        #
+        # Behaviour note: this makes the lane SAME-LEVEL only. Cross-level coarse mixing still
+        # happens in the mixed window above (and through the global top level), but it is no
+        # longer part of the lane -- the scalar form remains available if that matters.
+        _lane_plans = spec.get("lane_per_level", None)
+        if _lane_plans:
+            for _plan in _lane_plans:
+                rows_l = _plan["rows"]
+                n_l = int(rows_l.numel())
+                ql = q_pre.index_select(1, rows_l)
+                kl = k_pre.index_select(1, rows_l)
+                vl = v.index_select(1, rows_l)
+                _pnd = _plan.get("pos_nd", None) if pos_nd is not None else None
+                if hasattr(self, "rotary_pos_enc") and _pnd is not None:
+                    nd = int(_pnd.size(-1))
+                    rep = _pnd.view(1, n_l, nd).expand(B, n_l, nd).reshape(B * n_l, nd)
+                    ql = self.rotary_pos_enc.apply_rotary_pos_emb(
+                        ql.reshape(B * n_l, self.num_heads, self.head_dim), rep
+                    ).view(B, n_l, self.num_heads, self.head_dim)
+                    kl = self.rotary_pos_enc.apply_rotary_pos_emb(
+                        kl.reshape(B * n_l, self.num_heads, self.head_dim), rep
+                    ).view(B, n_l, self.num_heads, self.head_dim)
+                elif hasattr(self, "rotary_pos_enc"):
+                    rep = _plan["pos"].view(1, n_l).expand(B, n_l).reshape(-1)
+                    ql = self.rotary_pos_enc.apply_rotary_pos_emb(
+                        ql.reshape(B * n_l, self.num_heads, self.head_dim), rep
+                    ).view(B, n_l, self.num_heads, self.head_dim)
+                    kl = self.rotary_pos_enc.apply_rotary_pos_emb(
+                        kl.reshape(B * n_l, self.num_heads, self.head_dim), rep
+                    ).view(B, n_l, self.num_heads, self.head_dim)
+                # Level tag is constant within a level, so index a single row rather than
+                # gathering one per node.
+                if getattr(self, "local_pack_level_bias", False):
+                    _li = min(int(_plan["level"]), int(self.local_pack_level_k_emb.size(0)) - 1)
+                    kl = kl + self.local_pack_level_k_emb[_li].unsqueeze(0).unsqueeze(0).to(kl.dtype)
+                    vl = vl + self.local_pack_level_v_emb[_li].unsqueeze(0).unsqueeze(0).to(vl.dtype)
+                if node_keep is not None:
+                    vl = vl * node_keep.index_select(1, rows_l)
+                out_l = self._compute_local_attn_from_qkv(
+                    q_lvl=ql, k_lvl=kl, v_lvl=vl,
+                    window=int(_plan["window"]), causal=pack_causal,
+                    backend=str(spec.get("backend", "sdpa")), level=-2,
+                )
+                if out_l is None:
+                    continue
+                if source_gates is not None:
+                    out_l = source_gates["local"] * out_l
+                out.index_add_(1, _plan["nodes"], out_l.to(dtype=out.dtype))
+        # No early return: the shared-lane block below is skipped automatically because the
+        # per-level spec sets "lane_per_level" and never "lane_perm" (the two are mutually
+        # exclusive in _local_pack_build_spec), and the coarse_global / L0-band blocks after
+        # it must still run.
 
         # Coarse lane: second packed window (causal in AR mode, two-sided in bidi) over ONLY
         # the coarse rows (close-time order preserved by construction), restoring wide coarse
