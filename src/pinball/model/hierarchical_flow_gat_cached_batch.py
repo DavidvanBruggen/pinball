@@ -2442,6 +2442,17 @@ class HierarchicalFlowGAT(nn.Module):
         # local_pack_coarse_window -- and the per-level split measured 1.8x SLOWER at 4096
         # because six small flash calls are launch-bound, not FLOP-bound.
         local_pack_top_global: bool = False,
+        # Fixed-size GLOBAL BLOCK, filled top-down by whole levels. Take the top level; if it
+        # fits in the budget add the next level down whole; repeat. Every pack query then
+        # attends to that block IN ADDITION to its local window.
+        #
+        # Why a fixed budget rather than a rank window: the coarse bank is a fixed FRACTION
+        # of N, so "all coarse" (the lane, or flexhier's rank window) is quadratic. A budget
+        # is a CONSTANT, so the term is pack*B -- linear -- and it degrades exactly the right
+        # way: at short N the whole coarse bank fits and every upper level is fully visible;
+        # at long N it narrows to the top level alone. Pair it with a level count chosen so
+        # n_top <= B, otherwise nothing fits and the block is empty.
+        local_pack_global_block: int = 0,
         # Combine the mixed window + coarse lane for coarse queries as ONE unified softmax
         # over the union of both key sets (log-sum-exp merge of the two flash calls),
         # instead of adding two independently-normalized outputs. Parameter-free and
@@ -2866,6 +2877,7 @@ class HierarchicalFlowGAT(nn.Module):
         else:
             self.local_pack_coarse_window_per_level = None
             self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
+        self.local_pack_global_block = max(0, int(local_pack_global_block or 0))
         self.local_pack_top_global = bool(local_pack_top_global)
         if self.local_pack_top_global:
             logger.info("Packed coarse lane: global TOP level attention enabled "
@@ -5704,6 +5716,33 @@ class HierarchicalFlowGAT(nn.Module):
             "window": window,
             "backend": backend,
         }
+        # GLOBAL BLOCK (local_pack_global_block): whole levels top-down while they fit the
+        # budget. Rows are concatenated top-level-first and kept contiguous so the flex mask
+        # clause stays block-coherent; the additive path just uses them as a key set.
+        _B = int(getattr(self, "local_pack_global_block", 0) or 0)
+        if _B > 0:
+            _blk, _tot, _lvls = [], 0, []
+            for _lv in range(len(spec["level_rows"]) - 1, 0, -1):
+                _r = spec["level_rows"][_lv]
+                _n = int(_r.numel())
+                if _n == 0:
+                    continue
+                if _tot + _n > _B:
+                    break
+                _blk.append(_r); _tot += _n; _lvls.append(_lv)
+            if _blk:
+                _rows = torch.cat(_blk)
+                spec["global_block"] = {
+                    "rows": _rows,                                  # packed rows in the block
+                    "nodes": perm.index_select(0, _rows),
+                    "levels": sorted(_lvls),
+                    "budget": _B,
+                }
+                # Boolean over MIXED rows; the flex consumer reindexes it to split order.
+                _mask = torch.zeros(n_total, dtype=torch.bool, device=perm.device)
+                _mask[_rows] = True
+                spec["global_block_mask"] = _mask
+
         # Axial ND RoPE (local_pack_rope_axial): true ND coords per packed row (curve mode).
         # The layer re-RoPEs q/k with exact spatial offsets instead of 1D close-time index;
         # missing pos_nd (text runs, AE-extended graphs) keeps the 1D behavior.
@@ -5792,7 +5831,21 @@ class HierarchicalFlowGAT(nn.Module):
                 # arrays: r = rank in the mixed packing, lane = rank in the coarse region.
                 # Requires all levels queried (guarded at the consumer).
                 if bool(getattr(self, "local_pack_flex_union", False)):
-                    flex_perm_local = torch.cat([lane_rows, torch.nonzero(lvl_packed == 0, as_tuple=False).view(-1)])
+                    # Layout: [global block | remaining coarse | tokens]. The block rows go
+                    # FIRST so the "in_global" clause hits a contiguous KV prefix. In close-time
+                    # order they interleave with the rest of the bank -- measured 168 rows
+                    # scattered into 127 runs touching 58 KV blocks of 64 instead of 3, a 19x
+                    # block-sparsity waste that flex pays on every query. The band clause is
+                    # unaffected in MEANING (it reads ranks from flex_r_mixed, not row order),
+                    # and unaffected in practice because the block is <1% of rows.
+                    _tok_rows = torch.nonzero(lvl_packed == 0, as_tuple=False).view(-1)
+                    _gm = spec.get("global_block_mask", None)
+                    if _gm is not None:
+                        _lane_is_blk = _gm.index_select(0, lane_rows)
+                        flex_perm_local = torch.cat([
+                            lane_rows[_lane_is_blk], lane_rows[~_lane_is_blk], _tok_rows])
+                    else:
+                        flex_perm_local = torch.cat([lane_rows, _tok_rows])
                     spec["flex_perm"] = flex_perm_local.contiguous()          # split pos -> mixed row
                     spec["flex_r_mixed"] = flex_perm_local.contiguous()      # mixed rank per split pos
                     n_lane_rows = int(lane_rows.numel())
@@ -5815,6 +5868,10 @@ class HierarchicalFlowGAT(nn.Module):
                     crank_mixed = (lvl_packed > 0).to(torch.long).cumsum(0) - 1
                     spec["flex_crank"] = crank_mixed.clamp_min(0).index_select(
                         0, flex_perm_local).contiguous()
+                    # Global block in SPLIT order, for the unified-softmax clause.
+                    if "global_block_mask" in spec:
+                        spec["flex_in_global"] = spec["global_block_mask"].index_select(
+                            0, flex_perm_local).contiguous()
                     spec["flex_levels"] = lvl_packed.clamp(0, _max_lvl).index_select(
                         0, flex_perm_local).contiguous()
         # Global TOP level (local_pack_top_global). Only the topmost coarse level, so the

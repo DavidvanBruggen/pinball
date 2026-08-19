@@ -2,6 +2,7 @@
 # Copyright (C) 2026 David van Bruggen
 # Part of Pinball — a hierarchical graph transformer for efficient long-context sequence modeling.
 # Licensed under the GNU GPL v3.0 (see LICENSE). Please cite via CITATION.cff.
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -125,7 +126,19 @@ def _pick_attention_backend_cached(device_index: int, cap_major: int, cap_minor:
 
     if cap >= (8, 0):
         fa3_exc = None
+        # FlashAttention-3 is HOPPER-ONLY (sm_90). Its kernels are not built for any other
+        # arch, and on a card it does not support the launch fails with "no kernel image is
+        # available" -- which ABORTS THE PROCESS rather than raising, so _smoke_test_flash_attn
+        # below cannot catch it (verified on sm_120: the interpreter dies before stdout is
+        # even flushed). The smoke test is therefore not a sufficient guard; fa3 must not be
+        # attempted off Hopper at all. Set PINBALL_ALLOW_FA3_ANY_ARCH=1 to override.
+        _fa3_ok_arch = cap[0] == 9 or os.environ.get("PINBALL_ALLOW_FA3_ANY_ARCH", "") == "1"
+        if not _fa3_ok_arch:
+            fa3_exc = RuntimeError(
+                f"skipped: FlashAttention-3 is Hopper-only (sm_90), device is sm_{cap[0]}{cap[1]}")
         try:
+            if not _fa3_ok_arch:
+                raise fa3_exc
             from flash_attn_interface import flash_attn_func
         except Exception as exc:
             fa3_exc = exc
@@ -3835,7 +3848,9 @@ class HierarchicalMessagePassing(MessagePassing):
         perm = spec["flex_perm"]
         # Cache per (causal, coarse-rank radius): both change the mask, and the spec
         # itself is cached per skeleton so a stale BlockMask would silently survive.
-        _bm_key = (bool(causal), int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0))
+        _bm_key = (bool(causal),
+                   int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0),
+                   int(getattr(self, "local_pack_global_block", 0) or 0))
         bm = spec.get("flex_block_mask") if spec.get("flex_block_mask_key") == _bm_key else None
         if bm is None:
             r = spec["flex_r_mixed"]
@@ -3847,8 +3862,23 @@ class HierarchicalMessagePassing(MessagePassing):
             crank = spec.get("flex_crank", None)
             w_l0c = int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0)
             causal_mask = bool(causal)
+            in_glob = spec.get("flex_in_global", None)
 
-            if crank is not None and w_l0c > 0:
+            if in_glob is not None:
+                # UNIFIED SOFTMAX with a fixed GLOBAL BLOCK. One normalisation over
+                # "local window OR global block". The block is a constant number of rows
+                # (whole levels taken top-down), so this is linear in N -- unlike the
+                # coarse-rank clause below, whose key set is a fixed FRACTION of N and is
+                # therefore quadratic. OR semantics dedup exactly: a block row that also
+                # falls in the local window is ONE key, not two with a +ln2 advantage.
+                def mask_mod(b, h, qi, ki):
+                    dr = r[qi] - r[ki]
+                    band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
+                    # Causal: a block row is only visible once it has closed.
+                    glob = (in_glob[ki] & (dr >= 0)) if causal_mask else in_glob[ki]
+                    return band | glob
+            elif crank is not None and w_l0c > 0:
+
                 # GENERALISED UNION. Two changes from the original clause:
                 #   isc[qi] & isc[ki]  ->  isc[ki]      L0 queries may read coarse too
                 #   one-sided dr/dl    ->  |dr|, |dl|   two-sided when the pack is bidi
@@ -3879,8 +3909,17 @@ class HierarchicalMessagePassing(MessagePassing):
                     return band | coarse
 
             n = int(perm.numel())
-            bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n,
-                                   device=str(perm.device))
+            # _compile=True builds the block mask with a compiled sweep instead of
+            # materialising the mask over the full Q_LEN x KV_LEN grid. That materialisation
+            # is what produced a 28.1 GiB one-time spike at N=32768 (40272 packed rows) --
+            # steady state there is only 12.6 GiB, so the spike, not the kernel, was setting
+            # peak memory. Private API, so fall back if the running torch lacks it.
+            try:
+                bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n,
+                                       device=str(perm.device), _compile=True)
+            except TypeError:
+                bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n,
+                                       device=str(perm.device))
             spec["flex_block_mask"] = bm
             spec["flex_block_mask_key"] = _bm_key
 
@@ -4438,6 +4477,35 @@ class HierarchicalMessagePassing(MessagePassing):
                 if source_gates is not None:
                     _c = source_gates["local"] * _c
                 out.index_add_(1, perm.index_select(0, _l0_rows), _c.to(dtype=out.dtype))
+
+        # GLOBAL BLOCK (local_pack_global_block), additive form. Same term as coarse_global
+        # below, but the key set is the fixed top-down budget rather than the WHOLE coarse
+        # bank -- which is what turns it from quadratic (bank is a fixed fraction of N) into
+        # linear (budget is a constant). Query set is every pack row, not just L0, so coarse
+        # levels also get the global view. Shares coarse_global_gate (init 0.0 = exact
+        # identity), so it can be switched on mid-run without disturbing trained weights.
+        _gblk = spec.get("global_block", None)
+        if _gblk is not None and hasattr(self, "coarse_global_gate"):
+            k_rows = _gblk["rows"]
+            q_rows = sel                                  # all packed query rows
+            if int(k_rows.numel()) > 0 and int(q_rows.numel()) > 0:
+                q_g = qp.index_select(1, q_rows).permute(0, 2, 1, 3)
+                k_g = kp.index_select(1, k_rows).permute(0, 2, 1, 3)
+                v_g = vp.index_select(1, k_rows).permute(0, 2, 1, 3)
+                bias = None
+                if pack_causal:
+                    bias = (k_rows.view(1, -1) <= q_rows.view(-1, 1)).view(
+                        1, 1, int(q_rows.numel()), int(k_rows.numel()))
+                out_g = F.scaled_dot_product_attention(
+                    q_g, k_g, v_g, attn_mask=bias,
+                    dropout_p=float(self.dropout.p) if self.training else 0.0,
+                )
+                out_g = torch.nan_to_num(out_g, nan=0.0)
+                out_g = out_g.permute(0, 2, 1, 3).reshape(B, int(q_rows.numel()), -1)
+                c_g = self.out_proj(out_g) * self.coarse_global_gate.to(out_g.dtype)
+                if source_gates is not None:
+                    c_g = source_gates["local"] * c_g
+                out.index_add_(1, perm.index_select(0, q_rows), c_g.to(dtype=out.dtype))
 
         if bool(getattr(self, "local_pack_coarse_global", False)) and lvl_packed is not None:
             l0_rows = (lvl_packed == 0).nonzero(as_tuple=False).view(-1)
