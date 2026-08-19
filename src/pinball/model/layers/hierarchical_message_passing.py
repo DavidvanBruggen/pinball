@@ -4182,6 +4182,57 @@ class HierarchicalMessagePassing(MessagePassing):
         # Behaviour note: this makes the lane SAME-LEVEL only. Cross-level coarse mixing still
         # happens in the mixed window above (and through the global top level), but it is no
         # longer part of the lane -- the scalar form remains available if that matters.
+        # GLOBAL TOP LEVEL (local_pack_top_global). One all-to-all over the topmost coarse
+        # level only, additive to whatever lane runs. This is the cheap way to buy global
+        # reach: the shared lane below stays windowed (linear, ONE kernel) and this term costs
+        # n_top^2, which the sqrt(N) rule keeps inside the O(N) budget. Two kernels total.
+        #
+        # Measured: splitting the lane per level instead costs 1.8x at 4096 (593 ms vs 323 ms)
+        # -- six small flash calls are launch-bound, not FLOP-bound, so they lose despite
+        # doing strictly less work. Expanding the shared window to cover the top level is not
+        # an alternative: the bank is interleaved, so a window wide enough to reach every top
+        # node also makes L1 all-to-all, which is the quadratic term being removed.
+        _topg = spec.get("top_global", None)
+        if _topg is not None:
+            rows_t = _topg["rows"]
+            n_t = int(rows_t.numel())
+            qt = q_pre.index_select(1, rows_t)
+            kt = k_pre.index_select(1, rows_t)
+            vt = v.index_select(1, rows_t)
+            _tnd = _topg.get("pos_nd", None) if pos_nd is not None else None
+            if hasattr(self, "rotary_pos_enc") and _tnd is not None:
+                nd = int(_tnd.size(-1))
+                rep = _tnd.view(1, n_t, nd).expand(B, n_t, nd).reshape(B * n_t, nd)
+                qt = self.rotary_pos_enc.apply_rotary_pos_emb(
+                    qt.reshape(B * n_t, self.num_heads, self.head_dim), rep
+                ).view(B, n_t, self.num_heads, self.head_dim)
+                kt = self.rotary_pos_enc.apply_rotary_pos_emb(
+                    kt.reshape(B * n_t, self.num_heads, self.head_dim), rep
+                ).view(B, n_t, self.num_heads, self.head_dim)
+            elif hasattr(self, "rotary_pos_enc"):
+                rep = _topg["pos"].view(1, n_t).expand(B, n_t).reshape(-1)
+                qt = self.rotary_pos_enc.apply_rotary_pos_emb(
+                    qt.reshape(B * n_t, self.num_heads, self.head_dim), rep
+                ).view(B, n_t, self.num_heads, self.head_dim)
+                kt = self.rotary_pos_enc.apply_rotary_pos_emb(
+                    kt.reshape(B * n_t, self.num_heads, self.head_dim), rep
+                ).view(B, n_t, self.num_heads, self.head_dim)
+            if getattr(self, "local_pack_level_bias", False):
+                _ti = min(int(_topg["level"]), int(self.local_pack_level_k_emb.size(0)) - 1)
+                kt = kt + self.local_pack_level_k_emb[_ti].unsqueeze(0).unsqueeze(0).to(kt.dtype)
+                vt = vt + self.local_pack_level_v_emb[_ti].unsqueeze(0).unsqueeze(0).to(vt.dtype)
+            if node_keep is not None:
+                vt = vt * node_keep.index_select(1, rows_t)
+            out_t = self._compute_local_attn_from_qkv(
+                q_lvl=qt, k_lvl=kt, v_lvl=vt,
+                window=n_t, causal=pack_causal,
+                backend=str(spec.get("backend", "sdpa")), level=-2,
+            )
+            if out_t is not None:
+                if source_gates is not None:
+                    out_t = source_gates["local"] * out_t
+                out.index_add_(1, _topg["nodes"], out_t.to(dtype=out.dtype))
+
         _lane_plans = spec.get("lane_per_level", None)
         if _lane_plans:
             for _plan in _lane_plans:

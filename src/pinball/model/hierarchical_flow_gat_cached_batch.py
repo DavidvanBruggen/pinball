@@ -2435,6 +2435,13 @@ class HierarchicalFlowGAT(nn.Module):
         # levels a fixed radius (linear) and leave only the TOP level global, whose n_top^2
         # stays inside the O(N) budget when n_top <= sqrt(N). See model/hierarchy_plan.py.
         local_pack_coarse_window: Union[int, List[int], None] = 512,
+        # Add ONE all-to-all attention over the TOP level only, alongside the shared lane.
+        # This is the cheap way to buy global reach: the shared lane stays windowed (linear,
+        # one kernel) and the top level costs n_top^2, which the sqrt(N) rule keeps inside the
+        # O(N) budget. Two kernels total, versus one per level for the list form of
+        # local_pack_coarse_window -- and the per-level split measured 1.8x SLOWER at 4096
+        # because six small flash calls are launch-bound, not FLOP-bound.
+        local_pack_top_global: bool = False,
         # Combine the mixed window + coarse lane for coarse queries as ONE unified softmax
         # over the union of both key sets (log-sum-exp merge of the two flash calls),
         # instead of adding two independently-normalized outputs. Parameter-free and
@@ -2859,6 +2866,10 @@ class HierarchicalFlowGAT(nn.Module):
         else:
             self.local_pack_coarse_window_per_level = None
             self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
+        self.local_pack_top_global = bool(local_pack_top_global)
+        if self.local_pack_top_global:
+            logger.info("Packed coarse lane: global TOP level attention enabled "
+                        "(local_pack_top_global).")
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.local_pack_coarse_global = bool(local_pack_coarse_global)
         self.local_pack_l0_coarse_bands = bool(local_pack_l0_coarse_bands)
@@ -5806,6 +5817,21 @@ class HierarchicalFlowGAT(nn.Module):
                         0, flex_perm_local).contiguous()
                     spec["flex_levels"] = lvl_packed.clamp(0, _max_lvl).index_select(
                         0, flex_perm_local).contiguous()
+        # Global TOP level (local_pack_top_global). Only the topmost coarse level, so the
+        # cost is n_top^2 -- linear in N exactly while n_top <= sqrt(N). Skipped when the top
+        # level has <= 1 node (nothing to attend over) or is not a query level.
+        if bool(getattr(self, "local_pack_top_global", False)) and len(lane_q_levels) > 0:
+            _top = max(lane_q_levels)
+            _rows = spec["level_rows"][_top] if _top < len(spec["level_rows"]) else None
+            if _rows is not None and int(_rows.numel()) > 1:
+                spec["top_global"] = {
+                    "level": int(_top),
+                    "rows": _rows,
+                    "nodes": perm.index_select(0, _rows),
+                    "pos": pos.index_select(0, _rows).contiguous(),
+                }
+                if "pos_nd" in spec:
+                    spec["top_global"]["pos_nd"] = spec["pos_nd"].index_select(0, _rows).contiguous()
         self._local_pack_spec_cache = (key, spec)
         return spec
 

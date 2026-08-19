@@ -91,9 +91,26 @@ local_pack_cross_level: true
 local_pack_query_levels: [0, 1, 2, 3, 4, 5, 6]   # MUST cover every level
 local_pack_level_bias: true
 local_pack_coarse_lane: true
-# PER-LEVEL radii, in each level's OWN rank space; last entry 0 = GLOBAL top level.
-# A scalar here would mean the legacy single window over the whole interleaved bank, which
-# is the quadratic term this arm exists to remove.
+# PER-LEVEL radii, each in that LEVEL's OWN rank space; last entry 0 = global top.
+# This is what makes reach work: a small upper level (32, 8, 2 nodes at 4096) is smaller
+# than its own radius, so it becomes all-to-all for free, and a token can climb to a
+# globally-connected level in one hop. MEASURED: full receptive field in 3 of 12 layers.
+#
+# Two alternatives were measured and rejected:
+#
+#  * scalar window + local_pack_top_global (2 kernels, 374 ms, 1.21x): FAILS REACH.
+#    A shared window is denominated in MIXED bank slots, so the 2 top nodes sit ~469 slots
+#    apart and coarse rows never see one -- nothing can climb to the global level.
+#    Only 66.8% of the sequence reached after 6 layers at 4096, 24.3% at 16384.
+#
+#  * scalar window = full bank, i.e. all-to-all (1 kernel, 323 ms, 1.05x): reach is fine
+#    (3 layers) and it is the FASTEST option at N <= ~16k -- but it is the N^2 term this
+#    arm exists to remove: 599 pairs/token at 4096 rising to 55375 at 1M, vs a flat 414.
+#    If you are only running 4k-16k, prefer it and ignore this arm.
+#
+# The per-level form costs 1.9x today purely because six small flash calls are launch-bound,
+# not FLOP-bound. Fusing the levels that are already all-to-all (any level with
+# n_l <= 2W+1) into one call would cut it to ~3 kernels; that work is not done yet.
 local_pack_coarse_window: [64, 64, 64, 64, 64, 0]
 local_pack_flex_union: false    # see the flexhier arm
 local_pack_lane_merge: false    # causal-only; inert in a bidi run

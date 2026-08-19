@@ -212,6 +212,7 @@ def build_pinball_model(
         local_pack_coarse_lane=bool(getattr(args, "local_pack_coarse_lane", False)),
         # int (shared window over the whole coarse bank) or list (per-coarse-level radius,
         # 0 = global for that level). int() here would raise on the list form.
+        local_pack_top_global=bool(getattr(args, "local_pack_top_global", False)),
         local_pack_coarse_window=(
             list(getattr(args, "local_pack_coarse_window"))
             if isinstance(getattr(args, "local_pack_coarse_window", None), (list, tuple))
