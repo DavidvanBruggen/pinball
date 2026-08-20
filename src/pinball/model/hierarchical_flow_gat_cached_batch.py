@@ -13228,6 +13228,7 @@ class HierarchicalFlowGAT(nn.Module):
                         and len(active_levels) < len(all_pinball_levels)
                     ):
                         active_compute_levels = active_levels
+                    _fold = False   # set below; read after the checkpoint call
                     _use_ckpt = (
                         bool(getattr(self, "use_gradient_checkpointing", False))
                         and self.training
@@ -13251,20 +13252,50 @@ class HierarchicalFlowGAT(nn.Module):
                         # Loop-varying args are bound as defaults so the backward
                         # recompute uses THIS layer's snapshot (edge_attr_work is
                         # reassigned later in the loop).
+                        # FOLD THE LAYER TAIL IN. pinball_refinement_norm used to run OUTSIDE
+                        # this checkpoint, so layernorm's backward retained its input: a SECOND
+                        # full-size [B, n_packed, H] fp32 tensor per layer, on top of the
+                        # checkpoint's own saved input. That is why checkpointing bought pinball
+                        # only 3.8x where the param-matched transformer (one retention per layer)
+                        # got 5.1x. Folding the alpha blend + norm in leaves only the layer INPUT
+                        # retained: peak 4.34 -> 3.50 GiB at N=16384 and 7.60 -> 5.92 at 32768,
+                        # for +0.5% step time. Forward is BIT-IDENTICAL; gradients move by
+                        # 5.7e-3 median against a 2.3e-3 same-config nondeterminism floor (one
+                        # more bf16 op recomputed in backward). The terminal self.final_norm is a
+                        # different module outside the loop and is untouched (its grads match to
+                        # every printed digit).
+                        #
+                        # Both folded ops are pure. The fold is skipped when something
+                        # side-effecting sits between the refine step and the norm -- the zipper
+                        # (which accumulates counters) or level cycling (which writes x through
+                        # _copy_active_nodes) -- because the recompute would run it twice.
+                        _fold = not run_zip_step and not pinball_cycle_active
+                        _do_alpha = bool(
+                            apply_l0_alpha and ((not pinball_cycle_active) or 0 in active_levels)
+                        )
+
                         def _ckpt_refine(
                             x_in,
                             _t=transformer, _ei=refine_ei, _nl=base_nl, _lo=base_lo,
                             _pl=pos_local, _ea=edge_attr_work, _et=refine_et,
                             _bi=hqd_b_idx, _si=hqd_src_idx, _di=hqd_dst_idx,
                             _al=active_compute_levels, _gate=_xq_gate_cur,
+                            _fd=_fold, _da=_do_alpha, _l0i=l0_idx, _l0o=x_l0_orig,
                         ):
-                            return self._refine_step_true_batch_native(
+                            _x, _e = self._refine_step_true_batch_native(
                                 transformer=_t, x_bnh=x_in, edge_index=_ei,
                                 node_level=_nl, level_offsets=_lo, pos_local=_pl,
                                 edge_attr_work=_ea, edge_type_work=_et,
                                 hqd_b_idx=_bi, hqd_src_idx=_si, hqd_dst_idx=_di,
                                 active_levels=_al, xq_gate=_gate,
                             )
+                            if _fd:
+                                if _da:
+                                    _a = self.alpha
+                                    _xl0 = _x.index_select(1, _l0i)
+                                    _x.index_copy_(1, _l0i, _a * _xl0 + (1.0 - _a) * _l0o)
+                                _x = self.pinball_refinement_norm(_x)
+                            return _x, _e
                         x, new_edge_attr = torch.utils.checkpoint.checkpoint(
                             _ckpt_refine, x, use_reentrant=False,
                         )
@@ -13347,7 +13378,11 @@ class HierarchicalFlowGAT(nn.Module):
                     if pinball_cycle_active:
                         x = _copy_active_nodes(x_before_zip, x, active_node_idx)
 
-                if apply_l0_alpha and ((not pinball_cycle_active) or 0 in active_levels):
+                # Both of these are folded into the checkpoint above when _folded (see there);
+                # only the non-checkpointed path (eval, or a zipper/cycling layer) runs them here.
+                _folded = bool(_fold) and bool(_use_ckpt)
+                if (apply_l0_alpha and ((not pinball_cycle_active) or 0 in active_levels)
+                        and not _folded):
                     a = self.alpha
                     x_l0 = x.index_select(1, l0_idx)
                     x.index_copy_(1, l0_idx, a * x_l0 + (1.0 - a) * x_l0_orig)
@@ -13356,7 +13391,7 @@ class HierarchicalFlowGAT(nn.Module):
                     x_normed = self.pinball_refinement_norm(x.index_select(1, active_node_idx))
                     x = x.clone()
                     x.index_copy_(1, active_node_idx, x_normed.to(dtype=x.dtype))
-                else:
+                elif not _folded:
                     x = self.pinball_refinement_norm(x)
                 layer_step += 1
 

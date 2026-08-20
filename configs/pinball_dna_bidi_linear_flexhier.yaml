@@ -1,0 +1,161 @@
+# DNA backbone -- loaded via build_pinball(cfg_path=..., num_tracks=<dim>).
+# Architecture keys only: the host harness owns the loop, data, optimizer and batching.
+#
+# DEEP-HIERARCHY FLEXHIER ARM. Six coarse levels + a fixed-size GLOBAL BLOCK, all under
+# ONE flex_attention softmax.
+#
+# Mechanism, and how it differs from the other two multi-level arms:
+#
+#   windowed_flexhier  3 coarse levels, mask = "band OR every coarse row". Reaches
+#                      everything, but the coarse key set is a fixed FRACTION of N
+#                      (0.219*N), so the second clause is quadratic.
+#   linear             6 coarse levels, per-level lane windows + global top, additive.
+#                      Linear and reaches everything, but six small flash calls are
+#                      launch-bound: 1.9x step time.
+#   THIS ARM           6 coarse levels, mask = "band OR the global block", where the block
+#                      is whole levels taken top-down while they fit a fixed row budget.
+#                      A CONSTANT number of keys, so linear, in ONE kernel.
+#
+# Every row reads the whole block directly (the clause is key-side and ungated by level),
+# so a token reaches a globally-connected level in ONE hop -- this is what the rejected
+# additive local_pack_top_global variant could not do.
+#
+# Level sizes and the block the budget actually buys (levels are taken top-down until the
+# next one would not fit, so the block SHRINKS in level-span as N grows, which is exactly
+# what keeps it constant-cost):
+#
+#   N        L1     L2     L3    L4    L5   L6    block rows   levels   reach
+#   4096    512    256    128    32     8    2           170   L3-L6    FULL in 2 layers
+#   16384  2048   1024    512   128    32    8           168   L4-L6    FULL in 4 layers
+#   32768  4096   2048   1024   256    64   16            80   L5-L6    STALLS at 98.6%
+#   32768  (with local_pack_global_block: 512)          336   L4-L6    FULL in 4 layers
+#
+# Measured against the additive global-block arm (same levels, same block), min-of-rounds:
+#   N=4096 1.10x, N=16384 1.025x, N=32768 1.014x.
+#
+# CHOOSING THE BUDGET. Reach is 2-hop only while every token has a block row inside its
+# own band: token -> block row near it -> read globally by everyone. Levels are taken
+# top-down, so as N grows a fixed budget stops affording the denser levels and the worst
+# token->block gap blows past local_pack_window (101 slots at 4096, 375 at 16384, but
+# 1475 at 32768 -- and that is where it stalls). Raising the budget one level down fixes
+# it. Rule: keep at least THREE levels in the block, and re-check after any change with
+#   python bench_reach_block.py pinball_dna_bidi_linear_flexhier 256,512 <N>
+# Those hop counts are an ATTENTION-ONLY lower bound -- hier_upward_refresh /
+# hier_downward_refresh give the hierarchy a second, un-modelled path to the same rows.
+#
+# Check any edit with:  python bench_hierarchy_plan.py --config <this file> --scan 4096 1048576
+block_size: 4096
+model_type: pinball
+tokenizer_name: gpt2            # unused in features mode; build_pinball stubs it
+
+# Extra levels are comp 8 @ overlap 0.5 -> stride 4. Do NOT use comp 2 here:
+# stride = max(1, int(comp*(1-overlap))), so comp 2 @ 0.5 gives int(1.0) = 1 and the level
+# does not compress at all.
+compression_ratios: [16, 4, 4, 8, 8, 8]
+overlap_ratios: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+
+hidden_dim: 1024
+num_heads: 16
+num_refinement_layers: 12
+num_layers: [0, 0, 0, 0, 0, 0, 0]   # length = level count (L0 + 6 coarse)
+internal_cycles: [0, 0, 0, 0]
+refinement_style: unified
+unified_refinement_cycles: 1
+l0_cycles: 0
+iterative_refinement_cycles: 0
+local_connectivity_window_size: 0
+dropout: 0.1
+norm_type: layernorm
+attn_backend: flash             # alias -> l0_local_backend
+qkv_sharing: shared
+use_gradient_checkpointing: true
+
+# Bidirectional: coverage reads the whole window, nothing to leak.
+ar_graph_causal: false
+ar_hier_edge_mode: none
+drop_static_cross_level_edges: true
+local_pack_bidirectional: true
+hier_downward_bidi_parent: true
+
+# 1D positions, set explicitly rather than left to the spatial_dims fallback.
+spatial_curve: none
+local_pack_rope_axial: false
+
+# refine_cond_mode is deliberately absent: the harness calls the model bare, with no
+# conditioning vector for per-layer FiLM to read.
+
+upper_init: pooled
+upper_seed_gate_init: 1.0
+hier_upward_refresh: true
+hier_upward_refresh_every: 1
+hier_upward_refresh_gate_init: 0.1
+hier_downward_refresh: true
+hier_downward_refresh_every: 1
+hier_downward_refresh_gate_init: 0.1
+hier_refresh_compile: true
+hier_layer_compile: true
+
+# Stability normalizations (both default ON; set false only to reproduce a checkpoint
+# trained before they existed). final_norm_fast_path re-applies the terminal norm on exit
+# from the refinement loop, which the fast path had lost -- without it nothing renormalizes
+# the residual stream before output_projection. qk_norm normalizes q/k over head_dim before
+# the dot product, bounding the attention logits; it matters most here because one softmax
+# spans all four levels at once. Cost of both together is within noise (~1-2%).
+final_norm_fast_path: true
+qk_norm: true
+qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
+
+# Required: these populate local_attn_config, which gates the packed cross-level path.
+# Without them every local_pack_* key below is silently inert.
+local_attn_windows: [128, 128, 128, 128, 128, 128, 128]
+l0_local_window: 128
+
+local_pack_cross_level: true
+local_pack_query_levels: [0, 1, 2, 3, 4, 5, 6]   # MUST cover every level
+local_pack_level_bias: true
+local_pack_coarse_lane: true
+# GATE ONLY in this arm. flex_union returns before the additive lane runs, and the mask
+# clause here is "band OR block", which never reads the lane radius -- so the VALUE is
+# inert and only >0 matters (it is what builds the packed flex spec at all). Keep it small
+# so that turning local_pack_flex_union off falls back to something sane rather than to an
+# all-to-all lane.
+local_pack_coarse_window: 64    # scalar REQUIRED: the per-level list form takes a
+                                # different spec branch that never builds flex_perm
+# ONE flex_attention call whose block-sparse mask is "within local_pack_window mixed slots
+# OR in the global block" -- an exact set union under a single softmax, with the overlap
+# deduped (a block row inside the band is ONE key, not two with a +ln2 advantage).
+# flex_attention has no dropout_p, so this path applies token-wise V dropout instead; set
+# dropout: 0.0 on BOTH arms when A/B-ing against an additive one or that difference is the
+# confound.
+local_pack_flex_union: true
+local_pack_global_block: 256    # ROW budget, not a level index. Whole levels, top-down,
+                                # while they fit. Constant keys per query => linear in N.
+local_pack_l0_coarse_rank_window: 0     # OFF: that clause is the quadratic one (its key
+                                        # set is a fixed fraction of N). The block clause
+                                        # takes precedence anyway when a block exists.
+local_pack_lane_merge: false    # causal-only; inert in a bidi run
+
+# Source gating is on in every arm so the arms differ by mechanism, not parameter count.
+# sigmoid(hqd_source_gate_logit) reads out how much the model weights HQD; dump it from a
+# checkpoint with tools_gate_dump.py.
+attention_source_gating_enable: false
+attention_source_gate_init_graph: 1.0
+attention_source_gate_init_local: 1.0   # 1.0, not the 0.5 default, which halves the main
+                                        # attention path
+attention_source_gate_init_hqd: 0.05    # small but trainable: a sigmoid near 0 damps its
+                                        # own gradient and starves the HQD subtree
+attention_source_gate_debug: true       # 0-dim tensors, one sync per logging interval
+
+xq_nominate_enable: false
+pinball_multirate_enable: false
+use_aux_loss: false
+hier_aux_mode: mean_mse         # jepa_mlp would allocate 16.8M predictor params, dead unless aux is on
+token_unet_enable: false
+use_edge_embedding: false
+learn_edge_from_attention: false
+lateral_edge_trace_enable: false
+
+# === DEEP FLEXHIER ARM: windowed L0 + global block, one softmax =======================
+# Matches the windowed control's L0 window so the arms differ by hierarchy, not by L0 reach.
+local_pack_window: 156          # +-W in PACKED slots (~+-127 L0 tokens at 4096)
+use_hqd: false
