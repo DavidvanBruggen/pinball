@@ -24,11 +24,17 @@
 # next one would not fit, so the block SHRINKS in level-span as N grows, which is exactly
 # what keeps it constant-cost):
 #
+# Measured at the budget this file ships (local_pack_global_block: 896):
+#
 #   N        L1     L2     L3    L4    L5   L6    block rows   levels   reach
-#   4096    512    256    128    32     8    2           170   L3-L6    FULL in 2 layers
-#   16384  2048   1024    512   128    32    8           168   L4-L6    FULL in 4 layers
-#   32768  4096   2048   1024   256    64   16            80   L5-L6    STALLS at 98.6%
-#   32768  (with local_pack_global_block: 512)          336   L4-L6    FULL in 4 layers
+#   4096    512    256    128    32     8    2           426   L2-L6    FULL in 2 layers
+#   16384  2048   1024    512   128    32    8           680   L3-L6    FULL in 2 layers
+#   32768  4096   2048   1024   256    64   16           336   L4-L6    FULL in 4 layers
+#   65536  8192   4096   2048   512   128   32           672   L4-L6    (rows derived, reach
+#                                                                        not yet measured)
+#
+# The earlier 256 budget bought only 170/168/80 rows and stalled at 98.6% by 32768; 896
+# keeps three or more levels in the block out to 65536, which is what the rule wants.
 #
 # Measured against the additive global-block arm (same levels, same block), min-of-rounds:
 #   N=4096 1.10x, N=16384 1.025x, N=32768 1.014x.
@@ -36,10 +42,13 @@
 # CHOOSING THE BUDGET. Reach is 2-hop only while every token has a block row inside its
 # own band: token -> block row near it -> read globally by everyone. Levels are taken
 # top-down, so as N grows a fixed budget stops affording the denser levels and the worst
-# token->block gap blows past local_pack_window (101 slots at 4096, 375 at 16384, but
-# 1475 at 32768 -- and that is where it stalls). Raising the budget one level down fixes
-# it. Rule: keep at least THREE levels in the block, and re-check after any change with
-#   python bench_reach_block.py pinball_dna_bidi_linear_flexhier 256,512 <N>
+# token->block gap eventually blows past local_pack_window. At 896 that gap is 43 slots at
+# 4096 and 101 at 16384 -- both comfortably inside the 156-slot band, which is why the
+# window does NOT need widening to buy reach. Raising the budget one level down is the fix
+# if it ever does; widening the window is the expensive way to the same place (W=1248 cost
+# 7.5x the pairs/token for identical reach, and made the arm as slow as full attention).
+# Rule: keep at least THREE levels in the block, and re-check after any change with
+#   python bench_reach_block.py pinball_dna_bidi_linear_flexhier 896 <N>
 # Those hop counts are an ATTENTION-ONLY lower bound -- hier_upward_refresh /
 # hier_downward_refresh give the hierarchy a second, un-modelled path to the same rows.
 #
@@ -56,7 +65,25 @@ overlap_ratios: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 
 hidden_dim: 1024
 num_heads: 16
-num_refinement_layers: 12
+num_refinement_layers: 15         # LAYER-matched to transformer_dna_bidi, which is also 15.
+                                  # Measured: per-layer parameters are the SAME in both models
+                                  # (12.87M vs 12.85M -- identical SwiGLU FFN and QKV+out), so
+                                  # equal depth means equal per-layer capacity and the ONLY
+                                  # difference left is the hierarchy itself. That is the clean
+                                  # control; param-matching instead (14 vs 15) would make the
+                                  # transformer 25% deeper and confound depth with mechanism.
+                                  #
+                                  # Residual gap to declare: pinball carries a depth-INDEPENDENT
+                                  # 25.59M of scaffolding vs the transformer's 4.33M (its learned
+                                  # position table, live even though RoPE is on). At 15 layers
+                                  # that is 218.61M vs 197.13M, or 212.04M vs 197.13M (+7.6%)
+                                  # counting only parameters that receive gradient -- 6.57M of
+                                  # pinball's total is allocated unconditionally and never runs
+                                  # here (cond_film, time_embed_mlp, hier_recon_head,
+                                  # highest_to_token_projection).
+                                  #
+                                  # NB full/windowed sit at 12, so this arm is layer-matched to
+                                  # the transformer but NOT to the other pinball arms.
 num_layers: [0, 0, 0, 0, 0, 0, 0]   # length = level count (L0 + 6 coarse)
 internal_cycles: [0, 0, 0, 0]
 refinement_style: unified
@@ -65,6 +92,7 @@ l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0
 dropout: 0.1
+hier_node_dropout: 0.1
 norm_type: layernorm
 attn_backend: flash             # alias -> l0_local_backend
 qkv_sharing: shared
@@ -128,8 +156,9 @@ local_pack_coarse_window: 64    # scalar REQUIRED: the per-level list form takes
 # dropout: 0.0 on BOTH arms when A/B-ing against an additive one or that difference is the
 # confound.
 local_pack_flex_union: true
-local_pack_global_block: 256    # ROW budget, not a level index. Whole levels, top-down,
+local_pack_global_block: 896    # ROW budget, not a level index. Whole levels, top-down,
                                 # while they fit. Constant keys per query => linear in N.
+                                # This, not local_pack_window, is the knob that buys reach.
 local_pack_l0_coarse_rank_window: 0     # OFF: that clause is the quadratic one (its key
                                         # set is a fixed fraction of N). The block clause
                                         # takes precedence anyway when a block exists.
@@ -157,5 +186,9 @@ lateral_edge_trace_enable: false
 
 # === DEEP FLEXHIER ARM: windowed L0 + global block, one softmax =======================
 # Matches the windowed control's L0 window so the arms differ by hierarchy, not by L0 reach.
-local_pack_window: 156          # +-W in PACKED slots (~+-127 L0 tokens at 4096)
+# +-W in PACKED slots, NOT tokens: packed length is 5034 at 4096, so 156 slots is ~+-127 L0
+# tokens. Do not copy 1248 across from the latent config -- there it happened to equal the
+# whole packed length (1024 grid + 224 coarse) and so meant "global"; here it is just a wide
+# band that costs 3098 pairs/token instead of 670 and reaches no further.
+local_pack_window: 156
 use_hqd: false
