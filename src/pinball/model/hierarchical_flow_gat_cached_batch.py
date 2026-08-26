@@ -2295,6 +2295,35 @@ class HierarchicalFlowGAT(nn.Module):
         hier_upward_refresh: bool = False,
         hier_upward_refresh_every: int = 1,       # apply after every k-th layer call
         hier_upward_refresh_gate_init: float = 0.0,
+        # DIRECT (unchained) upward pooling. The chained form re-pools level lvl from the
+        # ALREADY-REFRESHED level lvl-1, so one call carries L0 to the top -- but the per-level
+        # factors (1 + gate_l * ||proj_l||) MULTIPLY, giving a sensitivity that compounds over
+        # levels AND over layers (levels*layers steps: 90 at 6 levels x 15 layers vs 36 at
+        # 3 x 12). Direct mode pools L0 itself into every coarse level using that level's
+        # CUMULATIVE window, so contributions are additive and independent, L0 reaches every
+        # level in ONE layer, and the parameter count is unchanged. Symmetric with the
+        # downward path, which already gathers 0:m directly for every m. Costs ~12*N*H of
+        # pooling per call instead of ~1.2*N*H -- a memory-bound reduction, ~1% of the packed
+        # attention in the same layer.
+        hier_upward_refresh_direct: bool = False,
+        hier_upper_seed_direct: bool = False,     # same, for the one-shot pooled upper seed
+        # Relevance-gated pooling. Unweighted means give an unsupervised / uninformative child
+        # the same weight as any other, so flank content is averaged into the coarse levels at
+        # full strength -- unlike a transformer, where a softmax can simply assign it ~0. A
+        # per-child sigmoid gate restores that: pooled = mean_j(sigmoid(<u_l, x_j> + b_l) * x_j).
+        # The gate is per CHILD (not per parent-window), so it needs no [.., comp] tensor and
+        # fuses into the same unfold reduction -- one matvec, O(N*H) against the O(N*H^2)
+        # projection already in the path. Dividing by the window COUNT rather than by the gate
+        # sum is deliberate: a window whose children are all low-gate then produces a small
+        # vector instead of a renormalised average of noise.
+        #   bias_init PICKS A TRADE. Large values reproduce the unweighted mean (sigmoid(10) =
+        #   0.99995) but SATURATE the gate -- sigmoid'(10) = 4.5e-5, so it barely trains and the
+        #   feature does nothing. Use ~10 only to warm-start an existing checkpoint. For a fresh
+        #   run use the default 2.0: sigmoid(2) = 0.881 with sigmoid'(2) = 0.105, so the pool
+        #   starts at 88% of the mean (a constant the downstream projection absorbs) and the
+        #   gate is actually free to move.
+        hier_pool_gate: bool = False,
+        hier_pool_gate_bias_init: float = 2.0,
         # Per-layer downward refresh — the linear-cost DENSE replacement for the bridges/
         # staggered scatter edges: each fine node gathers the MOST-RECENT CLOSED node of each
         # strictly-coarser level (the same node a bridge edge points at), projected per pair
@@ -2453,6 +2482,42 @@ class HierarchicalFlowGAT(nn.Module):
         # at long N it narrows to the top level alone. Pair it with a level count chosen so
         # n_top <= B, otherwise nothing fits and the block is empty.
         local_pack_global_block: int = 0,
+        # PER-LEVEL RINGS. A same-level radius for EVERY level, given in that level's own
+        # node units (so ring 64 at L2 reaches +-64 L2 nodes, not +-64 mixed slots). This is
+        # the "triangle": resolution that decays with distance instead of the two-tier
+        # "fine within +-W tokens, else coarse everywhere" the band+block pair gives today.
+        #
+        # WHY IT IS NOT REDUNDANT WITH THE BAND. local_pack_window is denominated in MIXED
+        # slots, so it covers a fixed PHYSICAL span at every level -- at N=32768 a +-156-slot
+        # band gives every level the same +-128 tokens, which is narrower than an L4 node's
+        # own 256-token span and far narrower than L6's 4096. Rings are denominated per level,
+        # so +-64 gives L1 +-512 tokens, L2 +-1024, L3 +-2048, L4 +-8192.
+        #
+        # COMPOSES WITH THE GLOBAL BLOCK, does not replace it. The block still takes whole
+        # levels top-down while they fit, which is what makes the degenerate case work: when
+        # the top levels collapse to 1-2 nodes they cost almost nothing and the loop keeps
+        # descending, so "global" automatically lands on the topmost level that is actually
+        # discriminative. Rings then cover the levels the budget could NOT take whole -- and
+        # that budget is currently underspent (at N=32768 the block takes 336 of 896 rows and
+        # stops, because L3's 1024 will not fit), so the rings largely ride for free.
+        local_pack_ring_windows: Optional[Sequence[int]] = None,
+        # HOW the ring keys are combined with the band+block softmax.
+        #   "additive" (default) -- rings run as a SECOND flex call in level-grouped order
+        #       and their output is summed. Two independent softmaxes, so ring keys compete
+        #       only with ring keys. Measured 1.238ms vs 0.739ms baseline at N=32768 (H=16,
+        #       D=64), against 4.5ms projected for folding them into the one mask.
+        #   "lse" -- same two calls, but recombined by log-sum-exp into the EXACT single
+        #       softmax over the union (valid because the ring mask excludes every band and
+        #       block row, so the key sets are disjoint). Correct, and 1.71x the cost of
+        #       additive (1.967 vs 1.165ms) -- the merge is elementwise over [B,H,N,D].
+        #   "union" -- the original single-call form: ring folded into the one mask_mod.
+        #       Exact like lse and needs no merge, but the rings are SCATTERED in ar_time
+        #       order (L3 sits 1-in-39 slots at 32768), so block-sparsity collapses:
+        #       52628 tiles vs 8174, waste 7.02x vs 1.29x, +41% step. Kept for reference.
+        # Why "additive" is not merely the cheap option: the same choice was measured on
+        # trained text runs, where additive BEAT the fused union late in training in two
+        # matched pairs (see the flex-union note in local_pack_flex_union).
+        local_pack_ring_merge: str = "additive",
         # Combine the mixed window + coarse lane for coarse queries as ONE unified softmax
         # over the union of both key sets (log-sum-exp merge of the two flash calls),
         # instead of adding two independently-normalized outputs. Parameter-free and
@@ -2878,6 +2943,17 @@ class HierarchicalFlowGAT(nn.Module):
             self.local_pack_coarse_window_per_level = None
             self.local_pack_coarse_window = max(0, int(local_pack_coarse_window or 0))
         self.local_pack_global_block = max(0, int(local_pack_global_block or 0))
+        self.local_pack_ring_windows = (
+            [max(0, int(v)) for v in local_pack_ring_windows]
+            if local_pack_ring_windows else None)
+        _rm = str(local_pack_ring_merge or "additive").lower()
+        if _rm not in ("additive", "lse", "union"):
+            raise ValueError(
+                f"local_pack_ring_merge must be additive|lse|union, got {local_pack_ring_merge!r}")
+        self.local_pack_ring_merge = _rm
+        if self.local_pack_ring_windows and any(self.local_pack_ring_windows):
+            logger.info("Per-level rings enabled: %s (own-level node units).",
+                        self.local_pack_ring_windows)
         self.local_pack_top_global = bool(local_pack_top_global)
         if self.local_pack_top_global:
             logger.info("Packed coarse lane: global TOP level attention enabled "
@@ -4075,6 +4151,26 @@ class HierarchicalFlowGAT(nn.Module):
             )
             logger.info("Per-layer upward refresh enabled (every %d layer(s), gate init %.3g).",
                         self.hier_upward_refresh_every, float(hier_upward_refresh_gate_init))
+        self.hier_upward_refresh_direct = bool(hier_upward_refresh_direct)
+        self.hier_upper_seed_direct = bool(hier_upper_seed_direct)
+        if self.hier_upward_refresh_direct or self.hier_upper_seed_direct:
+            logger.info("Upward pooling: DIRECT L0 (refresh=%s, seed=%s) -- chained cross-level "
+                        "coupling removed.", self.hier_upward_refresh_direct,
+                        self.hier_upper_seed_direct)
+
+        # --- Relevance-gated pooling (see _pooled_child_window_means) ---
+        self.hier_pool_gate = bool(hier_pool_gate)
+        if self.hier_pool_gate:
+            _nl = len(compression_ratios)
+            # u_l = 0 and b_l = bias_init => every gate sigmoid(b_l); at the default 10 that is
+            # 0.99995, so the pool is the unweighted mean to within bf16 noise. Exact identity
+            # is the flag being OFF (separate code path), not this init.
+            self.pool_gate_vec = nn.Parameter(torch.zeros(_nl, self.hidden_dim))
+            self.pool_gate_bias = nn.Parameter(
+                torch.full((_nl,), float(hier_pool_gate_bias_init)))
+            logger.info("Relevance-gated pooling enabled (%d levels, bias init %.3g -> gate %.5f).",
+                        _nl, float(hier_pool_gate_bias_init),
+                        float(torch.sigmoid(torch.tensor(float(hier_pool_gate_bias_init)))))
 
         # --- Per-layer downward refresh (see _apply_downward_refresh) ---
         self.hier_downward_refresh = bool(hier_downward_refresh)
@@ -5375,17 +5471,55 @@ class HierarchicalFlowGAT(nn.Module):
         self._pooled_seed_idx_cache[key] = out
         return out
 
-    def _pooled_child_window_means(self, lower: torch.Tensor, lvl: int, n_parent: int) -> torch.Tensor:
+    def _cumulative_window(self, lvl: int) -> Tuple[int, int]:
+        """(span, stride) of level `lvl` expressed in L0 tokens, for direct L0 pooling.
+
+        Composes the per-level rule the hierarchy is actually built with:
+        span_l = comp_{l-1} * stride_{l-1..0}, stride_l = prod(stride_k, k < l). For
+        [16,4,4,8,8,8] @ overlap 0.5 that is (16,8) (32,16) (64,32) (256,128) (1024,512)
+        (4096,2048) -- i.e. an L6 node spans 4096 L0 tokens. Pure python ints, cached, so it
+        traces as a constant inside the compiled refresh core.
+        """
+        cache = getattr(self, "_cum_window_cache", None)
+        if cache is None:
+            cache = {}
+            s = 1
+            for i in range(len(self.compression_ratios)):
+                comp = int(self.compression_ratios[i])
+                stride = max(1, int(comp * (1 - self.overlap_ratios[i])))
+                cache[i + 1] = (comp * s, stride * s)
+                s = stride * s
+            self._cum_window_cache = cache
+        return cache[int(lvl)]
+
+    def _pooled_child_window_means(self, lower: torch.Tensor, lvl: int, n_parent: int,
+                                   comp: Optional[int] = None,
+                                   stride: Optional[int] = None) -> torch.Tensor:
         """Per-parent-window child means -> [B, n_parent, H] for level lvl pooling level lvl-1.
 
         Same window rule as _pooled_seed_indices / _create_next_level, but the regular bulk
         windows go through a ZERO-COPY unfold view (no 2x child materialization, no scatter);
         only the few clamped tail windows are sliced explicitly. All bounds are python ints —
         no GPU sync, no data-dependent shapes.
+
+        comp/stride override the per-level rule; direct-L0 pooling passes the cumulative
+        window from _cumulative_window so `lower` can be L0 for any lvl.
+
+        With hier_pool_gate the children are scaled by a per-child sigmoid relevance gate
+        BEFORE the window reduction. Scaling the input rather than the window keeps the gate
+        parent-independent, so nothing beyond a [B, n_lower] vector is materialised and every
+        clamped-tail path below is untouched.
         """
         B, n_lower, H = lower.shape
-        comp = int(self.compression_ratios[lvl - 1])
-        stride = max(1, int(comp * (1 - self.overlap_ratios[lvl - 1])))
+        if comp is None:
+            comp = int(self.compression_ratios[lvl - 1])
+            stride = max(1, int(comp * (1 - self.overlap_ratios[lvl - 1])))
+        else:
+            comp, stride = int(comp), max(1, int(stride))
+        if getattr(self, "hier_pool_gate", False):
+            u = self.pool_gate_vec[lvl - 1].to(dtype=lower.dtype)
+            b = self.pool_gate_bias[lvl - 1].to(dtype=lower.dtype)
+            lower = lower * torch.sigmoid(lower @ u + b).unsqueeze(-1)
         n_bulk = min(n_parent, (n_lower - comp) // stride + 1) if n_lower >= comp else 0
         parts = []
         if n_bulk > 0:
@@ -5422,11 +5556,16 @@ class HierarchicalFlowGAT(nn.Module):
         for s in level_sizes:
             offsets.append(offsets[-1] + int(s))
         pieces = [x_cat[:, : offsets[1], :]]
-        lower = x_cat[:, offsets[0] : offsets[1], :]
+        l0 = x_cat[:, offsets[0] : offsets[1], :]
+        direct = bool(getattr(self, "hier_upper_seed_direct", False))
+        lower = l0
         for lvl in range(1, len(level_sizes)):
-            pooled = self.level_projections[lvl - 1](
-                self._pooled_child_window_means(lower, lvl, int(level_sizes[lvl]))
-            )
+            if direct:
+                c, st = self._cumulative_window(lvl)
+                _pool = self._pooled_child_window_means(l0, lvl, int(level_sizes[lvl]), c, st)
+            else:
+                _pool = self._pooled_child_window_means(lower, lvl, int(level_sizes[lvl]))
+            pooled = self.level_projections[lvl - 1](_pool)
             base = x_cat[:, offsets[lvl] : offsets[lvl + 1], :]
             gate = self.upper_seed_gates[lvl - 1].to(dtype=pooled.dtype)
             cur = base + gate * (pooled - base)
@@ -5455,9 +5594,15 @@ class HierarchicalFlowGAT(nn.Module):
     def _upward_refresh_core(self, x: torch.Tensor, offsets: tuple) -> torch.Tensor:
         level_sizes = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
         pieces = [x[:, : offsets[1], :]]
-        lower = x[:, offsets[0] : offsets[1], :]
+        l0 = x[:, offsets[0] : offsets[1], :]
+        direct = bool(getattr(self, "hier_upward_refresh_direct", False))
+        lower = l0
         for lvl in range(1, len(level_sizes)):
-            pooled = self._pooled_child_window_means(lower, lvl, int(level_sizes[lvl]))
+            if direct:
+                c, st = self._cumulative_window(lvl)
+                pooled = self._pooled_child_window_means(l0, lvl, int(level_sizes[lvl]), c, st)
+            else:
+                pooled = self._pooled_child_window_means(lower, lvl, int(level_sizes[lvl]))
             gate = self.upward_refresh_gates[lvl - 1].to(dtype=pooled.dtype)
             cur = x[:, offsets[lvl] : offsets[lvl + 1], :] + gate * self.upward_refresh_proj[lvl - 1](pooled)
             pieces.append(cur)
@@ -5742,6 +5887,49 @@ class HierarchicalFlowGAT(nn.Module):
                 _mask = torch.zeros(n_total, dtype=torch.bool, device=perm.device)
                 _mask[_rows] = True
                 spec["global_block_mask"] = _mask
+
+        # PER-LEVEL RINGS (local_pack_ring_windows). Converted here from "nodes at that
+        # level" to L0 TOKENS by the level's cumulative stride, so the consumer can test the
+        # radius against spec["pos"] (each packed row's close time) with a plain subtraction.
+        # Comparing POSITIONS rather than level-ranks is deliberate: it keeps the RANGE test
+        # and the CAUSALITY test as separate predicates. Rank order cannot stand in for
+        # causality here -- windows overlap (overlap 0.5 => a parent's window runs `comp`
+        # past its start), so a lower-ranked node at the same level can close AFTER the
+        # query, and a one-sided rank test would leak exactly at the frontier. The consumer
+        # therefore ANDs the ring with the same packed-order closure test the band uses.
+        _rw = getattr(self, "local_pack_ring_windows", None)
+        if _rw and any(int(v) > 0 for v in _rw):
+            _wt = []
+            for _lv in range(_n_lvl):
+                _w = int(_rw[_lv]) if _lv < len(_rw) else 0
+                _st = 1 if _lv == 0 else int(self._cumulative_window(_lv)[1])
+                _wt.append(max(0, _w) * _st)
+            if any(v > 0 for v in _wt):
+                _wt_t = torch.tensor(_wt, dtype=torch.long, device=perm.device)
+                spec["flex_ring_wtok"] = _wt_t
+                # python tuple so the BlockMask cache key needs no GPU sync
+                spec["flex_ring_key"] = tuple(_wt)
+                _mode = str(getattr(self, "local_pack_ring_merge", "additive"))
+                spec["flex_ring_merge"] = _mode
+                if _mode in ("additive", "lse"):
+                    # SPLIT (level-grouped) ORDER for the second call. Packed order is
+                    # already ar_time-sorted, so a STABLE argsort on level alone yields
+                    # (level, ar_time) -- each level becomes one contiguous run, which is
+                    # what turns a ring from ~78 sparsely-populated tiles into ~2 full ones.
+                    _rp = torch.argsort(lvl_packed, stable=True)
+                    _inv = torch.empty_like(_rp)
+                    _inv[_rp] = torch.arange(n_total, device=_rp.device)
+                    spec["flex_ring_perm"] = _rp.contiguous()
+                    spec["flex_ring_inv"] = _inv.contiguous()
+                    spec["flex_ring_pos_s"] = pos.index_select(0, _rp).contiguous()
+                    # radius folded per ROW here, so the kernel does ONE gather per key
+                    # instead of chaining level -> radius on every masked element.
+                    spec["flex_ring_wtok_s"] = (
+                        _wt_t.index_select(0, lvl_packed).index_select(0, _rp).contiguous())
+                    _gb = spec.get("global_block_mask", None)
+                    spec["flex_ring_inglob_s"] = (
+                        _gb.index_select(0, _rp).contiguous() if _gb is not None
+                        else torch.zeros(n_total, dtype=torch.bool, device=_rp.device))
 
         # Axial ND RoPE (local_pack_rope_axial): true ND coords per packed row (curve mode).
         # The layer re-RoPEs q/k with exact spatial offsets instead of 1D close-time index;

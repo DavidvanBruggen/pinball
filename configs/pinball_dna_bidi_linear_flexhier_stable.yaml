@@ -1,5 +1,35 @@
-# DNA backbone -- loaded via build_pinball(cfg_path=..., num_tracks=<dim>).
-# Architecture keys only: the host harness owns the loop, data, optimizer and batching.
+# STABILITY VARIANT of pinball_dna_bidi_linear_flexhier.yaml, at 4096 tokens (~500 kb at
+# 128 bp/token). Identical to that arm except for three INDEPENDENT flags, each of which
+# targets a measured way the deep flexhier arm differs from the 3-level windowed/full arms
+# (which trained stably on the same code). Flip them one at a time to attribute.
+#
+#  1. hier_pool_gate            -- relevance-gated pooling. Unweighted means give an
+#     unsupervised flank child the same weight as any other, and pinball POOLS its coarse
+#     levels rather than reading them through a softmax, so flank content enters the global
+#     block at full strength instead of being down-weighted to ~0 the way a transformer
+#     would. Per-child sigmoid gate; ~0.1% compute (one matvec vs the O(H^2) projection
+#     already there), memory-neutral, +6150 params.
+#
+#  2. hier_upward_refresh_direct -- pool L0 into every coarse level directly, instead of
+#     chaining level <- level-1. The chain multiplies (1 + gate_l*||proj_l||) across levels
+#     AND repeats every layer: 6 levels x 15 layers = 90 compounding steps here vs 36 for
+#     windowed (3 x 12). Direct pooling makes the contributions additive and independent,
+#     and gets L0 to every level in ONE layer instead of six. Symmetric with the downward
+#     path, which already gathers 0:m directly for every m -- and whose coarse<-coarse pairs
+#     measured DEAD on trained checkpoints (1:2 = +0.0005, 2:3 = -0.0001 at ep27), which is
+#     the same links the upward chain routes through.
+#
+#  3. hier_node_dropout_per_level -- the scalar form drops 10% of EVERY coarse level. As N
+#     grows the global block loses its fine levels (L2-L6 at 4096 -> L4-L6 at 32768), so the
+#     surviving rows each carry more and dropping one is a larger perturbation; at 4096 L5
+#     has 8 rows and L6 has 2. Taper to 0 at the top.
+#
+# Note hier_upper_seed_direct exists too (same change for the one-shot pooled upper seed)
+# but is left OFF: the seed runs once per forward, not 15 times, so it carries 1/15th of the
+# compounding and is not the suspect.
+#
+# All three are no-ops when off; flags-off output is bit-identical to the base arm (verified,
+# sha 65d0d414b4280a2b at block_size 1024, params unchanged at 218,498,763).
 #
 # DEEP-HIERARCHY FLEXHIER ARM. Six coarse levels + a fixed-size GLOBAL BLOCK, all under
 # ONE flex_attention softmax.
@@ -53,7 +83,7 @@
 # hier_downward_refresh give the hierarchy a second, un-modelled path to the same rows.
 #
 # Check any edit with:  python bench_hierarchy_plan.py --config <this file> --scan 4096 1048576
-block_size: 32768 #4096
+block_size: 4096
 model_type: pinball
 tokenizer_name: gpt2            # unused in features mode; build_pinball stubs it
 
@@ -92,7 +122,11 @@ l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0
 dropout: 0.1
-hier_node_dropout: 0.1
+# Per-level DropNode. Index i = level i; L0 is pinned to 0.0 whatever this says. Level sizes
+# at 4096 are L1 512, L2 256, L3 128, L4 32, L5 8, L6 2 -- dropping 10% of a 2-row level is a
+# 50%-of-the-level event, so the top levels get none.
+hier_node_dropout: 0.0
+hier_node_dropout_per_level: [0.0, 0.1, 0.1, 0.05, 0.0, 0.0, 0.0]
 norm_type: layernorm
 attn_backend: flash             # alias -> l0_local_backend
 qkv_sharing: shared
@@ -115,71 +149,33 @@ local_pack_rope_axial: false
 upper_init: pooled
 upper_seed_gate_init: 1.0
 hier_upward_refresh: true
-hier_upward_refresh_every: 1
+# every: 2, not 1 -- and this is a cost recovery, not a compromise. Direct pooling reaches
+# EVERY level in one application, where the chain needed six layers to fill, so 7 direct
+# refreshes over 15 layers deliver strictly more vertical exchange than 15 chained ones.
+# Measured @4096 B=2 on the Blackwell (fwd+bwd, median of 5, eager):
+#   chained every:1 (baseline)        188.8 ms   14.16 GiB
+#   direct  every:1                   208.9 ms   14.15 GiB   (+10.6%, memory-neutral)
+#   direct  every:1 + pool gate       226.9 ms   16.22 GiB   (+20.2%, +2.06 GiB)
+#   direct  every:2 + pool gate       198.0 ms   15.10 GiB   (+4.9%,  +0.94 GiB)
+#   direct  every:3 + pool gate       191.3 ms   14.82 GiB   (+1.3%,  +0.66 GiB)
+#   direct  every:2 (no gate)         188.2 ms   14.10 GiB   (free)
+# The gate's memory is the gated child tensor saved for backward, once per level per refresh;
+# in direct mode that is 6 copies of L0 rather than one pass over shrinking levels. Raising
+# `every` is the cheapest lever on both axes. Checkpointing the pool would trade it back for
+# time if the gate proves worth every:1.
+hier_upward_refresh_every: 2
 hier_upward_refresh_gate_init: 0.1
+hier_upward_refresh_direct: true    # pool L0 directly into every level (no chain)
+hier_upper_seed_direct: false       # same for the one-shot seed; off, see header
+hier_pool_gate: true                # per-child sigmoid relevance gate on pooling
+hier_pool_gate_bias_init: 2.0       # sigmoid(2)=0.881, sigmoid'(2)=0.105 -- pool starts near
+                                    # the mean AND the gate can still move. Do NOT raise to
+                                    # ~10 for a fresh run: sigmoid'(10)=4.5e-5 freezes it.
 hier_downward_refresh: true
 hier_downward_refresh_every: 1
 hier_downward_refresh_gate_init: 0.1
 hier_refresh_compile: true
 hier_layer_compile: true
-
-# === STABILITY / REACH KNOBS =========================================================
-# All default OFF and are no-ops when off (flags-off output is bit-identical to the arm
-# before they existed: sha 65d0d414b4280a2b, params 218,498,763 at block_size 1024).
-# Only hier_pool_gate is ON here.
-
-# RELEVANCE-GATED POOLING. Coarse levels are built by UNWEIGHTED means, so an unsupervised
-# or uninformative child enters its parent at full strength -- unlike a transformer, where a
-# softmax can simply give it ~0 weight. This adds a per-child sigmoid gate:
-# pooled = mean_j(sigmoid(<u_l, x_j> + b_l) * x_j). Dividing by the window COUNT rather than
-# by the gate sum is deliberate: a window whose children are all low-gate then yields a small
-# vector instead of a renormalised average of noise. Shared by the pooled upper seed and the
-# upward refresh, so both agree on what matters. ~0.1% compute (one matvec against the
-# O(H^2) projection already in the path), +6,150 params.
-hier_pool_gate: true
-# bias_init is a TRADE, not a formality. ~10 reproduces the plain mean (sigmoid(10)=0.99995)
-# but SATURATES the gate -- sigmoid'(10)=4.5e-5, so it barely trains and the feature does
-# nothing. Use ~10 only to warm-start an existing checkpoint. 2.0 gives sigmoid=0.881 with
-# sigmoid'=0.105: pool starts near the mean AND the gate can actually move.
-hier_pool_gate_bias_init: 2.0
-
-# DIRECT (UNCHAINED) UPWARD POOLING. The chained refresh re-pools level l from the ALREADY
-# REFRESHED level l-1, so the per-level factors (1 + gate*||proj||) MULTIPLY across levels
-# and repeat every layer -- 6 levels x 15 layers = 90 compounding steps here, against 36 for
-# the 3-level/12-layer windowed arm that trained stably on identical code. Direct mode pools
-# L0 into every level using that level's cumulative window: contributions become additive and
-# independent, and L0 reaches every level in ONE layer instead of six. Same parameter count.
-# Pair it with hier_upward_refresh_every: 2 -- direct at every:2 measured 188.2ms vs the
-# chained every:1 baseline's 188.8ms @4096 B=2, i.e. free, while still exchanging more.
-hier_upward_refresh_direct: false
-hier_upper_seed_direct: false      # same change for the ONE-SHOT seed; it runs once per
-                                   # forward rather than 15 times, so it carries 1/15th of
-                                   # the compounding and is not the suspect
-
-# PER-LEVEL RINGS ("the triangle"): a same-level radius per level, in that level's OWN node
-# units, filling the resolution gap between the band and the global block. local_pack_window
-# is denominated in MIXED slots, so it hands every level the same ~+-128 tokens -- narrower
-# than an L4 node's own 256-token span. A ring of 64 reaches +-64*cumulative_stride(L) tokens
-# (L1 +-65 kb, L2 +-131 kb, L3 +-262 kb at 128 bp/token). OFF here.
-# Verified causal (prefix diff exactly 0.000e+00 against a control that leaks 2.8e-01), and
-# lse mode reproduces the single-softmax union to 1.6e-06 relative.
-# Cost at N=32768 B=1 with [0,64,64,64,0,0,0], vs a 913.6ms / 52.27 GiB baseline:
-#   additive  1008.7ms (+10.4%)  58.09 GiB     two independent softmaxes, summed
-#   lse       1079.9ms (+18.2%)  65.26 GiB     exact single softmax over the union
-#   union     1299.1ms (+42.2%)  52.27 GiB     one mask; no extra memory, 4x the time
-# The two-call modes buy time with memory (they gather q/k/v into a second layout and hold it
-# for backward); union buys memory with time. At 4 Mb with an unchecked stem you are already
-# near 87 GiB, so union may be the right pick there despite being slower.
-local_pack_ring_windows: null
-local_pack_ring_merge: additive    # additive | lse | union -- inert while rings are null
-
-# PER-LEVEL DropNode. The scalar hier_node_dropout above drops 10% of EVERY coarse level. As
-# N grows the global block loses its fine levels (L2-L6 at 4096 -> L4-L6 at 32768), so the
-# surviving rows each carry more and dropping one perturbs more; at 4096 L5 has 8 rows and L6
-# has 2, where 10% is a large fraction of the level. Uncomment to taper it to 0 at the top
-# (index i = level i; L0 is pinned to 0.0 regardless).
-# hier_node_dropout_per_level: [0.0, 0.1, 0.1, 0.05, 0.0, 0.0, 0.0]
-# =====================================================================================
 
 # Stability normalizations (both default ON; set false only to reproduce a checkpoint
 # trained before they existed). final_norm_fast_path re-applies the terminal norm on exit
@@ -221,6 +217,61 @@ local_pack_l0_coarse_rank_window: 0     # OFF: that clause is the quadratic one 
                                         # set is a fixed fraction of N). The block clause
                                         # takes precedence anyway when a block exists.
 local_pack_lane_merge: false    # causal-only; inert in a bidi run
+
+# PER-LEVEL RINGS ("the triangle"): a same-level radius per level, in that level's OWN node
+# units, OR-ed into the same softmax alongside the band and the global block. Fills the
+# resolution gap between them -- the band is denominated in MIXED slots so it hands every
+# level the same ~+-128 tokens, while the block only carries whole levels it can afford.
+# At 4096 the block already takes L2-L6 (426 of 896 rows) so only L1 is ring-reachable; at
+# 32768 it takes just L4-L6 (336 rows) and L1/L2/L3 are ring-only, which is where this earns
+# its keep. Radius R at level L reaches +-R * cumulative_stride(L) tokens: at 32768 an L3
+# ring of 64 spans +-2048 tokens at 32-token granularity.
+#
+# HOW THEY ARE COMBINED -- local_pack_ring_merge: additive (default) | lse | union.
+# Rings run as a SECOND flex call in level-grouped order, because in the main call's ar_time
+# order a level's rows are interleaved with every other level's (L3 is 1-in-39 slots at
+# 32768), so a 128-row ring smears over ~78 tiles at ~1.6 live rows each. Regrouping makes
+# each ring one contiguous run: 1878 tiles instead of 44454 added to the union mask, 24x.
+#
+# Measured, DNA arm N=32768 B=1, rings [0,64,64,64,0,0,0], fwd+bwd:
+#
+#   mode        step        vs base   peak        note
+#   (no rings)  913.6ms       --      52.27 GiB
+#   additive   1008.7ms     +10.4%    58.09 GiB   two independent softmaxes, summed
+#   lse        1079.9ms     +18.2%    65.26 GiB   EXACT single softmax over the union
+#   union      1299.1ms     +42.2%    52.27 GiB   one mask; no extra memory, 4x the time
+#
+# So the two-call forms trade MEMORY for time and union trades time for memory. additive
+# costs +5.8 GiB and lse +13.0 GiB because the second call gathers its own q/k/v into the
+# split layout (~82 MB each per layer) and holds them for backward; union adds none because
+# it reuses the one layout. Pick by which resource is tight -- at 4 Mb with an unchecked
+# stem you are already near 87 GiB, so union may still be the right call there.
+#
+# A worthwhile optimisation if the memory bites: only coarse rows ever carry a ring radius
+# (L0's is 0), so the second call's K/V could be gathered from the 19% of rows with wt>0
+# instead of all 40272. Queries must stay full. Not done yet.
+#
+# CORRECTNESS: lse reproduces union to 1.6e-06 RELATIVE on a full forward. That single check
+# validates the split permutation, the scatter back to mixed order, the disjointness of the
+# ring mask (overlapping key sets would double-count and diverge), and the merge math.
+# additive is deliberately a DIFFERENT operator -- ring keys compete only with ring keys and
+# the two convex combinations sum, so magnitude roughly doubles. It is the default anyway
+# because the same choice measured BETTER on trained text runs, not merely cheaper.
+#
+# Cost is set by the COARSEST ringed level (waste ~ 1/density): under `union` at 32768,
+# [0,64,0,..] costs +10.4% and [0,0,0,64,..] +41.4%, and [0,64,64,64,..] is no worse than
+# L3 alone -- so ring everything finer than the coarsest level you are willing to pay for.
+#
+# Causality verified on the causal pack config (flex engaged, rings live and changing the
+# output): prefix diff exactly 0.000e+00 with and without a global block, while the same
+# probe on a bidi build leaks 1.07e-01 -- so the test is sensitive and the rings are clean.
+# The mask keeps RANGE and CAUSALITY as separate predicates: the range test is on positions,
+# and closure reuses the band's packed-order test, because overlapping windows mean a
+# lower-ranked same-level node can close AFTER the query.
+#
+# OFF here: this arm is the stability test, and +42% would confound it. Flip it for a reach
+# run once the gate/direct verdict is in.
+# local_pack_ring_windows: [0, 64, 64, 64, 0, 0, 0]
 
 # Source gating is on in every arm so the arms differ by mechanism, not parameter count.
 # sigmoid(hqd_source_gate_logit) reads out how much the model weights HQD; dump it from a

@@ -3834,6 +3834,73 @@ class HierarchicalMessagePassing(MessagePassing):
         keep = keep / (1.0 - p_row).clamp_min(1e-6)
         return keep.view(B, -1, 1, 1).to(dtype)
 
+    def _flex_ring_call(self, qp, kp, vp, spec: Dict, causal: bool, want_lse: bool):
+        """Rings as their OWN flex call, in LEVEL-GROUPED (split) order.
+
+        Why a second call rather than another clause in the union mask: the union mask runs
+        in ar_time order, where a level's rows are interleaved with every other level's (L3
+        is 1-in-39 slots at N=32768), so a 128-row ring smears over ~78 tiles holding ~1.6
+        live rows each. Regrouping by level makes each ring one contiguous run -- measured
+        1878 tiles here against 44454 added to the union mask, a 24x reduction.
+
+        Returns (out, lse) with out [B, N, H, D] and lse [B, H, N], both scattered back to
+        MIXED order so the caller can combine without knowing this layout.
+        """
+        from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+        rp, inv = spec["flex_ring_perm"], spec["flex_ring_inv"]
+        pos_s, wt_s = spec["flex_ring_pos_s"], spec["flex_ring_wtok_s"]
+        ing_s = spec["flex_ring_inglob_s"]
+        w_mix, n = int(spec["window"]), int(rp.numel())
+        _key = (bool(causal), spec.get("flex_ring_key", ()), w_mix)
+        bm = spec.get("flex_ring_bm") if spec.get("flex_ring_bm_key") == _key else None
+        if bm is None:
+            cm = bool(causal)
+
+            def ring_mask(b, h, qi, ki):
+                # rp[i] IS the mixed rank of split row i, so band distance costs no extra
+                # array. RANGE and CAUSALITY stay separate predicates (see the spec-side
+                # note): overlapping windows mean a lower-ranked same-level node can close
+                # AFTER the query, so closure is the mixed-order test, never the range one.
+                dm = rp[qi] - rp[ki]
+                wt = wt_s[ki]
+                rng = (wt > 0) & ((pos_s[qi] - pos_s[ki]).abs() <= wt)
+                band = ((dm >= 0) & (dm <= w_mix)) if cm else (dm.abs() <= w_mix)
+                # DISJOINT by construction: drop anything the band or the global block
+                # already delivers. Required for lse to be exact, and it stops additive
+                # from double-weighting a key.
+                keep = rng & (~band) & (~ing_s[ki])
+                return (keep & (dm >= 0)) if cm else keep
+
+            _bs = 64 if (rp.is_cuda and n >= 512) else None
+            _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
+            try:
+                bm = create_block_mask(ring_mask, B=None, H=None, Q_LEN=n, KV_LEN=n,
+                                       device=str(rp.device), _compile=True, **_kw)
+            except TypeError:
+                bm = create_block_mask(ring_mask, B=None, H=None, Q_LEN=n, KV_LEN=n,
+                                       device=str(rp.device), **_kw)
+            spec["flex_ring_bm"], spec["flex_ring_bm_key"] = bm, _key
+        q_r = qp.index_select(1, rp).transpose(1, 2)
+        k_r = kp.index_select(1, rp).transpose(1, 2)
+        v_r = vp.index_select(1, rp).transpose(1, 2)
+        _p = float(self.dropout.p) if self.training else 0.0
+        if _p > 0.0:
+            # Same token-wise V dropout the main call uses (flex has no dropout_p). Drawn
+            # independently of the main call's mask -- these are disjoint key sets, so there
+            # is no shared key whose two draws would have to agree.
+            _keep = torch.rand(v_r.shape[0], v_r.shape[1], v_r.shape[2], 1,
+                               device=v_r.device, dtype=torch.float32) >= _p
+            v_r = v_r * (_keep.to(v_r.dtype) / (1.0 - _p))
+        if q_r.is_cuda and n >= 512:
+            res = _flex_compiled_singleton()(
+                q_r, k_r, v_r, block_mask=bm, return_lse=want_lse,
+                kernel_options={"BLOCK_M": 64, "BLOCK_N": 64})
+        else:
+            res = flex_attention(q_r, k_r, v_r, block_mask=bm, return_lse=want_lse)
+        o_r, l_r = res if want_lse else (res, None)
+        return (o_r.transpose(1, 2).index_select(1, inv),
+                l_r.index_select(2, inv) if l_r is not None else None)
+
     def _flex_union_attn(
         self, qp: torch.Tensor, kp: torch.Tensor, vp: torch.Tensor, spec: Dict,
         causal: bool = True,
@@ -3850,7 +3917,8 @@ class HierarchicalMessagePassing(MessagePassing):
         # itself is cached per skeleton so a stale BlockMask would silently survive.
         _bm_key = (bool(causal),
                    int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0),
-                   int(getattr(self, "local_pack_global_block", 0) or 0))
+                   int(getattr(self, "local_pack_global_block", 0) or 0),
+                   spec.get("flex_ring_key", ()))
         bm = spec.get("flex_block_mask") if spec.get("flex_block_mask_key") == _bm_key else None
         if bm is None:
             r = spec["flex_r_mixed"]
@@ -3863,6 +3931,22 @@ class HierarchicalMessagePassing(MessagePassing):
             w_l0c = int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0)
             causal_mask = bool(causal)
             in_glob = spec.get("flex_in_global", None)
+
+            # PER-LEVEL RINGS. ring_wt[level] is that level's radius already converted to L0
+            # tokens, so the range test is |pos[q] - pos[k]| <= ring_wt[level[k]] -- a radius
+            # that scales with the level's own granularity while staying one subtraction.
+            # ring_pos / ring_lvl are in PACKED (mixed) order, which is the index space the
+            # prefix branch works in directly; the permuted branches reach them through
+            # r[.], their split->mixed map.
+            ring_wt = spec.get("flex_ring_wtok", None)
+            ring_pos = spec.get("pos", None)
+            ring_lvl = spec.get("levels", None)
+            if ring_pos is None or ring_lvl is None:
+                ring_wt = None
+            # additive/lse run the rings as a SEPARATE call in level-grouped order, so the
+            # clause must NOT also be in this mask or every ring key is counted twice.
+            if str(spec.get("flex_ring_merge", "union")) != "union":
+                ring_wt = None
 
             kv_pre = spec.get("flex_kv_prefix", None)
             if kv_pre is not None and in_glob is not None:
@@ -3881,6 +3965,20 @@ class HierarchicalMessagePassing(MessagePassing):
                     p = (ki - _G).clamp(0, _nq - 1)
                     dr = qi - p
                     band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
+                    if ring_wt is not None:
+                        # RANGE: physical distance against the key level's own radius.
+                        wt = ring_wt[ring_lvl[p]]
+                        ring = (wt > 0) & ((ring_pos[qi] - ring_pos[p]).abs() <= wt)
+                        # CAUSALITY: the SAME packed-order closure test the band uses. Never
+                        # inferred from the range test -- see the spec-side note on why
+                        # overlapping windows make rank order an unsound proxy.
+                        if causal_mask:
+                            ring = ring & (dr >= 0)
+                        band = band | ring
+                    # Dedup AFTER the union: block rows are physically duplicated into the
+                    # K/V prefix, so anything in the block must reach the query through the
+                    # prefix only. Without this a ring row that is also a block row is TWO
+                    # keys and silently carries a +ln2 advantage.
                     band = band & (~in_glob[p])
                     if causal_mask:
                         # A block row is visible once it has closed (its own packed rank).
@@ -3900,6 +3998,13 @@ class HierarchicalMessagePassing(MessagePassing):
                     band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
                     # Causal: a block row is only visible once it has closed.
                     glob = (in_glob[ki] & (dr >= 0)) if causal_mask else in_glob[ki]
+                    if ring_wt is not None:
+                        rk = r[ki]
+                        wt = ring_wt[ring_lvl[rk]]
+                        ring = (wt > 0) & ((ring_pos[r[qi]] - ring_pos[rk]).abs() <= wt)
+                        if causal_mask:
+                            ring = ring & (dr >= 0)
+                        band = band | ring
                     return band | glob
             elif crank is not None and w_l0c > 0:
 
@@ -3930,6 +4035,13 @@ class HierarchicalMessagePassing(MessagePassing):
                         coarse = isc[qi] & isc[ki] & (dl >= 0) & (dl <= w_lane) & (dr >= 0)
                     else:
                         coarse = isc[qi] & isc[ki] & (dl.abs() <= w_lane)
+                    if ring_wt is not None:
+                        rk = r[ki]
+                        wt = ring_wt[ring_lvl[rk]]
+                        ring = (wt > 0) & ((ring_pos[r[qi]] - ring_pos[rk]).abs() <= wt)
+                        if causal_mask:
+                            ring = ring & (dr >= 0)
+                        coarse = coarse | ring
                     return band | coarse
 
             n = int(perm.numel())
@@ -3994,14 +4106,38 @@ class HierarchicalMessagePassing(MessagePassing):
         # Compiled kernel only for real graphs: the inductor lowering asserts on tiny
         # sequences (< one mask block, e.g. generation-prefix graphs), and eager flex
         # (math composite, O(n^2) but n is tiny there) is fine for those.
+        _rmode = str(spec.get("flex_ring_merge", "union"))
+        _ring = _rmode in ("additive", "lse") and "flex_ring_perm" in spec
+        _lse = _ring and _rmode == "lse"
         if q_s.is_cuda and int(perm.numel()) >= 512:
             fn = _flex_compiled_singleton()
             # Default tiles exceed the workstation Blackwell's 101KB shared memory.
-            out = fn(q_s, k_s, v_s, block_mask=bm,
+            out = fn(q_s, k_s, v_s, block_mask=bm, return_lse=_lse,
                      kernel_options={"BLOCK_M": 64, "BLOCK_N": 64})
         else:
-            out = flex_attention(q_s, k_s, v_s, block_mask=bm)
-        return out.transpose(1, 2)  # [B, N, H, D] split order
+            out = flex_attention(q_s, k_s, v_s, block_mask=bm, return_lse=_lse)
+        out, lse_main = out if _lse else (out, None)
+        out = out.transpose(1, 2)  # [B, N, H, D]
+        if not _ring:
+            return out
+        o_r, l_r = self._flex_ring_call(qp, kp, vp, spec, bool(causal), _lse)
+        if _pre is None:
+            # main call ran permuted; bring the ring result into the same row order
+            o_r = o_r.index_select(1, perm)
+            if l_r is not None:
+                l_r = l_r.index_select(2, perm)
+        if not _lse:
+            return out + o_r
+        # EXACT single softmax over the union, valid because ring_mask excludes every band
+        # and block row. A ring row with no keys returns lse = -inf -> weight 0 -> the main
+        # result passes through untouched; the main call always has self in band, so the
+        # denominator can never be zero.
+        L1 = lse_main.permute(0, 2, 1).unsqueeze(-1).float()
+        L2 = l_r.permute(0, 2, 1).unsqueeze(-1).float()
+        m = torch.maximum(L1, L2)
+        w1, w2 = (L1 - m).exp(), (L2 - m).exp()
+        return (((out.float() * w1 + o_r.float() * w2)
+                 / (w1 + w2).clamp_min(1e-20))).to(out.dtype)
 
 
     def _l0_bands_block(self, qp, kp, vp, l0rows, lvlrows, w0, dp, causal, flash_fn):
