@@ -1,56 +1,50 @@
 # DNA backbone -- loaded via build_pinball(cfg_path=..., num_tracks=<dim>).
 # Architecture keys only: the host harness owns the loop, data, optimizer and batching.
 #
-# DEEP-HIERARCHY FLEXHIER ARM. Six coarse levels + a fixed-size GLOBAL BLOCK, all under
-# ONE flex_attention softmax.
 #
-# Mechanism, and how it differs from the other two multi-level arms:
+# THREE-KERNEL LINEAR ARM. Six coarse levels on the ADDITIVE path: a mixed local window,
+# a windowed coarse lane, and one all-to-all GLOBAL TIER. Replaces the flexhier arm's
+# single fused flex_attention softmax over "band OR global block".
 #
-#   windowed_flexhier  3 coarse levels, mask = "band OR every coarse row". Reaches
-#                      everything, but the coarse key set is a fixed FRACTION of N
-#                      (0.219*N), so the second clause is quadratic.
-#   linear             6 coarse levels, per-level lane windows + global top, additive.
-#                      Linear and reaches everything, but six small flash calls are
-#                      launch-bound: 1.9x step time.
-#   THIS ARM           6 coarse levels, mask = "band OR the global block", where the block
-#                      is whole levels taken top-down while they fit a fixed row budget.
-#                      A CONSTANT number of keys, so linear, in ONE kernel.
+# Why, against flexhier at 32768:
 #
-# Every row reads the whole block directly (the clause is key-side and ungated by level),
-# so a token reaches a globally-connected level in ONE hop -- this is what the rejected
-# additive local_pack_top_global variant could not do.
+#   The block is read by EVERY query, so it costs n_block * N. Holding the same levels
+#   needs n_block proportional to N, which is quadratic; a fixed budget stays linear but
+#   strands levels as N grows (at 131072 the 896 budget affords only L5+L6, and L4 drops
+#   to seeing ONE of its own 1024 nodes). The tier reads only itself, so it costs
+#   n_tier^2 -- 120x cheaper than the block for an identical global set, at every length.
 #
-# Level sizes and the block the budget actually buys (levels are taken top-down until the
-# next one would not fit, so the block SHRINKS in level-span as N grows, which is exactly
-# what keeps it constant-cost):
+#   The block also gives full within-level reach only to the levels it CONTAINS. Levels
+#   below the cutoff see their own level only through the +-156 mixed band, which at L3's
+#   stride of 32 is +-4 nodes. The lane is denominated in bank slots instead, so a single
+#   radius buys every coarse level a large own-level neighbourhood, constant in N.
 #
-# Measured at the budget this file ships (local_pack_global_block: 896):
+# Own-level nodes visible, and step time, measured at 32768 (compiled, Blackwell,
+# pinball-bw, flex verified to actually run -- flexfail=0 on every arm):
 #
-#   N        L1     L2     L3    L4    L5   L6    block rows   levels   reach
-#   4096    512    256    128    32     8    2           426   L2-L6    FULL in 2 layers
-#   16384  2048   1024    512   128    32    8           680   L3-L6    FULL in 2 layers
-#   32768  4096   2048   1024   256    64   16           336   L4-L6    FULL in 4 layers
-#   65536  8192   4096   2048   512   128   32           672   L4-L6    (rows derived, reach
-#                                                                        not yet measured)
+#   arm                                    step        L1     L2     L3   global nodes
+#   flexhier (flex_union + 896 block)     460.8 ms     31     15      7   336 (block)
+#   THIS ARM (budget 400, window 900)     455.0 ms    982    491    245   336 (tier)
+#   same, window 469                      450.2 ms    512    256    128   336 (tier)
+#   all-to-all lane, no tier              485.5 ms    ALL    ALL    ALL   -- 56.3M pairs
 #
-# The earlier 256 budget bought only 170/168/80 rows and stalled at 98.6% by 32768; 896
-# keeps three or more levels in the block out to 65536, which is what the rule wants.
+# Same global cardinality, ~33x the lateral reach, no step-time cost. The deltas are near
+# the ~1% run-to-run noise, and these arms ran later and hotter than the flexhier one, so
+# they are conservative. The all-to-all lane is the windowed arm's shape and does not
+# survive the move to 32768 -- bench_hierarchy_plan flags it as the N^2 term.
 #
-# Measured against the additive global-block arm (same levels, same block), min-of-rounds:
-#   N=4096 1.10x, N=16384 1.025x, N=32768 1.014x.
+# End-to-end reach is 4 layers here against 3-4 for flexhier (attention-only lower bound;
+# hier_upward_refresh / hier_downward_refresh give a second, un-modelled path). Against 15
+# layers that is ample, and unlike the block it does not degrade with N: flexhier needs 9
+# layers at 131072 and does not reach at all by 524288.
 #
-# CHOOSING THE BUDGET. Reach is 2-hop only while every token has a block row inside its
-# own band: token -> block row near it -> read globally by everyone. Levels are taken
-# top-down, so as N grows a fixed budget stops affording the denser levels and the worst
-# token->block gap eventually blows past local_pack_window. At 896 that gap is 43 slots at
-# 4096 and 101 at 16384 -- both comfortably inside the 156-slot band, which is why the
-# window does NOT need widening to buy reach. Raising the budget one level down is the fix
-# if it ever does; widening the window is the expensive way to the same place (W=1248 cost
-# 7.5x the pairs/token for identical reach, and made the arm as slow as full attention).
-# Rule: keep at least THREE levels in the block, and re-check after any change with
-#   python bench_reach_block.py pinball_dna_bidi_linear_flexhier 896 <N>
-# Those hop counts are an ATTENTION-ONLY lower bound -- hier_upward_refresh /
-# hier_downward_refresh give the hierarchy a second, un-modelled path to the same rows.
+# SIZING. local_pack_top_global_budget takes whole levels top-down while they fit; 400
+# buys L4+L5+L6 = 336 nodes at 32768, matching what the block held. "sqrt" resolves to
+# floor(sqrt(N)) -- the point past which the tier's own n^2 stops being linear -- but at
+# 32768 that yields only 80 nodes and strands L4, so the explicit budget is used here.
+# local_pack_coarse_window accepts "auto", the radius that guarantees every coarse row a
+# tier node (53 for a 336-node tier). Prefer an explicit value well above it: auto is the
+# narrowest window that works, and lateral reach is the reason this arm exists.
 #
 # Check any edit with:  python bench_hierarchy_plan.py --config <this file> --scan 4096 1048576
 block_size: 32768 #4096
@@ -181,38 +175,30 @@ local_pack_cross_level: true
 local_pack_query_levels: [0, 1, 2, 3, 4, 5, 6]   # MUST cover every level
 local_pack_level_bias: true
 local_pack_coarse_lane: true
-# GATE ONLY in this arm. flex_union returns before the additive lane runs, and the mask
-# clause here is "band OR block", which never reads the lane radius -- so the VALUE is
-# inert and only >0 matters (it is what builds the packed flex spec at all). Keep it small
-# so that turning local_pack_flex_union off falls back to something sane rather than to an
-# all-to-all lane.
-local_pack_coarse_window: 64    # scalar REQUIRED: the per-level list form takes a
-                                # different spec branch that never builds flex_perm
-# ONE flex_attention call whose block-sparse mask is "within local_pack_window mixed slots
-# OR in the global block" -- an exact set union under a single softmax, with the overlap
-# deduped (a block row inside the band is ONE key, not two with a +ln2 advantage).
-# flex_attention has no dropout_p, so this path applies token-wise V dropout instead; set
-# dropout: 0.0 on BOTH arms when A/B-ing against an additive one or that difference is the
-# confound.
-local_pack_flex_union: true
-local_pack_global_block: 896    # ROW budget, not a level index. Whole levels, top-down,
-                                # while they fit. Constant keys per query => linear in N.
-                                # This, not local_pack_window, is the knob that buys reach.
+# Lane radius in COARSE bank slots -- this is the knob that buys within-level lateral
+# reach, and unlike the band it is denominated in the bank rather than the mixed stream.
+# Own-level nodes seen at 32768: 900 -> 982/491/245 at L1/L2/L3, 469 -> 512/256/128,
+# 64 -> 70/35/17. Constant in N, because each level's share of the bank is. Must be a
+# scalar or "auto": the per-level list form takes a different spec branch (one flash call
+# per level, measured 1.8x slower at 4096 -- launch-bound, not FLOP-bound).
+local_pack_coarse_window: 900
+# The band, the lane and the tier are three separate flash calls summed. Additive is not
+# one softmax over the union: a coarse row inside BOTH the band and the lane is attended
+# twice (~57 of ~900 lane keys at 32768). That is inherent to the path, not a defect, and
+# the trained A/B on 2026-07-14 favoured additive over flex_union late-run anyway.
+local_pack_flex_union: false
+local_pack_global_block: 0      # the tier replaces it: n_tier^2 instead of n_block*N
 local_pack_l0_coarse_rank_window: 0     # OFF: that clause is the quadratic one (its key
-                                        # set is a fixed fraction of N). The block clause
-                                        # takes precedence anyway when a block exists.
+                                        # set is a fixed fraction of N).
 local_pack_lane_merge: false    # causal-only; inert in a bidi run
 
-# GLOBAL TIER -- additive path only (flex_union returns before the lane runs), so all three
-# keys below are inert while local_pack_flex_union is true. The tier attends all-to-all over
-# itself; whole levels are taken top-down while they fit the budget.
+# GLOBAL TIER. Whole levels top-down while they fit the budget, attending all-to-all over
+# themselves. 400 buys L4+L5+L6 = 336 nodes at 32768, the same global set the 896-row block
+# held, for n^2 instead of n*N.
 #   budget 0      topmost level alone: 16 nodes at 32768, and only 2 at 4096.
-#   budget sqrt   floor(sqrt(N)), the point past which the tier's own n^2 stops being linear.
-# A denser tier is easier to reach, so widening it NARROWS the lane rather than adding to it.
-# Pair counts at 32768: tier=L6 needs a +-469 lane and costs 7.05M coarse pairs; tier=top3
-# (336 nodes) needs +-22 and costs 0.45M, with one hop less to full reach.
-local_pack_top_global: false
-local_pack_top_global_budget: 0     # 0 | <row budget> | sqrt
+#   budget sqrt   floor(sqrt(N)); at 32768 that is 80 nodes and strands L4, hence 400 here.
+local_pack_top_global: true
+local_pack_top_global_budget: 400     # 0 | <row budget> | sqrt
 # local_pack_coarse_window also accepts "auto": the radius that puts a tier node inside EVERY
 # coarse row's window, so the ascent to the tier is one hop. It is sized from the true
 # worst-case distance to the nearest tier row, not from mean spacing -- tier levels carry

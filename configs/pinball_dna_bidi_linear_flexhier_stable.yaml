@@ -1,35 +1,8 @@
-# STABILITY VARIANT of pinball_dna_bidi_linear_flexhier.yaml, at 4096 tokens (~500 kb at
-# 128 bp/token). Identical to that arm except for three INDEPENDENT flags, each of which
-# targets a measured way the deep flexhier arm differs from the 3-level windowed/full arms
-# (which trained stably on the same code). Flip them one at a time to attribute.
-#
-#  1. hier_pool_gate            -- relevance-gated pooling. Unweighted means give an
-#     unsupervised flank child the same weight as any other, and pinball POOLS its coarse
-#     levels rather than reading them through a softmax, so flank content enters the global
-#     block at full strength instead of being down-weighted to ~0 the way a transformer
-#     would. Per-child sigmoid gate; ~0.1% compute (one matvec vs the O(H^2) projection
-#     already there), memory-neutral, +6150 params.
-#
-#  2. hier_upward_refresh_direct -- pool L0 into every coarse level directly, instead of
-#     chaining level <- level-1. The chain multiplies (1 + gate_l*||proj_l||) across levels
-#     AND repeats every layer: 6 levels x 15 layers = 90 compounding steps here vs 36 for
-#     windowed (3 x 12). Direct pooling makes the contributions additive and independent,
-#     and gets L0 to every level in ONE layer instead of six. Symmetric with the downward
-#     path, which already gathers 0:m directly for every m -- and whose coarse<-coarse pairs
-#     measured DEAD on trained checkpoints (1:2 = +0.0005, 2:3 = -0.0001 at ep27), which is
-#     the same links the upward chain routes through.
-#
-#  3. hier_node_dropout_per_level -- the scalar form drops 10% of EVERY coarse level. As N
-#     grows the global block loses its fine levels (L2-L6 at 4096 -> L4-L6 at 32768), so the
-#     surviving rows each carry more and dropping one is a larger perturbation; at 4096 L5
-#     has 8 rows and L6 has 2. Taper to 0 at the top.
-#
-# Note hier_upper_seed_direct exists too (same change for the one-shot pooled upper seed)
-# but is left OFF: the seed runs once per forward, not 15 times, so it carries 1/15th of the
-# compounding and is not the suspect.
-#
-# All three are no-ops when off; flags-off output is bit-identical to the base arm (verified,
-# sha 65d0d414b4280a2b at block_size 1024, params unchanged at 218,498,763).
+# Stability variant of pinball_dna_bidi_linear_flexhier.yaml at 4096 tokens (~500 kb at
+# 128 bp/token). Identical to that arm apart from three independent flags, each targeting a
+# way this deep arm differs from the 3-level windowed/full arms that trained stably on the
+# same code: relevance-gated pooling, direct (unchained) upward pooling, and per-level
+# DropNode. All are no-ops when off; flip them one at a time to attribute.
 #
 # DEEP-HIERARCHY FLEXHIER ARM. Six coarse levels + a fixed-size GLOBAL BLOCK, all under
 # ONE flex_attention softmax.
@@ -149,20 +122,10 @@ local_pack_rope_axial: false
 upper_init: pooled
 upper_seed_gate_init: 1.0
 hier_upward_refresh: true
-# every: 2, not 1 -- and this is a cost recovery, not a compromise. Direct pooling reaches
-# EVERY level in one application, where the chain needed six layers to fill, so 7 direct
-# refreshes over 15 layers deliver strictly more vertical exchange than 15 chained ones.
-# Measured @4096 B=2 on the Blackwell (fwd+bwd, median of 5, eager):
-#   chained every:1 (baseline)        188.8 ms   14.16 GiB
-#   direct  every:1                   208.9 ms   14.15 GiB   (+10.6%, memory-neutral)
-#   direct  every:1 + pool gate       226.9 ms   16.22 GiB   (+20.2%, +2.06 GiB)
-#   direct  every:2 + pool gate       198.0 ms   15.10 GiB   (+4.9%,  +0.94 GiB)
-#   direct  every:3 + pool gate       191.3 ms   14.82 GiB   (+1.3%,  +0.66 GiB)
-#   direct  every:2 (no gate)         188.2 ms   14.10 GiB   (free)
-# The gate's memory is the gated child tensor saved for backward, once per level per refresh;
-# in direct mode that is 6 copies of L0 rather than one pass over shrinking levels. Raising
-# `every` is the cheapest lever on both axes. Checkpointing the pool would trade it back for
-# time if the gate proves worth every:1.
+# every: 2 rather than 1 is a cost recovery, not a compromise: direct pooling reaches every
+# level in one application where the chain needed six layers, so 7 direct refreshes over 15
+# layers exchange more than 15 chained ones. Compiled @4096 B=2: baseline 115.4ms, +gate
+# 117.4ms, +gate+direct 122.6ms.
 hier_upward_refresh_every: 2
 hier_upward_refresh_gate_init: 0.1
 hier_upward_refresh_direct: true    # pool L0 directly into every level (no chain)
@@ -218,59 +181,28 @@ local_pack_l0_coarse_rank_window: 0     # OFF: that clause is the quadratic one 
                                         # takes precedence anyway when a block exists.
 local_pack_lane_merge: false    # causal-only; inert in a bidi run
 
-# PER-LEVEL RINGS ("the triangle"): a same-level radius per level, in that level's OWN node
-# units, OR-ed into the same softmax alongside the band and the global block. Fills the
-# resolution gap between them -- the band is denominated in MIXED slots so it hands every
-# level the same ~+-128 tokens, while the block only carries whole levels it can afford.
-# At 4096 the block already takes L2-L6 (426 of 896 rows) so only L1 is ring-reachable; at
-# 32768 it takes just L4-L6 (336 rows) and L1/L2/L3 are ring-only, which is where this earns
-# its keep. Radius R at level L reaches +-R * cumulative_stride(L) tokens: at 32768 an L3
-# ring of 64 spans +-2048 tokens at 32-token granularity.
+# Per-level rings: a same-level radius per level, in that level's own node units, filling the
+# resolution gap between the mixed-slot band (which gives every level the same ~+-128 tokens)
+# and the global block. Radius 64 reaches +-65/131/262 kb at L1/L2/L3.
 #
-# HOW THEY ARE COMBINED -- local_pack_ring_merge: additive (default) | lse | union.
-# Rings run as a SECOND flex call in level-grouped order, because in the main call's ar_time
-# order a level's rows are interleaved with every other level's (L3 is 1-in-39 slots at
-# 32768), so a 128-row ring smears over ~78 tiles at ~1.6 live rows each. Regrouping makes
-# each ring one contiguous run: 1878 tiles instead of 44454 added to the union mask, 24x.
+# Rings run as a second flex call in level-grouped order, because in the main call's ar_time
+# order a level's rows are interleaved (L3 is 1-in-39 slots at 32768) and a ring smears
+# across ~78 tiles at ~1.6 live rows each: 1878 tiles regrouped vs 44454 folded into the one
+# mask. local_pack_ring_merge selects the combiner -- additive (two softmaxes summed), lse
+# (exact single softmax over the union; reproduces `union` to 1.6e-06 relative), or union
+# (single mask, no extra memory, ~4x the time).
 #
-# Measured, DNA arm N=32768 B=1, rings [0,64,64,64,0,0,0], fwd+bwd:
+# Cost at N=32768 B=1, [0,64,64,64,0,0,0], compiled -- measure compiled, since the absolute
+# ring cost is unchanged by compilation while the baseline halves:
+#   none 470.1ms 33.3GiB | additive +20.1% 39.0GiB | lse +34.9% 46.2GiB | union +82.7% 33.1GiB
+# additive/lse trade memory for time and add one graph break; union does neither.
 #
-#   mode        step        vs base   peak        note
-#   (no rings)  913.6ms       --      52.27 GiB
-#   additive   1008.7ms     +10.4%    58.09 GiB   two independent softmaxes, summed
-#   lse        1079.9ms     +18.2%    65.26 GiB   EXACT single softmax over the union
-#   union      1299.1ms     +42.2%    52.27 GiB   one mask; no extra memory, 4x the time
+# Causality verified on the causal pack config for all three modes (prefix diff 0.000e+00
+# against a control that leaks 2.8e-01). The mask keeps range and closure as separate
+# predicates: overlapping windows mean a lower-ranked same-level node can close after the
+# query, so closure is the mixed-order test, never the range one.
 #
-# So the two-call forms trade MEMORY for time and union trades time for memory. additive
-# costs +5.8 GiB and lse +13.0 GiB because the second call gathers its own q/k/v into the
-# split layout (~82 MB each per layer) and holds them for backward; union adds none because
-# it reuses the one layout. Pick by which resource is tight -- at 4 Mb with an unchecked
-# stem you are already near 87 GiB, so union may still be the right call there.
-#
-# A worthwhile optimisation if the memory bites: only coarse rows ever carry a ring radius
-# (L0's is 0), so the second call's K/V could be gathered from the 19% of rows with wt>0
-# instead of all 40272. Queries must stay full. Not done yet.
-#
-# CORRECTNESS: lse reproduces union to 1.6e-06 RELATIVE on a full forward. That single check
-# validates the split permutation, the scatter back to mixed order, the disjointness of the
-# ring mask (overlapping key sets would double-count and diverge), and the merge math.
-# additive is deliberately a DIFFERENT operator -- ring keys compete only with ring keys and
-# the two convex combinations sum, so magnitude roughly doubles. It is the default anyway
-# because the same choice measured BETTER on trained text runs, not merely cheaper.
-#
-# Cost is set by the COARSEST ringed level (waste ~ 1/density): under `union` at 32768,
-# [0,64,0,..] costs +10.4% and [0,0,0,64,..] +41.4%, and [0,64,64,64,..] is no worse than
-# L3 alone -- so ring everything finer than the coarsest level you are willing to pay for.
-#
-# Causality verified on the causal pack config (flex engaged, rings live and changing the
-# output): prefix diff exactly 0.000e+00 with and without a global block, while the same
-# probe on a bidi build leaks 1.07e-01 -- so the test is sensitive and the rings are clean.
-# The mask keeps RANGE and CAUSALITY as separate predicates: the range test is on positions,
-# and closure reuses the band's packed-order test, because overlapping windows mean a
-# lower-ranked same-level node can close AFTER the query.
-#
-# OFF here: this arm is the stability test, and +42% would confound it. Flip it for a reach
-# run once the gate/direct verdict is in.
+# Off here: this arm is the stability test, and the ring cost would confound it.
 # local_pack_ring_windows: [0, 64, 64, 64, 0, 0, 0]
 
 # Source gating is on in every arm so the arms differ by mechanism, not parameter count.

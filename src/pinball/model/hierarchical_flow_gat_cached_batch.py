@@ -2295,33 +2295,19 @@ class HierarchicalFlowGAT(nn.Module):
         hier_upward_refresh: bool = False,
         hier_upward_refresh_every: int = 1,       # apply after every k-th layer call
         hier_upward_refresh_gate_init: float = 0.0,
-        # DIRECT (unchained) upward pooling. The chained form re-pools level lvl from the
-        # ALREADY-REFRESHED level lvl-1, so one call carries L0 to the top -- but the per-level
-        # factors (1 + gate_l * ||proj_l||) MULTIPLY, giving a sensitivity that compounds over
-        # levels AND over layers (levels*layers steps: 90 at 6 levels x 15 layers vs 36 at
-        # 3 x 12). Direct mode pools L0 itself into every coarse level using that level's
-        # CUMULATIVE window, so contributions are additive and independent, L0 reaches every
-        # level in ONE layer, and the parameter count is unchanged. Symmetric with the
-        # downward path, which already gathers 0:m directly for every m. Costs ~12*N*H of
-        # pooling per call instead of ~1.2*N*H -- a memory-bound reduction, ~1% of the packed
-        # attention in the same layer.
+        # Direct (unchained) upward pooling: pool L0 into every coarse level using that
+        # level's cumulative window, instead of re-pooling level lvl from the already
+        # refreshed level lvl-1. The chained form multiplies per-level factors and repeats
+        # every layer, and takes L calls for L0 to reach the top; direct is additive across
+        # levels and reaches every level in one. Parameter count is unchanged.
         hier_upward_refresh_direct: bool = False,
         hier_upper_seed_direct: bool = False,     # same, for the one-shot pooled upper seed
-        # Relevance-gated pooling. Unweighted means give an unsupervised / uninformative child
-        # the same weight as any other, so flank content is averaged into the coarse levels at
-        # full strength -- unlike a transformer, where a softmax can simply assign it ~0. A
-        # per-child sigmoid gate restores that: pooled = mean_j(sigmoid(<u_l, x_j> + b_l) * x_j).
-        # The gate is per CHILD (not per parent-window), so it needs no [.., comp] tensor and
-        # fuses into the same unfold reduction -- one matvec, O(N*H) against the O(N*H^2)
-        # projection already in the path. Dividing by the window COUNT rather than by the gate
-        # sum is deliberate: a window whose children are all low-gate then produces a small
-        # vector instead of a renormalised average of noise.
-        #   bias_init PICKS A TRADE. Large values reproduce the unweighted mean (sigmoid(10) =
-        #   0.99995) but SATURATE the gate -- sigmoid'(10) = 4.5e-5, so it barely trains and the
-        #   feature does nothing. Use ~10 only to warm-start an existing checkpoint. For a fresh
-        #   run use the default 2.0: sigmoid(2) = 0.881 with sigmoid'(2) = 0.105, so the pool
-        #   starts at 88% of the mean (a constant the downstream projection absorbs) and the
-        #   gate is actually free to move.
+        # Per-child sigmoid relevance gate on pooling: pooled = mean_j(sigmoid(<u_l, x_j>
+        # + b_l) * x_j). Unweighted means admit an uninformative child at full strength,
+        # where a softmax would give it ~0. The gate is per child, not per parent-window, so
+        # it needs no [.., comp] tensor and fuses into the same unfold reduction. Dividing by
+        # the window count rather than the gate sum lets an all-low-gate window produce a
+        # small vector instead of a rescaled average.
         hier_pool_gate: bool = False,
         hier_pool_gate_bias_init: float = 2.0,
         # Per-layer downward refresh — the linear-cost DENSE replacement for the bridges/
@@ -2471,6 +2457,17 @@ class HierarchicalFlowGAT(nn.Module):
         # local_pack_coarse_window -- and the per-level split measured 1.8x SLOWER at 4096
         # because six small flash calls are launch-bound, not FLOP-bound.
         local_pack_top_global: bool = False,
+        # Row budget for the global tier. Whole levels top-down while they fit; "sqrt"
+        # resolves to floor(sqrt(N)), the condition under which the tier's own n^2
+        # attention stays inside the O(N) budget. 0 keeps the topmost level alone.
+        # A wider tier is also DENSER in the bank, so the coarse window needed to reach it
+        # shrinks as bank/n_tier -- widening the tier makes the lane cheaper, not dearer.
+        local_pack_top_global_budget: Union[int, str, None] = 0,
+        # How many global-tier nodes an "auto" coarse window must span. 2 is the floor that
+        # guarantees the one-hop ascent; higher values widen the lane, which measured free
+        # over a 5x range at 16384 and gives the level below the tier a usable receptive
+        # field. Ignored unless local_pack_coarse_window is "auto".
+        local_pack_coarse_window_tier_nodes: int = 2,
         # Fixed-size GLOBAL BLOCK, filled top-down by whole levels. Take the top level; if it
         # fits in the budget add the next level down whole; repeat. Every pack query then
         # attends to that block IN ADDITION to its local window.
@@ -2482,41 +2479,16 @@ class HierarchicalFlowGAT(nn.Module):
         # at long N it narrows to the top level alone. Pair it with a level count chosen so
         # n_top <= B, otherwise nothing fits and the block is empty.
         local_pack_global_block: int = 0,
-        # PER-LEVEL RINGS. A same-level radius for EVERY level, given in that level's own
-        # node units (so ring 64 at L2 reaches +-64 L2 nodes, not +-64 mixed slots). This is
-        # the "triangle": resolution that decays with distance instead of the two-tier
-        # "fine within +-W tokens, else coarse everywhere" the band+block pair gives today.
-        #
-        # WHY IT IS NOT REDUNDANT WITH THE BAND. local_pack_window is denominated in MIXED
-        # slots, so it covers a fixed PHYSICAL span at every level -- at N=32768 a +-156-slot
-        # band gives every level the same +-128 tokens, which is narrower than an L4 node's
-        # own 256-token span and far narrower than L6's 4096. Rings are denominated per level,
-        # so +-64 gives L1 +-512 tokens, L2 +-1024, L3 +-2048, L4 +-8192.
-        #
-        # COMPOSES WITH THE GLOBAL BLOCK, does not replace it. The block still takes whole
-        # levels top-down while they fit, which is what makes the degenerate case work: when
-        # the top levels collapse to 1-2 nodes they cost almost nothing and the loop keeps
-        # descending, so "global" automatically lands on the topmost level that is actually
-        # discriminative. Rings then cover the levels the budget could NOT take whole -- and
-        # that budget is currently underspent (at N=32768 the block takes 336 of 896 rows and
-        # stops, because L3's 1024 will not fit), so the rings largely ride for free.
+        # Per-level ring radii, in each level's own node units. Complements the band
+        # (denominated in mixed slots, so every level gets the same physical span) and the
+        # global block (whole levels only, taken top-down while they fit the row budget).
         local_pack_ring_windows: Optional[Sequence[int]] = None,
-        # HOW the ring keys are combined with the band+block softmax.
-        #   "additive" (default) -- rings run as a SECOND flex call in level-grouped order
-        #       and their output is summed. Two independent softmaxes, so ring keys compete
-        #       only with ring keys. Measured 1.238ms vs 0.739ms baseline at N=32768 (H=16,
-        #       D=64), against 4.5ms projected for folding them into the one mask.
-        #   "lse" -- same two calls, but recombined by log-sum-exp into the EXACT single
-        #       softmax over the union (valid because the ring mask excludes every band and
-        #       block row, so the key sets are disjoint). Correct, and 1.71x the cost of
-        #       additive (1.967 vs 1.165ms) -- the merge is elementwise over [B,H,N,D].
-        #   "union" -- the original single-call form: ring folded into the one mask_mod.
-        #       Exact like lse and needs no merge, but the rings are SCATTERED in ar_time
-        #       order (L3 sits 1-in-39 slots at 32768), so block-sparsity collapses:
-        #       52628 tiles vs 8174, waste 7.02x vs 1.29x, +41% step. Kept for reference.
-        # Why "additive" is not merely the cheap option: the same choice was measured on
-        # trained text runs, where additive BEAT the fused union late in training in two
-        # matched pairs (see the flex-union note in local_pack_flex_union).
+        # Ring combiner. "additive" and "lse" run the rings as a second flex call in
+        # level-grouped order, where each ring is one contiguous run instead of scattered
+        # across ar_time order; "lse" recombines them into the exact single softmax over the
+        # union (valid because the ring mask excludes every band and block row), "additive"
+        # simply sums the two. "union" folds the rings into the one mask instead: exact and
+        # allocation-free, but block-sparsity collapses (7.0x waste vs 1.3x).
         local_pack_ring_merge: str = "additive",
         # Combine the mixed window + coarse lane for coarse queries as ONE unified softmax
         # over the union of both key sets (log-sum-exp merge of the two flash calls),
@@ -2927,7 +2899,18 @@ class HierarchicalFlowGAT(nn.Module):
         ]
         self.local_pack_level_bias = bool(local_pack_level_bias)
         self.local_pack_coarse_lane = bool(local_pack_coarse_lane)
-        if isinstance(local_pack_coarse_window, (list, tuple)):
+        if isinstance(local_pack_coarse_window, str):
+            # "auto": bank/n_tier, resolved at spec-build time. That is the smallest radius
+            # for which every coarse row is guaranteed a tier node inside its window, so the
+            # ascent to the global tier is one hop at any N.
+            if local_pack_coarse_window.strip().lower() != "auto":
+                raise ValueError(
+                    "local_pack_coarse_window must be an int, a list, or 'auto', got %r."
+                    % (local_pack_coarse_window,))
+            self.local_pack_coarse_window_per_level: Optional[List[int]] = None
+            self.local_pack_coarse_window: Union[int, str] = "auto"
+            logger.info("Packed coarse lane: window AUTO (bank/n_tier).")
+        elif isinstance(local_pack_coarse_window, (list, tuple)):
             # One radius per coarse level; padded/truncated to the configured depth so a
             # config written for 3 coarse levels still resolves on a deeper hierarchy.
             _cw = [max(0, int(v)) for v in local_pack_coarse_window]
@@ -2955,9 +2938,24 @@ class HierarchicalFlowGAT(nn.Module):
             logger.info("Per-level rings enabled: %s (own-level node units).",
                         self.local_pack_ring_windows)
         self.local_pack_top_global = bool(local_pack_top_global)
+        _tgb = local_pack_top_global_budget
+        if isinstance(_tgb, str):
+            if _tgb.strip().lower() != "sqrt":
+                raise ValueError(
+                    "local_pack_top_global_budget must be an int or 'sqrt', got %r." % (_tgb,))
+            self.local_pack_top_global_budget: Union[int, str] = "sqrt"
+        else:
+            self.local_pack_top_global_budget = max(0, int(_tgb or 0))
+        _ctn = int(local_pack_coarse_window_tier_nodes or 2)
+        if _ctn < 2:
+            logger.warning("local_pack_coarse_window_tier_nodes=%d would not guarantee a tier "
+                           "node in every coarse window; clamping to 2.", _ctn)
+            _ctn = 2
+        self.local_pack_coarse_window_tier_nodes = _ctn
         if self.local_pack_top_global:
-            logger.info("Packed coarse lane: global TOP level attention enabled "
-                        "(local_pack_top_global).")
+            logger.info("Packed coarse lane: global TOP attention enabled "
+                        "(local_pack_top_global, budget=%s).",
+                        self.local_pack_top_global_budget)
         self.local_pack_lane_merge = bool(local_pack_lane_merge)
         self.local_pack_coarse_global = bool(local_pack_coarse_global)
         self.local_pack_l0_coarse_bands = bool(local_pack_l0_coarse_bands)
@@ -5888,15 +5886,11 @@ class HierarchicalFlowGAT(nn.Module):
                 _mask[_rows] = True
                 spec["global_block_mask"] = _mask
 
-        # PER-LEVEL RINGS (local_pack_ring_windows). Converted here from "nodes at that
-        # level" to L0 TOKENS by the level's cumulative stride, so the consumer can test the
-        # radius against spec["pos"] (each packed row's close time) with a plain subtraction.
-        # Comparing POSITIONS rather than level-ranks is deliberate: it keeps the RANGE test
-        # and the CAUSALITY test as separate predicates. Rank order cannot stand in for
-        # causality here -- windows overlap (overlap 0.5 => a parent's window runs `comp`
-        # past its start), so a lower-ranked node at the same level can close AFTER the
-        # query, and a one-sided rank test would leak exactly at the frontier. The consumer
-        # therefore ANDs the ring with the same packed-order closure test the band uses.
+        # Ring radii, converted from nodes-at-that-level to L0 tokens via the cumulative
+        # stride so the consumer can test them against spec["pos"] with one subtraction.
+        # Comparing positions rather than level ranks keeps the range test and the causality
+        # test separate: windows overlap, so a lower-ranked same-level node can close after
+        # the query and rank order is not a sound proxy for closure.
         _rw = getattr(self, "local_pack_ring_windows", None)
         if _rw and any(int(v) > 0 for v in _rw):
             _wt = []
@@ -5912,18 +5906,17 @@ class HierarchicalFlowGAT(nn.Module):
                 _mode = str(getattr(self, "local_pack_ring_merge", "additive"))
                 spec["flex_ring_merge"] = _mode
                 if _mode in ("additive", "lse"):
-                    # SPLIT (level-grouped) ORDER for the second call. Packed order is
-                    # already ar_time-sorted, so a STABLE argsort on level alone yields
-                    # (level, ar_time) -- each level becomes one contiguous run, which is
-                    # what turns a ring from ~78 sparsely-populated tiles into ~2 full ones.
+                    # Level-grouped order for the second call. Packed order is already
+                    # ar_time-sorted, so a stable argsort on level alone gives (level,
+                    # ar_time) and each level becomes one contiguous run.
                     _rp = torch.argsort(lvl_packed, stable=True)
                     _inv = torch.empty_like(_rp)
                     _inv[_rp] = torch.arange(n_total, device=_rp.device)
                     spec["flex_ring_perm"] = _rp.contiguous()
                     spec["flex_ring_inv"] = _inv.contiguous()
                     spec["flex_ring_pos_s"] = pos.index_select(0, _rp).contiguous()
-                    # radius folded per ROW here, so the kernel does ONE gather per key
-                    # instead of chaining level -> radius on every masked element.
+                    # radius folded per row, so the kernel does one gather per key rather
+                    # than chaining level -> radius on every masked element.
                     spec["flex_ring_wtok_s"] = (
                         _wt_t.index_select(0, lvl_packed).index_select(0, _rp).contiguous())
                     _gb = spec.get("global_block_mask", None)
@@ -5980,7 +5973,7 @@ class HierarchicalFlowGAT(nn.Module):
         elif (
             bool(getattr(self, "local_pack_coarse_lane", False))
             and len(lane_q_levels) > 0
-            and int(getattr(self, "local_pack_coarse_window", 0)) > 0
+            and self._resolved_lane_window(spec, lvl_packed, lane_q_levels) > 0
         ):
             lane_rows = torch.nonzero(lvl_packed > 0, as_tuple=False).view(-1)
             if lane_rows.numel() > 1:
@@ -6001,7 +5994,8 @@ class HierarchicalFlowGAT(nn.Module):
                 spec["lane_levels"] = lane_levels
                 spec["lane_query_sel"] = lane_sel
                 spec["lane_query_nodes"] = lane_perm.index_select(0, lane_sel)
-                spec["lane_window"] = int(self.local_pack_coarse_window)
+                spec["lane_window"] = self._resolved_lane_window(
+                    spec, lvl_packed, lane_q_levels)
                 # For the LSE merge: lane queries' row positions in the MIXED packing (to
                 # fetch their mixed-window output/LSE), plus host copies of both position
                 # arrays so the LSE recompute can slice keys without device syncs.
@@ -6081,12 +6075,20 @@ class HierarchicalFlowGAT(nn.Module):
                             0, flex_perm_local).contiguous()
                     spec["flex_levels"] = lvl_packed.clamp(0, _max_lvl).index_select(
                         0, flex_perm_local).contiguous()
-        # Global TOP level (local_pack_top_global). Only the topmost coarse level, so the
-        # cost is n_top^2 -- linear in N exactly while n_top <= sqrt(N). Skipped when the top
-        # level has <= 1 node (nothing to attend over) or is not a query level.
+        # GLOBAL TIER (local_pack_top_global). Whole levels top-down while they fit
+        # local_pack_top_global_budget; the tier attends all-to-all over itself at cost
+        # n_tier^2, linear in N exactly while n_tier <= sqrt(N). Budget 0 keeps the topmost
+        # level alone, which at short N can leave 2 nodes standing in for all global context.
+        # Skipped when the tier has <= 1 node, or when no level is a lane query level.
         if bool(getattr(self, "local_pack_top_global", False)) and len(lane_q_levels) > 0:
             _top = max(lane_q_levels)
-            _rows = spec["level_rows"][_top] if _top < len(spec["level_rows"]) else None
+            _sel = self._resolve_global_tier(spec["level_rows"], _top)
+            if len(_sel) > 1:
+                # Level-major concatenation is not time-ordered, and the consumer attends
+                # over these rows with a causal window, so restore packed (ar_time) order.
+                _rows = torch.sort(torch.cat(_sel)).values.contiguous()
+            else:
+                _rows = _sel[0] if _sel else None
             if _rows is not None and int(_rows.numel()) > 1:
                 spec["top_global"] = {
                     "level": int(_top),
@@ -6094,10 +6096,70 @@ class HierarchicalFlowGAT(nn.Module):
                     "nodes": perm.index_select(0, _rows),
                     "pos": pos.index_select(0, _rows).contiguous(),
                 }
+                if len(_sel) > 1:
+                    # Only for a multi-level tier: a single-level tier keeps the scalar tag
+                    # path, so the default stays bit-identical.
+                    spec["top_global"]["levels"] = spec["levels"].index_select(
+                        0, _rows).contiguous()
                 if "pos_nd" in spec:
                     spec["top_global"]["pos_nd"] = spec["pos_nd"].index_select(0, _rows).contiguous()
         self._local_pack_spec_cache = (key, spec)
         return spec
+
+    def _resolve_global_tier(self, level_rows: List[torch.Tensor], top_level: int):
+        """Levels forming the all-to-all global tier: whole levels top-down while they fit
+        local_pack_top_global_budget ("sqrt" -> floor(sqrt(N))). Budget 0 returns the top
+        level alone, which is the pre-tier behaviour. Returns row tensors, top level first."""
+        raw = getattr(self, "local_pack_top_global_budget", 0)
+        if isinstance(raw, str):
+            n0 = int(level_rows[0].numel()) if level_rows else 0
+            budget = math.isqrt(max(0, n0)) if raw.strip().lower() == "sqrt" else 0
+        else:
+            budget = max(0, int(raw or 0))
+        top_level = int(top_level)
+        if budget <= 0:
+            r = level_rows[top_level] if top_level < len(level_rows) else None
+            return [r] if r is not None else []
+        sel, tot = [], 0
+        for lv in range(top_level, 0, -1):
+            r = level_rows[lv] if lv < len(level_rows) else None
+            if r is None or int(r.numel()) == 0:
+                continue
+            if sel and tot + int(r.numel()) > budget:
+                break
+            sel.append(r)
+            tot += int(r.numel())
+        return sel
+
+    def _resolved_lane_window(self, spec: Dict[str, Any], lvl_packed: torch.Tensor,
+                              lane_q_levels: Sequence[int]) -> int:
+        """Scalar lane radius. "auto" resolves to bank/n_tier -- the smallest radius that
+        still puts a global-tier node inside every coarse row's window, so widening the tier
+        narrows the lane rather than adding to it."""
+        raw = getattr(self, "local_pack_coarse_window", 0)
+        if not isinstance(raw, str):
+            return max(0, int(raw or 0))
+        n_bank = int((lvl_packed > 0).sum())
+        if not lane_q_levels or n_bank <= 0:
+            return 0
+        tier = self._resolve_global_tier(spec["level_rows"], max(lane_q_levels))
+        if not tier:
+            return 0
+        n_tier = sum(int(r.numel()) for r in tier)
+        k = int(getattr(self, "local_pack_coarse_window_tier_nodes", 2) or 2)
+        # Mean spacing sets the k-node width, but it does NOT bound the worst case: tier
+        # levels carry large ar_time offsets, so the first tier node sits well inside the
+        # bank and the rows before it have no tier node at any spacing-derived radius.
+        # Take the true worst-case distance to the nearest tier row as a hard floor.
+        coarse = lvl_packed > 0
+        lane_rank = torch.cumsum(coarse.long(), 0) - 1
+        tier_rows = torch.cat(tier) if len(tier) > 1 else tier[0]
+        tp = torch.sort(lane_rank.index_select(0, tier_rows)).values
+        head = int(tp[0])
+        tail = n_bank - 1 - int(tp[-1])
+        inner = int((tp[1:] - tp[:-1]).max()) // 2 if int(tp.numel()) > 1 else n_bank
+        floor_w = max(head, tail, inner)
+        return max(1, floor_w, (k * (n_bank // max(1, n_tier))) // 2)
 
     def _apply_downward_refresh(
         self, x: torch.Tensor, level_offsets: torch.Tensor, node_ar_time: torch.Tensor

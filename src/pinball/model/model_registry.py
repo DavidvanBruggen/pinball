@@ -217,10 +217,15 @@ def build_pinball_model(
         # int (shared window over the whole coarse bank) or list (per-coarse-level radius,
         # 0 = global for that level). int() here would raise on the list form.
         local_pack_top_global=bool(getattr(args, "local_pack_top_global", False)),
+        local_pack_top_global_budget=getattr(args, "local_pack_top_global_budget", 0),
+        local_pack_coarse_window_tier_nodes=int(
+            getattr(args, "local_pack_coarse_window_tier_nodes", 2) or 2),
         local_pack_global_block=int(getattr(args, "local_pack_global_block", 0) or 0),
         local_pack_coarse_window=(
             list(getattr(args, "local_pack_coarse_window"))
             if isinstance(getattr(args, "local_pack_coarse_window", None), (list, tuple))
+            else str(getattr(args, "local_pack_coarse_window"))
+            if isinstance(getattr(args, "local_pack_coarse_window", None), str)
             else int(getattr(args, "local_pack_coarse_window", 512) or 0)),
         local_pack_coarse_global=bool(getattr(args, "local_pack_coarse_global", False)),
         local_pack_l0_coarse_bands=bool(getattr(args, "local_pack_l0_coarse_bands", False)),

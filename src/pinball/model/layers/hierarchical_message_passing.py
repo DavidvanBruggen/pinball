@@ -3835,16 +3835,15 @@ class HierarchicalMessagePassing(MessagePassing):
         return keep.view(B, -1, 1, 1).to(dtype)
 
     def _flex_ring_call(self, qp, kp, vp, spec: Dict, causal: bool, want_lse: bool):
-        """Rings as their OWN flex call, in LEVEL-GROUPED (split) order.
+        """Rings as their own flex call, in level-grouped order.
 
-        Why a second call rather than another clause in the union mask: the union mask runs
-        in ar_time order, where a level's rows are interleaved with every other level's (L3
-        is 1-in-39 slots at N=32768), so a 128-row ring smears over ~78 tiles holding ~1.6
-        live rows each. Regrouping by level makes each ring one contiguous run -- measured
-        1878 tiles here against 44454 added to the union mask, a 24x reduction.
+        A separate call rather than another clause in the union mask because that mask runs
+        in ar_time order, where a level's rows are interleaved with every other level's and a
+        ring smears across many sparsely-populated tiles. Regrouping by level makes each ring
+        one contiguous run (1878 tiles against 44454 added to the union mask).
 
-        Returns (out, lse) with out [B, N, H, D] and lse [B, H, N], both scattered back to
-        MIXED order so the caller can combine without knowing this layout.
+        Returns (out, lse), shapes [B, N, H, D] and [B, H, N], both scattered back to mixed
+        order so the caller need not know this layout.
         """
         from torch.nn.attention.flex_attention import flex_attention, create_block_mask
         rp, inv = spec["flex_ring_perm"], spec["flex_ring_inv"]
@@ -3857,17 +3856,16 @@ class HierarchicalMessagePassing(MessagePassing):
             cm = bool(causal)
 
             def ring_mask(b, h, qi, ki):
-                # rp[i] IS the mixed rank of split row i, so band distance costs no extra
-                # array. RANGE and CAUSALITY stay separate predicates (see the spec-side
-                # note): overlapping windows mean a lower-ranked same-level node can close
-                # AFTER the query, so closure is the mixed-order test, never the range one.
+                # rp[i] is the mixed rank of split row i, so band distance needs no extra
+                # array. Range and causality stay separate predicates: overlapping windows
+                # let a lower-ranked same-level node close after the query, so closure is
+                # the mixed-order test, never the range one.
                 dm = rp[qi] - rp[ki]
                 wt = wt_s[ki]
                 rng = (wt > 0) & ((pos_s[qi] - pos_s[ki]).abs() <= wt)
                 band = ((dm >= 0) & (dm <= w_mix)) if cm else (dm.abs() <= w_mix)
-                # DISJOINT by construction: drop anything the band or the global block
-                # already delivers. Required for lse to be exact, and it stops additive
-                # from double-weighting a key.
+                # Disjoint by construction: drop anything the band or global block already
+                # delivers. Required for lse to be exact, and stops additive double-counting.
                 keep = rng & (~band) & (~ing_s[ki])
                 return (keep & (dm >= 0)) if cm else keep
 
@@ -3885,9 +3883,8 @@ class HierarchicalMessagePassing(MessagePassing):
         v_r = vp.index_select(1, rp).transpose(1, 2)
         _p = float(self.dropout.p) if self.training else 0.0
         if _p > 0.0:
-            # Same token-wise V dropout the main call uses (flex has no dropout_p). Drawn
-            # independently of the main call's mask -- these are disjoint key sets, so there
-            # is no shared key whose two draws would have to agree.
+            # Token-wise V dropout, as in the main call (flex has no dropout_p). Drawn
+            # independently: the key sets are disjoint, so no key is sampled twice.
             _keep = torch.rand(v_r.shape[0], v_r.shape[1], v_r.shape[2], 1,
                                device=v_r.device, dtype=torch.float32) >= _p
             v_r = v_r * (_keep.to(v_r.dtype) / (1.0 - _p))
@@ -3932,19 +3929,16 @@ class HierarchicalMessagePassing(MessagePassing):
             causal_mask = bool(causal)
             in_glob = spec.get("flex_in_global", None)
 
-            # PER-LEVEL RINGS. ring_wt[level] is that level's radius already converted to L0
-            # tokens, so the range test is |pos[q] - pos[k]| <= ring_wt[level[k]] -- a radius
-            # that scales with the level's own granularity while staying one subtraction.
-            # ring_pos / ring_lvl are in PACKED (mixed) order, which is the index space the
-            # prefix branch works in directly; the permuted branches reach them through
-            # r[.], their split->mixed map.
+            # Ring radii, already in L0 tokens, so the range test is a single subtraction
+            # against spec["pos"]. These arrays are in packed (mixed) order, which the prefix
+            # branch indexes directly; the permuted branches reach them through r[.].
             ring_wt = spec.get("flex_ring_wtok", None)
             ring_pos = spec.get("pos", None)
             ring_lvl = spec.get("levels", None)
             if ring_pos is None or ring_lvl is None:
                 ring_wt = None
-            # additive/lse run the rings as a SEPARATE call in level-grouped order, so the
-            # clause must NOT also be in this mask or every ring key is counted twice.
+            # additive/lse run the rings as a separate call, so the clause must not also
+            # appear here or every ring key is counted twice.
             if str(spec.get("flex_ring_merge", "union")) != "union":
                 ring_wt = None
 
@@ -3966,19 +3960,14 @@ class HierarchicalMessagePassing(MessagePassing):
                     dr = qi - p
                     band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
                     if ring_wt is not None:
-                        # RANGE: physical distance against the key level's own radius.
                         wt = ring_wt[ring_lvl[p]]
                         ring = (wt > 0) & ((ring_pos[qi] - ring_pos[p]).abs() <= wt)
-                        # CAUSALITY: the SAME packed-order closure test the band uses. Never
-                        # inferred from the range test -- see the spec-side note on why
-                        # overlapping windows make rank order an unsound proxy.
-                        if causal_mask:
+                        if causal_mask:      # closure, never inferred from the range test
                             ring = ring & (dr >= 0)
                         band = band | ring
-                    # Dedup AFTER the union: block rows are physically duplicated into the
-                    # K/V prefix, so anything in the block must reach the query through the
-                    # prefix only. Without this a ring row that is also a block row is TWO
-                    # keys and silently carries a +ln2 advantage.
+                    # Dedup after the union: block rows are duplicated into the K/V prefix,
+                    # so they must reach the query through the prefix only, or a row in both
+                    # clauses becomes two keys with a +ln2 advantage.
                     band = band & (~in_glob[p])
                     if causal_mask:
                         # A block row is visible once it has closed (its own packed rank).
@@ -4128,10 +4117,9 @@ class HierarchicalMessagePassing(MessagePassing):
                 l_r = l_r.index_select(2, perm)
         if not _lse:
             return out + o_r
-        # EXACT single softmax over the union, valid because ring_mask excludes every band
-        # and block row. A ring row with no keys returns lse = -inf -> weight 0 -> the main
-        # result passes through untouched; the main call always has self in band, so the
-        # denominator can never be zero.
+        # Exact single softmax over the union, valid because ring_mask excludes every band
+        # and block row. A ring row with no keys returns lse = -inf, hence weight 0; the main
+        # call always has self in band, so the denominator cannot vanish.
         L1 = lse_main.permute(0, 2, 1).unsqueeze(-1).float()
         L2 = l_r.permute(0, 2, 1).unsqueeze(-1).float()
         m = torch.maximum(L1, L2)
@@ -4434,9 +4422,15 @@ class HierarchicalMessagePassing(MessagePassing):
                     kt.reshape(B * n_t, self.num_heads, self.head_dim), rep
                 ).view(B, n_t, self.num_heads, self.head_dim)
             if getattr(self, "local_pack_level_bias", False):
-                _ti = min(int(_topg["level"]), int(self.local_pack_level_k_emb.size(0)) - 1)
-                kt = kt + self.local_pack_level_k_emb[_ti].unsqueeze(0).unsqueeze(0).to(kt.dtype)
-                vt = vt + self.local_pack_level_v_emb[_ti].unsqueeze(0).unsqueeze(0).to(vt.dtype)
+                _tl = _topg.get("levels", None)
+                if _tl is None:
+                    _ti = min(int(_topg["level"]), int(self.local_pack_level_k_emb.size(0)) - 1)
+                    kt = kt + self.local_pack_level_k_emb[_ti].unsqueeze(0).unsqueeze(0).to(kt.dtype)
+                    vt = vt + self.local_pack_level_v_emb[_ti].unsqueeze(0).unsqueeze(0).to(vt.dtype)
+                else:
+                    _tl = _tl.clamp(max=int(self.local_pack_level_k_emb.size(0)) - 1)
+                    kt = kt + self.local_pack_level_k_emb.index_select(0, _tl).unsqueeze(0).to(kt.dtype)
+                    vt = vt + self.local_pack_level_v_emb.index_select(0, _tl).unsqueeze(0).to(vt.dtype)
             if node_keep is not None:
                 vt = vt * node_keep.index_select(1, rows_t)
             out_t = self._compute_local_attn_from_qkv(
