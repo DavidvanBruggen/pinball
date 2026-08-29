@@ -4400,39 +4400,14 @@ class HierarchicalMessagePassing(MessagePassing):
         if _topg is not None:
             rows_t = _topg["rows"]
             n_t = int(rows_t.numel())
-            qt = q_pre.index_select(1, rows_t)
-            kt = k_pre.index_select(1, rows_t)
-            vt = v.index_select(1, rows_t)
-            _tnd = _topg.get("pos_nd", None) if pos_nd is not None else None
-            if hasattr(self, "rotary_pos_enc") and _tnd is not None:
-                nd = int(_tnd.size(-1))
-                rep = _tnd.view(1, n_t, nd).expand(B, n_t, nd).reshape(B * n_t, nd)
-                qt = self.rotary_pos_enc.apply_rotary_pos_emb(
-                    qt.reshape(B * n_t, self.num_heads, self.head_dim), rep
-                ).view(B, n_t, self.num_heads, self.head_dim)
-                kt = self.rotary_pos_enc.apply_rotary_pos_emb(
-                    kt.reshape(B * n_t, self.num_heads, self.head_dim), rep
-                ).view(B, n_t, self.num_heads, self.head_dim)
-            elif hasattr(self, "rotary_pos_enc"):
-                rep = _topg["pos"].view(1, n_t).expand(B, n_t).reshape(-1)
-                qt = self.rotary_pos_enc.apply_rotary_pos_emb(
-                    qt.reshape(B * n_t, self.num_heads, self.head_dim), rep
-                ).view(B, n_t, self.num_heads, self.head_dim)
-                kt = self.rotary_pos_enc.apply_rotary_pos_emb(
-                    kt.reshape(B * n_t, self.num_heads, self.head_dim), rep
-                ).view(B, n_t, self.num_heads, self.head_dim)
-            if getattr(self, "local_pack_level_bias", False):
-                _tl = _topg.get("levels", None)
-                if _tl is None:
-                    _ti = min(int(_topg["level"]), int(self.local_pack_level_k_emb.size(0)) - 1)
-                    kt = kt + self.local_pack_level_k_emb[_ti].unsqueeze(0).unsqueeze(0).to(kt.dtype)
-                    vt = vt + self.local_pack_level_v_emb[_ti].unsqueeze(0).unsqueeze(0).to(vt.dtype)
-                else:
-                    _tl = _tl.clamp(max=int(self.local_pack_level_k_emb.size(0)) - 1)
-                    kt = kt + self.local_pack_level_k_emb.index_select(0, _tl).unsqueeze(0).to(kt.dtype)
-                    vt = vt + self.local_pack_level_v_emb.index_select(0, _tl).unsqueeze(0).to(vt.dtype)
-            if node_keep is not None:
-                vt = vt * node_keep.index_select(1, rows_t)
+            # Gather from the PACKED tensors, not the node-indexed ones. qp/kp/vp are
+            # q_pre/k_pre/v already permuted into packed order AND already carrying RoPE,
+            # the level bias and node_keep -- exactly what the global block reads. rows_t
+            # are packed row numbers, so indexing q_pre (node-indexed) with them mixes up
+            # which node each vector belongs to and silently pulls in future content.
+            qt = qp.index_select(1, rows_t)
+            kt = kp.index_select(1, rows_t)
+            vt = vp.index_select(1, rows_t)
             out_t = self._compute_local_attn_from_qkv(
                 q_lvl=qt, k_lvl=kt, v_lvl=vt,
                 window=n_t, causal=pack_causal,

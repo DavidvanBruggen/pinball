@@ -172,7 +172,14 @@ def plan_hierarchy(
                 quad_pairs += n_l * n_l
         lane_all = quad_pairs > 0
     else:
-        cw_repr = int(local_pack_coarse_window)
+        # "auto" resolves at build time from the real tier spacing, which needs the
+        # packed layout this planner does not build. Cost it as the unrestricted lane so
+        # the estimate is an upper bound rather than a silent under-count.
+        if isinstance(local_pack_coarse_window, str):
+            cw_repr = 0 if local_pack_coarse_window.strip().lower() == "auto" else int(
+                local_pack_coarse_window)
+        else:
+            cw_repr = int(local_pack_coarse_window)
         reach = bank if cw_repr <= 0 else min(2 * cw_repr + 1, bank)
         lane_pairs = bank * reach
         lane_all = reach >= bank
