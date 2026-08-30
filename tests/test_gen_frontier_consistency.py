@@ -26,12 +26,17 @@ CFG = dict(
     num_layers=[0, 0, 0, 0], internal_cycles=[0, 0, 0, 0],
     refinement_style="unified", unified_refinement_cycles=1,
     compression_ratios=[16, 4, 4], overlap_ratios=[0.5, 0.5, 0.5],
-    local_attn_levels=[1, 2, 3], local_attn_windows=[0, 8, 16, 32],
-    local_attn_causal_levels=[1, 2, 3],
+    attn_backend="sdpa",
+    local_attn_levels=[0, 1, 2, 3], local_attn_windows=[16, 8, 16, 32],
+    local_attn_causal_levels=[0, 1, 2, 3],
     dropout=0.0, norm_type="layernorm", l0_cycles=0,
     iterative_refinement_cycles=0, local_connectivity_window_size=0,
     l0_local_window=1, train_mode="ar", ar_graph_causal=True,
     use_hqd=False, upper_init="pooled",
+    local_pack_cross_level=True, local_pack_window=20,
+    local_pack_query_levels=[0, 1, 2, 3], local_pack_level_bias=True,
+    local_pack_coarse_lane=True, local_pack_coarse_window=24,
+    local_pack_top_global=True, local_pack_top_global_budget=10,
 )
 
 
@@ -45,6 +50,16 @@ def test_frontier_consistency():
 
     look = model._gen_frontier_lookahead()
     assert look > 0, look
+    # Tier level membership must be tied to the training shape. A shorter frontier has
+    # fewer rows per level and previously admitted an extra lower level.
+    ref_sizes = model._predict_level_sizes(cfg.block_size)
+    ref_rows = [torch.full((int(n),), level) for level, n in enumerate(ref_sizes)]
+    short_rows = [torch.full((max(1, int(n) // 2),), level) for level, n in enumerate(ref_sizes)]
+    ref_tier = model._resolve_global_tier(ref_rows, len(ref_rows) - 1)
+    short_tier = model._resolve_global_tier(short_rows, len(short_rows) - 1)
+    ref_levels = [int(rows[0]) for rows in ref_tier]
+    short_levels = [int(rows[0]) for rows in short_tier]
+    assert ref_levels == short_levels, (ref_levels, short_levels)
     T = cfg.block_size
     torch.manual_seed(1)
     ids = torch.randint(0, tok.vocab_size, (1, T))

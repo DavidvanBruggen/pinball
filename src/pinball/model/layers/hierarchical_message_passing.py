@@ -2526,7 +2526,19 @@ class HierarchicalMessagePassing(MessagePassing):
         ):
             _nl = node_level.to(device=k_hqd.device, dtype=torch.long).clamp(
                 0, int(self.num_local_levels) - 1)
-            k_hqd = k_hqd + self.local_pack_level_k_emb.index_select(0, _nl).unsqueeze(0).to(k_hqd.dtype)
+            _tag_k = self.local_pack_level_k_emb.index_select(0, _nl).unsqueeze(0).to(k_hqd.dtype)
+            # k_hqd here is ALREADY rotated unless hqd_read_prerope swapped in the pre-RoPE
+            # snapshot, so an unrotated tag would make the level preference depend on the
+            # query's absolute position (see the pack site). Rotation is linear, so adding
+            # R(t) to the rotated key is exactly adding t before rotating. When the read is
+            # pre-RoPE neither side is rotated and the raw tag is already consistent.
+            if (not bool(getattr(self, "hqd_read_prerope", False))) and pos_rep is not None \
+                    and hasattr(self, "rotary_pos_enc"):
+                _tag_k = self.rotary_pos_enc.apply_rotary_pos_emb(
+                    _tag_k.expand(B, -1, -1, -1).reshape(
+                        B * num_nodes, self.num_heads, self.head_dim), pos_rep
+                ).view(B, num_nodes, self.num_heads, self.head_dim)
+            k_hqd = k_hqd + _tag_k
             v_hqd = v_hqd + self.local_pack_level_v_emb.index_select(0, _nl).unsqueeze(0).to(v_hqd.dtype)
 
         if hqd_edges is not None:
@@ -3898,6 +3910,33 @@ class HierarchicalMessagePassing(MessagePassing):
         return (o_r.transpose(1, 2).index_select(1, inv),
                 l_r.index_select(2, inv) if l_r is not None else None)
 
+    # (mask BLOCK_SIZE, kernel BLOCK_M, kernel BLOCK_N), finest first. Entry 0 is the
+    # measured-optimal matched 64x64; the rest exist only so that a lowering guard on a
+    # given card degrades the block sparsity instead of killing the flex path outright.
+    # A coarser MASK costs wasted work in partial blocks; a coarser KERNEL tile costs
+    # shared memory, so the kernel stays at 64 for as long as the guard allows.
+    _FLEX_TILE_LADDER = ((64, 64, 64), (128, 64, 64), (128, 128, 64), (None, None, None))
+
+    def _flex_tile_choice(self):
+        lvl = min(int(getattr(self, "_flex_tile_level", 0)),
+                  len(self._FLEX_TILE_LADDER) - 1)
+        return self._FLEX_TILE_LADDER[lvl]
+
+    def _flex_advance_tile(self, spec: Dict) -> bool:
+        """Step to the next-coarser tile after a flex failure. False when exhausted."""
+        lvl = int(getattr(self, "_flex_tile_level", 0)) + 1
+        if lvl >= len(self._FLEX_TILE_LADDER):
+            return False
+        self._flex_tile_level = lvl
+        # The cached BlockMask was built at the old granularity; its key now mismatches,
+        # but drop it explicitly so a stale mask can never be reused.
+        spec.pop("flex_block_mask", None)
+        spec.pop("flex_block_mask_key", None)
+        self._local_pack_log_once(
+            f"flex union: retrying at tile {self._FLEX_TILE_LADDER[lvl]} "
+            f"(mask BLOCK_SIZE, kernel BLOCK_M, BLOCK_N)")
+        return True
+
     def _flex_union_attn(
         self, qp: torch.Tensor, kp: torch.Tensor, vp: torch.Tensor, spec: Dict,
         causal: bool = True,
@@ -3915,6 +3954,7 @@ class HierarchicalMessagePassing(MessagePassing):
         _bm_key = (bool(causal),
                    int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0),
                    int(getattr(self, "local_pack_global_block", 0) or 0),
+                   int(getattr(self, "_flex_tile_level", 0)),
                    spec.get("flex_ring_key", ()))
         bm = spec.get("flex_block_mask") if spec.get("flex_block_mask_key") == _bm_key else None
         if bm is None:
@@ -4046,7 +4086,23 @@ class HierarchicalMessagePassing(MessagePassing):
             # computed pairs 20.5M -> 14.1M at N=16384 (2.12x -> 1.46x over the ideal
             # 9.7M) and the kernel 0.82 -> 0.55 ms fwd, 2.28 -> 1.62 fwd+bwd. Finer still
             # is not available: BLOCK_N=32 has no valid Triton config on sm_120.
-            _bs = 64 if (perm.is_cuda and n >= 512) else None
+            # ...BUT 64 IS NOT ALWAYS ADMISSIBLE, and the failure is silent. The
+            # inductor lowering guards SPARSE_Q_BLOCK_SIZE % BLOCK_M and
+            # SPARSE_KV_BLOCK_SIZE % BLOCK_N against the DEFAULT config for this
+            # (capability, dtype, head_dim) -- NOT against the kernel_options we pass,
+            # which are applied by setdefault only AFTER the guard. At bf16/head_dim 64
+            # that default is BLOCK_M=128 on every sm_80+ card (_a100_default_config and
+            # _h100_default_config both), so a 64-wide mask raises
+            #   "Q and KV block size must be divisible by BLOCK_M and BLOCK_N"
+            # with max_autotune off (len(configs) == 1 -> raise instead of skip). The
+            # consumer then logs once and disables flex PERMANENTLY, which turns a
+            # flexhier config into a silent duplicate of the additive arm -- measured on
+            # the 4090, and the likely cause of the same symptom recorded on sm_120.
+            # So walk a ladder of progressively coarser masks instead of losing the path;
+            # _flex_advance_tile bumps the level on failure and the consumer retries.
+            _bs, _bm_m, _bm_n = self._flex_tile_choice()
+            if not (perm.is_cuda and n >= 512):
+                _bs = None
             _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
             _nkv = n + (int(kv_pre.numel()) if kv_pre is not None else 0)
             try:
@@ -4100,9 +4156,11 @@ class HierarchicalMessagePassing(MessagePassing):
         _lse = _ring and _rmode == "lse"
         if q_s.is_cuda and int(perm.numel()) >= 512:
             fn = _flex_compiled_singleton()
-            # Default tiles exceed the workstation Blackwell's 101KB shared memory.
-            out = fn(q_s, k_s, v_s, block_mask=bm, return_lse=_lse,
-                     kernel_options={"BLOCK_M": 64, "BLOCK_N": 64})
+            # Default tiles exceed the workstation Blackwell's 101KB shared memory, so the
+            # ladder keeps the KERNEL tile small even where the MASK has to be coarse.
+            _, _km, _kn = self._flex_tile_choice()
+            _ko = {} if _km is None else {"BLOCK_M": _km, "BLOCK_N": _kn}
+            out = fn(q_s, k_s, v_s, block_mask=bm, return_lse=_lse, kernel_options=_ko)
         else:
             out = flex_attention(q_s, k_s, v_s, block_mask=bm, return_lse=_lse)
         out, lse_main = out if _lse else (out, None)
@@ -4257,6 +4315,20 @@ class HierarchicalMessagePassing(MessagePassing):
         qp = q_pre.index_select(1, perm)
         kp = k_pre.index_select(1, perm)
         vp = v.index_select(1, perm)
+        # LEVEL TAGS (local_pack_level_bias) -- ADDED BEFORE RoPE, and it must stay that
+        # way. RoPE only cancels to a relative encoding when BOTH sides are rotated:
+        #     (R_m q).(R_n k)            depends on m-n          <- correct
+        #     (R_m q).(R_n k + t_L)      depends on ABSOLUTE m   <- what post-RoPE gives
+        # Adding the tag first makes the term (R_m q).(R_n (k + t_L)), relative again, and
+        # costs nothing because the rotation below already sweeps the whole tensor.
+        # Measured with trained tags before the fix: an identical (q content, k content,
+        # distance) pair swung 2.1-5.6 logits purely on where it sat in the sequence,
+        # against a 0.000423 content-only control. V is never rotated, so the V tag is
+        # position-independent either way and is kept here only to stay adjacent.
+        lvl_packed = spec.get("levels", None)
+        if getattr(self, "local_pack_level_bias", False) and lvl_packed is not None:
+            kp = kp + self.local_pack_level_k_emb.index_select(0, lvl_packed).unsqueeze(0).to(kp.dtype)
+            vp = vp + self.local_pack_level_v_emb.index_select(0, lvl_packed).unsqueeze(0).to(vp.dtype)
         pos_nd = spec.get("pos_nd", None) if bool(getattr(self, "local_pack_rope_axial", False)) else None
         if hasattr(self, "rotary_pos_enc") and pos_nd is not None:
             # Axial ND RoPE (curve mode): rotate with TRUE spatial coords — exact (dy, dx)
@@ -4278,12 +4350,6 @@ class HierarchicalMessagePassing(MessagePassing):
             kp = self.rotary_pos_enc.apply_rotary_pos_emb(
                 kp.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep
             ).view(B, num_nodes, self.num_heads, self.head_dim)
-        # Level tags (local_pack_level_bias): post-RoPE additive K/V embeddings per source
-        # level — the flash-eligible stand-in for the scatter path's level-pair logit bias.
-        lvl_packed = spec.get("levels", None)
-        if getattr(self, "local_pack_level_bias", False) and lvl_packed is not None:
-            kp = kp + self.local_pack_level_k_emb.index_select(0, lvl_packed).unsqueeze(0).to(kp.dtype)
-            vp = vp + self.local_pack_level_v_emb.index_select(0, lvl_packed).unsqueeze(0).to(vp.dtype)
         # DropNode (hier_node_dropout), applied after the level tag so a dropped row
         # contributes nothing at all, including its level_v_emb. Built once here and reused
         # by the coarse lane below so the same node is dropped in both paths; vp also feeds
@@ -4305,19 +4371,29 @@ class HierarchicalMessagePassing(MessagePassing):
             and not getattr(self, "_flex_union_failed", False)
         ):
             if set(int(l) for l in spec.get("query_levels", ())) >= {0, 1, 2, 3}:
-                try:
-                    out_flex = self._flex_union_attn(qp, kp, vp, spec, pack_causal)
-                    contrib = self.out_proj(out_flex.reshape(B, out_flex.size(1), -1))
-                    if source_gates is not None:
-                        contrib = source_gates["local"] * contrib
-                    out.index_add_(1, spec["flex_query_nodes"], contrib.to(dtype=out.dtype))
-                    return query_levels
-                except Exception as exc:  # pragma: no cover - env-dependent (triton etc.)
-                    self._local_pack_log_once(f"flex union failed ({exc}); merge/additive fallback")
-                    # Permanent opt-out only for real-graph failures; a tiny-graph hiccup
-                    # (generation prefixes) must not poison the training path.
-                    if int(spec["flex_perm"].numel()) >= 512:
-                        self._flex_union_failed = True
+                # Retry across the tile ladder before giving up: the common failure is a
+                # lowering guard on the mask granularity, not a broken environment, and a
+                # permanent opt-out here silently turns a flexhier config into the
+                # additive arm it was built to be compared against.
+                while True:
+                    try:
+                        out_flex = self._flex_union_attn(qp, kp, vp, spec, pack_causal)
+                        contrib = self.out_proj(out_flex.reshape(B, out_flex.size(1), -1))
+                        if source_gates is not None:
+                            contrib = source_gates["local"] * contrib
+                        out.index_add_(1, spec["flex_query_nodes"], contrib.to(dtype=out.dtype))
+                        return query_levels
+                    except Exception as exc:  # pragma: no cover - env-dependent (triton etc.)
+                        if (int(spec["flex_perm"].numel()) >= 512
+                                and self._flex_advance_tile(spec)):
+                            continue
+                        self._local_pack_log_once(
+                            f"flex union failed ({exc}); merge/additive fallback")
+                        # Permanent opt-out only for real-graph failures; a tiny-graph
+                        # hiccup (generation prefixes) must not poison the training path.
+                        if int(spec["flex_perm"].numel()) >= 512:
+                            self._flex_union_failed = True
+                        break
             else:
                 self._local_pack_log_once("flex union needs all levels queried; merge/additive fallback")
 
@@ -4434,6 +4510,12 @@ class HierarchicalMessagePassing(MessagePassing):
                 kl = k_pre.index_select(1, rows_l)
                 vl = v.index_select(1, rows_l)
                 _pnd = _plan.get("pos_nd", None) if pos_nd is not None else None
+                # Level tag BEFORE the rotation (see the pack site). Constant within a
+                # level, so index a single row rather than gathering one per node.
+                if getattr(self, "local_pack_level_bias", False):
+                    _li = min(int(_plan["level"]), int(self.local_pack_level_k_emb.size(0)) - 1)
+                    kl = kl + self.local_pack_level_k_emb[_li].unsqueeze(0).unsqueeze(0).to(kl.dtype)
+                    vl = vl + self.local_pack_level_v_emb[_li].unsqueeze(0).unsqueeze(0).to(vl.dtype)
                 if hasattr(self, "rotary_pos_enc") and _pnd is not None:
                     nd = int(_pnd.size(-1))
                     rep = _pnd.view(1, n_l, nd).expand(B, n_l, nd).reshape(B * n_l, nd)
@@ -4451,12 +4533,6 @@ class HierarchicalMessagePassing(MessagePassing):
                     kl = self.rotary_pos_enc.apply_rotary_pos_emb(
                         kl.reshape(B * n_l, self.num_heads, self.head_dim), rep
                     ).view(B, n_l, self.num_heads, self.head_dim)
-                # Level tag is constant within a level, so index a single row rather than
-                # gathering one per node.
-                if getattr(self, "local_pack_level_bias", False):
-                    _li = min(int(_plan["level"]), int(self.local_pack_level_k_emb.size(0)) - 1)
-                    kl = kl + self.local_pack_level_k_emb[_li].unsqueeze(0).unsqueeze(0).to(kl.dtype)
-                    vl = vl + self.local_pack_level_v_emb[_li].unsqueeze(0).unsqueeze(0).to(vl.dtype)
                 if node_keep is not None:
                     vl = vl * node_keep.index_select(1, rows_l)
                 out_l = self._compute_local_attn_from_qkv(
@@ -4483,6 +4559,11 @@ class HierarchicalMessagePassing(MessagePassing):
             ql = q_pre.index_select(1, lane_perm)
             kl = k_pre.index_select(1, lane_perm)
             vl = v.index_select(1, lane_perm)
+            # Level tags BEFORE the lane rotation, same reason as the pack above.
+            lane_levels = spec.get("lane_levels", None)
+            if getattr(self, "local_pack_level_bias", False) and lane_levels is not None:
+                kl = kl + self.local_pack_level_k_emb.index_select(0, lane_levels).unsqueeze(0).to(kl.dtype)
+                vl = vl + self.local_pack_level_v_emb.index_select(0, lane_levels).unsqueeze(0).to(vl.dtype)
             lane_pos = spec.get("lane_pos", None)
             lane_pos_nd = spec.get("lane_pos_nd", None) if pos_nd is not None else None
             if hasattr(self, "rotary_pos_enc") and lane_pos_nd is not None:
@@ -4502,10 +4583,6 @@ class HierarchicalMessagePassing(MessagePassing):
                 kl = self.rotary_pos_enc.apply_rotary_pos_emb(
                     kl.reshape(B * n_lane, self.num_heads, self.head_dim), lane_pos_rep
                 ).view(B, n_lane, self.num_heads, self.head_dim)
-            lane_levels = spec.get("lane_levels", None)
-            if getattr(self, "local_pack_level_bias", False) and lane_levels is not None:
-                kl = kl + self.local_pack_level_k_emb.index_select(0, lane_levels).unsqueeze(0).to(kl.dtype)
-                vl = vl + self.local_pack_level_v_emb.index_select(0, lane_levels).unsqueeze(0).to(vl.dtype)
             # Same DropNode decision as the mixed window. lane_rows maps lane rows -> packed
             # rows and is precomputed in the spec: a nonzero() here would break the graph.
             lane_rows_idx = spec.get("lane_rows", None)

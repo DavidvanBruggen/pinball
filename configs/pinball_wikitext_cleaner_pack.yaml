@@ -11,13 +11,13 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 131072 #196704 #8196 #16384 #32768 #65536 #131072 #262144 #196704 #1024
-batch_size: 1
+block_size: 1024 #131072 #196704 #8196 #16384 #32768 #65536 #131072 #262144 #196704 #1024
+batch_size: 16
 val_split: 0.01
 
 # Training
 train_mode: ar            # ar | masked_diffusion
-learning_rate: 1e-3 #0.0001
+learning_rate: 1e-4 #0.0001
 weight_decay: 0.1
 warmup_steps: 1000
 #max_steps: 20000
@@ -31,7 +31,7 @@ muon_adjust_lr_fn: match_rms_adamw
 # Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
-num_epochs: 20
+num_epochs: 300 #20
 samples_per_epoch: 15625 #651 #15625 #3125 #25000 #782 #25000
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
@@ -72,7 +72,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_compileandscalingtests/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_cleaner_compileandscalingtests_test/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -85,7 +85,7 @@ ar_graph_causal: true
 # write scales, upper/top refiner level scales) so you can watch which pathways open or collapse.
 # Also callable directly: model.gate_monitor() -> {name: value}.
 pinball_monitor_gates: true
-pinball_monitor_gates_every: 100    # forward calls between logs
+pinball_monitor_gates_every: 10000    # forward calls between logs
 # Which strictly-past (leak-free) coarse->L0 scheme AR turns on by default so the hierarchy
 # feeds L0 (the AR filter otherwise cuts every downward coarse->L0 edge, going inert):
 #   staggered : DIRECT one-hop edges into L0 from each level -> L0<-L1, L0<-L2, L0<-L3 (the
@@ -110,8 +110,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 192 #192 #768
-num_heads: 3 #3 #12
+hidden_dim: 768 #192 #192 #768
+num_heads: 12 #3 #12
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).

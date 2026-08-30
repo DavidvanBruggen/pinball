@@ -6,8 +6,8 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt #./data/wikitext_combined.txt
-block_size: 4096 #8196 #16384 #32768 #65536 #131072 #262144 #1024
-batch_size: 2
+block_size: 1024 #8196 #16384 #32768 #65536 #131072 #262144 #1024
+batch_size: 4
 val_split: 0.01
 
 num_epochs: 300 #20
@@ -31,10 +31,10 @@ longctx_diag_every: 1
 gen_prompt_tokens: 512
 gen_max_new_tokens: 512
 save_every: 0
-checkpoint_dir: ./transformer/checkpoints_superlong_context_test
+checkpoint_dir: ./transformer/checkpoints_standardruntest #./transformer/checkpoints_superlong_context_test
 
 train_mode: ar
-learning_rate: 1e-3 #0.0001
+learning_rate: 1e-4 #0.0001
 weight_decay: 0.1
 #max_steps: 20000
 warmup_steps: 1000

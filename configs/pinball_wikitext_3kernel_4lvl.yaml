@@ -1,4 +1,66 @@
+# GPT-2-matched AR text arm, FOUR LEVELS (L0 + L1/L2/L3) -- otherwise identical to
+# pinball_wikitext_3kernel.yaml. Copied from it on 2026-08-30.
+#
+# WHY: hier_predaux / hier_copredict pairs are hardcoded to L0-L3, so on the 8-level arm
+# levels L4-L7 are unregularized and an "aux on vs off" A/B is really "aux on for half the
+# hierarchy vs off". At four levels the aux covers the whole hierarchy and that A/B means
+# what it says.
+#
+# EVERY per-level list had to be shortened by hand -- only pinball_level_dims and
+# pinball_level_cycles auto-expand (_expand_int_list); the rest mis-size SILENTLY. The
+# ones changed here, all to 4 levels (or 3 for the L-1 lists):
+#   num_layers, internal_cycles, compression_ratios, overlap_ratios,
+#   local_pack_query_levels, local_attn_levels, local_attn_windows,
+#   local_attn_causal_levels, hier_predaux_levels, hier_copredict_levels
+# and pinball_cross_query_pairs, which referenced level 7 ("1:7"/"0:7") and would have
+# pointed at a level that no longer exists -> now "1:3"/"0:3".
+#
+# Level sizes at block_size 1024: [1024, 128, 64, 32], 224 coarse rows (vs 254 at 8
+# levels), so the packed sequence and the mixed window barely move -- this is a hierarchy
+# DEPTH change, not a capacity change.
+#
+# Ported from pinball_wikitext_cleaner_pack.yaml. Baseline for the head-to-head is
+# configs/transformer_wikitext.yaml (12 layers, gpt2 tokenizer, same block_size);
+# num_refinement_layers stays 12 to keep that match.
+#
+# THE LANE (3 additive flash kernels, no flex -- runs under ChromScape-bw on the 4090):
+#   1. local_pack_window   mixed L0+coarse sliding window   (unchanged from the pack arm)
+#   2. coarse lane         same-level window over the bank  (local_pack_coarse_window)
+#   3. top-global tier     all-to-all over the top level(s) (local_pack_top_global)
+# local_pack_global_block is 0: the tier replaces it, paying n_tier^2 instead of
+# n_block*N. That is the whole reason this arm scales.
+#
+# DEPTH CHANGED, and it had to. bench_hierarchy_plan.py on the pack config at 131072:
+#   top level 4096 nodes vs sqrt(N)=362 -> an all-to-all top level is SUPERLINEAR.
+# Seven coarse levels give [16384, 8192, 4096, 2048, 1024, 512, 256]; the 256-node top
+# fits under sqrt(N), so the tier stays inside the linear budget. Every per-level list
+# below was extended to 8 levels to match -- a stale 4-entry list silently mis-sizes.
+#
+# local_pack_top_global_budget: sqrt self-sizes with block_size, so this config stays
+# correct if you change the context length. coarse_window: auto sizes the lane from the
+# real tier spacing (worst-case gap, not mean) so every bank row can reach a tier node.
+#
+# TIER CAUSALITY: FIXED AND VERIFIED. The tier used to gather q/k/v as
+#   qt = q_pre.index_select(1, rows_t)
+# but q_pre is NODE-indexed while rows_t are PACKED row numbers, so it attended over
+# vectors belonging to the wrong nodes and leaked future content (3e-06 to 5.7e-02
+# depending on tier width). It now gathers from qp/kp/vp -- the packed tensors, which
+# already carry RoPE, the level bias and node_keep -- exactly as the global block does.
+# tests/test_pack_tier_causality.py: all probes 0.000e+00 at block 1024 and 4096, tier
+# single-level, multi-level sqrt, and wide budget 200. Baseline determinism exactly 0.
+#
+# TWO DELIBERATE DEVIATIONS FROM THE PACK ARM, both flagged rather than silent:
+#   hier_pool_gate: true      -- measured load-bearing on the DNA 500 kb arm that reached
+#                                transformer parity (pool_gate_bias 1.99->1.61,
+#                                pool_gate_vec norm 1.21->4.08 over 20 epochs).
+#   hier_predaux_loss_mode    -- mse -> cosine. mse is scale-dependent and blew the aux
+#                                term 0.1 -> 20 on a deep arm; this is now a deep arm.
+# Revert either if you want a strict pack-config A/B rather than a transformer A/B.
+
 # Pinball hierarchical graph transformer — autoregressive LM on WikiText-103.
+# PACKED CROSS-LEVEL LOCAL run: pinball_wikitext_cleaner.yaml + local_pack_* on
+# (all-levels mixed window, level tags). Fresh runs only — do not warm-start from
+# non-pack checkpoints (L0's local attention distribution changes).
 # Friendly toggles (attn_backend / qkv_sharing / train_mode / use_hqd) expand to the
 # underlying flags in pinball.config.PinballConfig. See README for the full toggle table.
 
@@ -8,13 +70,13 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 1024 #16384 #32768 #1024
+block_size: 1024 #196704 #8196 #16384 #32768 #65536 #131072 #262144 #196704 #1024
 batch_size: 16
 val_split: 0.01
 
 # Training
 train_mode: ar            # ar | masked_diffusion
-learning_rate: 0.0001
+learning_rate: 1e-4 #0.0001
 weight_decay: 0.1
 warmup_steps: 1000
 #max_steps: 20000
@@ -28,8 +90,8 @@ muon_adjust_lr_fn: match_rms_adamw
 # Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
-num_epochs: 100
-samples_per_epoch: 15625 #25000 #782 #25000
+num_epochs: 300 #20
+samples_per_epoch: 15625 #651 #15625 #3125 #25000 #782 #25000
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
@@ -39,7 +101,10 @@ gradient_checkpointing: false    # trade compute for memory in the refinement st
 # weights/grads/optimizer/loss-head). Loss-equivalent. chunk e.g. 256 (=4 chunks over T=1024).
 # The position-chunk auto-scales UP for small batch (>= ~2048 tokens/chunk = B*chunk), so a long
 # sequence at batch 1 stays a few big chunks instead of hundreds of tiny launch-bound ones.
-train_feature_chunked_ce_enable: false
+# 2026-07-13: enabled — the chunked CE's old [B,V,T] "spatial" cross-entropy kernel was ~7x
+# slower than the flat 2D form (trainer now reshapes; bit-identical, verified). Measured at
+# T=8192, V=50257: chunked 2D = 34.5ms vs 37.8ms full-logits, peak head memory 5.66 -> 2.97 GiB.
+train_feature_chunked_ce_enable: true
 chunked_ce_seq_chunk: 64
 # Long-context diagnostic: every N validations, log next-token PPL bucketed by in-context
 # recurrence distance (never / <128 / 128-511 / 512-2k / >2k). Cheap — reuses the val batches,
@@ -66,7 +131,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_small_test_hqd_test/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_3kernel_4lvl/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -121,14 +186,14 @@ num_heads: 12 #3 #12
 attn_sparse_qk_mult: 1.0    # try 2.0 to lift cross-level routing rank 64 -> 128
 attn_sparse_v_mult: 1.0     # try 2.0 / 4.0 for fat-V (both sparse paths)
 num_refinement_layers: 12 #12
-num_layers: [0, 0, 0, 0]
+num_layers: [0, 0, 0, 0]     # length = level count (L0 + 7 coarse)
 internal_cycles: [0, 0, 0, 0]
 refinement_style: unified
 unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0 # set so graph windows are made dense (k=window_size*2+1) for local connectivity. 0 = sparse only.
-compression_ratios: [16, 4, 4]
+compression_ratios: [16, 4, 4]   # sizes @131072 -> [16384, 8192, 4096, 2048, 1024, 512, 256]
 overlap_ratios: [0.5, 0.5, 0.5]
 # Coarse-node seeding (the ORIGINAL design, restored). mask = coarse nodes start as mask
 # embeddings and content must climb the hierarchy through the refinement layers (measured:
@@ -161,10 +226,18 @@ hier_downward_refresh: true
 # hier_downward_refresh_pairs: ["0:1","0:2","0:3","1:2","1:3","2:3"]   # default: all downward
 hier_downward_refresh_every: 1
 hier_downward_refresh_gate_init: 0.1
+hier_upward_refresh_direct: false
+hier_upper_seed_direct: false      # same for the one-shot seed (runs once, not per layer)
 # The refreshes are kernel-LAUNCH-bound (many tiny ops x 12 layers): torch.compile fuses them,
 # measured ~14% whole-step win at seq 8196. Training mode only (fixed seq len = one compile);
 # eval/generation stay eager. Additional lever if needed: *_refresh_every: 2 (~12% win, stacks).
 hier_refresh_compile: true
+# Compile each refinement layer's forward (widest region below the model-level forward,
+# whose cache bookkeeping breaks dynamo). Fuses the launch-bound eager orchestration —
+# measured +14% at T=64 and +26% at T=1024 alone; 1.8x combined with refresh compile at
+# T=1024 (2026-07-17, 4090 under contention). Training-only, probation fallback to eager.
+# OFF here: flipping it mid-experiment changes step numerics slightly vs your running curve.
+hier_layer_compile: true
 # HQD v2 — cross-query-guided nomination (NSA-style selective sparse attention). At the
 # multirate midpoint each L0 query scores the CLOSED L3 windows with the 0:3 refiner's TRAINED
 # q/k (per-query, causal), descends into the top-k winners' L1 children (cosine), and
@@ -172,7 +245,7 @@ hier_refresh_compile: true
 # layers (v1 HQD's injection path — works with the static edges dropped; children tables come
 # from window arithmetic, not edge lists). This is the DYNAMIC content-addressed read the
 # recency gathers can't do. OFF for the baseline cleaner run; flip on for the retrieval test.
-xq_nominate_enable: off
+xq_nominate_enable: false
 # RECALL knobs (stage 1/2 shortlist width). Since the stage-3 scored prune fixes the read
 # at topk_l0 sources/query, widening these grows ONLY the nomination scoring cost (~4.5ms/
 # round, roughly linear) — NOT the per-layer read. 8 L3 windows ~= 700 tokens of candidate
@@ -206,10 +279,18 @@ xq_nominate_packed_read: true
 # Per-query relevance gate: read output scaled by sigmoid(w*stage1_top_score + b) — a no-op
 # option for queries with nothing to fetch (ungated reads HURT never-recurring tokens by
 # ~1.6%) and a task gradient into the 0:3 selector q/k (NSA-style selector training).
-xq_nominate_gate_enable: true
+xq_nominate_gate_enable: false
 # Stage-2 (L1 descent) scoring: local_qk = the layer's trained per-level q/k (the raw-cosine
 # default was a speed placeholder). No new params.
 xq_nominate_stage2: local_qk
+# 2026-07-15 far-fetch fixes. prerope: the RoPE'd L0<->L0 geometry is only trained inside the
+# ~128-token local window, so scoring/reading fetches at true far rotations is OOD noise ->
+# the selector retreats near (mean_dist collapsed 2k -> 990 over the last run). Pre-RoPE q/k
+# = content-only matching for the stage-3 prune + the packed read. sink: learned zero-value
+# slot in the read softmax so a query with no useful candidates can no-op (the forced read is
+# why first-occurrence tokens measured WORSE with xq on). Fresh-run knobs for the read path.
+xq_nominate_read_prerope: true
+xq_nominate_read_sink: true
 # NOTE (2026-07-10): the pre-v2.1 nomination projected the 0:3 refiner q/k inside no_grad
 # UNDER AUTOCAST — the first-call bf16 weight-cast cache then fed a DETACHED cast to the
 # multirate episode's grad-mode call, so the cross-query projections received NO gradient
@@ -230,17 +311,63 @@ xq_nominate_stage2: local_qk
 # reach far beyond either). FRESH-RUN knob (changes L0's local distribution). Generation
 # falls back to full rebuild (packed tail decode not built). Default [0] keeps L1-L3
 # lateral windows untouched; add 1-3 to route coarse laterals through the mixed window too.
-local_pack_cross_level: false
-local_pack_window: 0               # mixed slots; 0 = reuse L0's local window (128)
-# local_pack_query_levels: [0]
-# local_pack_level_bias: true      # zero-init per-level K/V tags for the mixed softmax (the
-#                                  # flash-eligible stand-in for the scatter level-pair bias)
-# local_pack_coarse_lane: true    # second packed window over ONLY coarse rows: restores wide
-# local_pack_coarse_window: 896   # coarse lateral reach (896 coarse slots ~= 4096 tokens)
-# => the enabled experiment lives in pinball_wikitext_cleaner_pack.yaml
+# THIS CONFIG: the pack experiment (vs pinball_wikitext_cleaner.yaml = identical run with
+# pack off). ALL levels query through the mixed window — coarse laterals move from their
+# 128-same-level-node windows (1k-4k token span) into the ~130-token mixed span. Measured
+# FASTER than baseline (-8.5%: one flash call over 9984 rows replaces four per-level calls);
+# the open question is whether the coarse-lateral repositioning hurts or helps quality.
+# Fall back to query_levels [0] to keep coarse laterals untouched (+2% cost instead).
+hier_pool_gate: true            # see header: measured load-bearing on DNA
+hier_pool_gate_bias_init: 2.0
+
+local_pack_ring_windows: null
+local_pack_ring_merge: additive    # additive | lse | union -- inert while rings are null
+
+local_pack_cross_level: true
+local_pack_window: 1248 #156 #624 #1248             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const) # 156 624 1248
+local_pack_query_levels: [0, 1, 2, 3]   # MUST cover every level
+# Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
+# bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
+# query-dependent level bias) and to V (output carries its source level). Zero init =
+# exactly the untagged packed call at step 0.
+local_pack_level_bias: true
+# COARSE LANE: second packed causal window over ONLY the L1-L3 rows (close-time order),
+# restoring the wide coarse LATERAL reach the hierarchy's economics lean on — the main
+# mixed window is ~78% tokens, which cuts coarse laterals to ~16 same-level neighbors.
+# Lane slots are all coarse (7 per 32 tokens): 896 slots = 4096 tokens of span = L3's full
+# pre-pack window (128 L3 + 256 L2 + 512 L1 in-window; L1/L2 lateral reach even grows vs
+# their old 1024/2048-token spans). Cost ~ the main packed call again (coarse rows are few).
+# Additive to the coarse queries' main-window read (fine detail stays available there).
+local_pack_coarse_lane: true
+local_pack_coarse_window: 900 # auto   # sized from real tier spacing; see header
+#local_pack_coarse_window_tier_nodes: 3   # >=3 tier nodes must fall in the window
+local_pack_top_global: true
+local_pack_top_global_budget: 400 #sqrt   # 0 | <row budget> | sqrt (self-sizing)
+local_pack_global_block: 0      # the tier replaces it: n_tier^2, not n_block*N
+# UNIFIED SOFTMAX over both windows (2026-07-13): coarse queries read the mixed window and
+# the lane as ONE softmax over the union of both key sets, instead of adding two
+# independently-normalized outputs (per-key context-selective arbitration; kills the
+# overlap double-count). Fallback chain: flex -> lse-merge -> additive.
+#   local_pack_flex_union — ONE flex_attention call, block-sparse union mask over a
+#     [coarse|tokens] block-coherent layout; exact dedup, flash-style tiled softmax
+#     (Triton). ~6% step at b4@8196. No attention-prob dropout on this path.
+#   local_pack_lane_merge — differentiable LSE merge of the two flash calls (equivalent
+#     softmax up to a +ln2 bias on overlap keys); runs only if flex fails at runtime.
+# FRESH-RUN knobs (they change the function vs the additive pack checkpoints).
+local_pack_flex_union: false
+local_pack_lane_merge: false
 norm_type: layernorm
 dropout: 0.1
-
+hier_node_dropout: 0 #0.1
+# Stability normalizations (both default ON; set false only to reproduce a checkpoint
+# trained before they existed). final_norm_fast_path re-applies the terminal norm on exit
+# from the refinement loop, which the fast path had lost -- without it nothing renormalizes
+# the residual stream before output_projection. qk_norm normalizes q/k over head_dim before
+# the dot product, bounding the attention logits; it matters most here because one softmax
+# spans all four levels at once. Cost of both together is within noise (~1-2%).
+final_norm_fast_path: true
+qk_norm: true
+qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
 # Frontier-consistent AR generation: a raw prefix builds TRUNCATED coarse windows, so the token
 # being predicted reads its own OPEN parent — but in training that parent's full window extends
 # past it and is causal-cut. This pads the prefix forward by the top-level coarse window span
@@ -250,7 +377,7 @@ gen_frontier_consistent: true
 
 # Attention / hierarchy toggles
 attn_backend: flash        # pyg | flash | sdpa
-qkv_sharing: separate      # shared | separate
+qkv_sharing: shared      # shared | separate
 # Tier-3 packed cross-level backbone attention: a dense/batched fast lane for the
 # cross-level message passing (groups each destination's parents into a padded fixed-K
 # block per level, runs [B,Q,K,H,D] attention instead of gather/segment-softmax/scatter).
@@ -405,7 +532,7 @@ hqd_window_bag_topk: 0
 
 local_attn_levels: [0, 1, 2, 3]
 local_attn_windows: [128, 128, 128, 128]
-local_attn_causal_levels: [0, 1, 2, 3]
+local_attn_causal_levels: [0, 1, 2, 3]   # AR: every level causal
 l0_local_window: 128
 
 # Attention-derived edge state.
@@ -425,9 +552,9 @@ lateral_edge_trace_mode: true_lateral   # windowed_approx | true_scatter | true_
 #                           fewer L0 nodes -> cheaper cycles).   Use token_unet_scale: >1 (pow2).
 token_unet_enable: false
 token_unet_block: cnn          # cnn | hyena
-token_unet_mode: stem            # stem (mode 2) | coarse_tokenize (mode 1)
+token_unet_mode: coarse_tokenize # stem (mode 2) | coarse_tokenize (mode 1)
 token_unet_dim: 1d               # auto | 1d | 2d  (text is 1d)
-token_unet_scale: 1              # power-of-two. 1 for stem; e.g. 4 for coarse_tokenize pooling
+token_unet_scale: 8              # power-of-two. 1 for stem; e.g. 4 for coarse_tokenize pooling
 token_unet_kernel_size: 9        # local conv width (cnn block only; ignored by hyena)
 token_unet_dropout: 0.1
 # Dynamic U-Net: a PROPER causal U-Net (vs the constant-width default). Channels GROW at
@@ -436,7 +563,7 @@ token_unet_dropout: 0.1
 # where multi-token structure lives; recommended over the constant-width path (which underfits).
 # Causal (AR-safe) for cnn AND hyena at fixed length; NOTE hyena's positional filter is length-
 # normalized so it is NOT stable under incremental generation (fine for teacher-forced training).
-token_unet_dynamic: false
+token_unet_dynamic: true
 token_unet_channel_growth: 256   # +channels per downsample level
 token_unet_max_channels: 0       # 0 => 2*hidden_dim
 token_unet_concat_skips: true    # true = concat+fuse (classic); false = additive
@@ -456,7 +583,7 @@ token_unet_lookahead_decode_enable: false
 # runs (scales stuck ~0.01-0.02); upper_refiner was borderline (L3 self-refine 0.04, L2 ~0.002)
 # and is deactivated FOR NOW, not removed — re-enable by raising its steps. steps: 0 skips
 # building the module entirely. Only the downward cross-query pairs below still run here.
-pinball_multirate_enable: true
+pinball_multirate_enable: false
 pinball_multirate_schedule: midpoint   # "midpoint" fires once after midpoint_layer; "after_full_stack" = after ALL layers
 # Placement of the multirate/thinking episode: "auto" = mid-stack (layer 6 of 12).
 # Prelude -> loop -> coda shape: 9 leaves 3 coda layers to locally mix + decode what the
@@ -474,7 +601,7 @@ pinball_multirate_midpoint_layer: 9
 # _last_pinball_multirate_stats: adaptive_cycles / adaptive_energy / adaptive_frozen_frac.
 pinball_multirate_adaptive: false   # default off = existing fixed-repeats behavior
 pinball_multirate_energy_tau: 0.05  # relative-update threshold; lower = more cycles
-pinball_multirate_max_cycles: 4     # hard cap on settling iterations per invocation
+pinball_multirate_max_cycles: 1     # hard cap on settling iterations per invocation
 pinball_multirate_active_rows: true # cycles 2+ only compute unfrozen query rows in the
                                     # cross-query pairs (exact, verified). Eval fwd ~wash
                                     # (launch-bound) but TRAIN step +4.9% and -1.17 GiB
@@ -519,13 +646,20 @@ pinball_upper_cross_write_scale_init: 0.01 # L3 residual write scale (starts ~id
 # "2:3" dropped: its write scale self-selected to zero (0.1 -> 0.048 and falling by ep10) —
 # L2 is ADJACENT to L3, so the bridges edges already deliver L3->L2 in one hop; the explicit
 # cross-query only pays off where the bridge path is multi-hop (L1, L0).
-pinball_cross_query_pairs: ["1:3", "0:3"]  # L1<-L3, L0<-L3 (downward broadcast)
+pinball_cross_query_pairs: ["1:3", "0:3"]  # L1<-L7, L0<-L7; top level is now 7
 pinball_cross_query_steps: 2               # master switch; passes per pair (0 = off)
 # 0 = attend ALL memory (no top-k selection). Memory here is L3 (few nodes) so this is cheap AND
 # avoids the global_mean selection's causality subtlety (its shared top-k is picked from a query
 # averaged over ALL positions incl. future). With 0 only the per-position causal mask applies.
 pinball_cross_query_topk: 0                # top-k memory nodes per selection; 0 = all
 pinball_cross_query_l0_window: 0           # only used when a pair's memory level is 0 (±ar_time window)
+# Recency cap on the episode read (ar-time units): each query reads only memory that closed
+# within the last W token-times — per-query, inside the causal mask, so leak-free and
+# BIT-IDENTICAL to unlimited while context <= W. 32768 = last 1024 closed L3 windows: inert
+# for training runs at 8k, engages beyond 32k so the per-query read set is bounded (linear
+# scaling; content retrieval past the window is xq_nominate's job, and adding hierarchy
+# levels above L3 extends global reach at geometrically shrinking node counts).
+pinball_cross_query_memory_window: 32768
 pinball_cross_query_backend: auto
 pinball_cross_query_causal: true
 pinball_cross_query_shared_weights: true
@@ -554,7 +688,7 @@ hier_predaux_enable: true  # cleaner-pinball: ON — with the scatter gradient p
 lambda_hier_predaux: 0.05
 hier_predaux_levels: [1, 2, 3]
 hier_predaux_horizon: 0        # windows ahead; 0 = auto (first non-overlapping window)
-hier_predaux_loss_mode: cosine # cosine | mse_norm | mse
+hier_predaux_loss_mode: cosine # cosine | mse_norm | mse -- see header: mse is scale-dependent
 hier_predaux_predictor: mlp    # mlp | linear
 # AR runs: next (forecast only — a "prev" head would be trivially copyable and empty). MASKED
 # runs: both (future is partially visible so "next" alone degrades toward copying; predicting
@@ -577,5 +711,5 @@ hier_aux_link_l0_target: false
 # just the loss. gate init 0.0 = warm-start bit-identical to a checkpoint without it.
 hier_copredict_l0: false  # cleaner-pinball: OFF — the per-layer downward refresh IS this same
                           # gather, applied in-stack at every layer instead of only at the head
-hier_copredict_levels: [1, 2, 3]   # coarse levels that co-predict L0 (clipped to available levels)
+hier_copredict_levels: [1, 2, 3]   # coarse levels that co-predict L0
 hier_copredict_gate_init: 0.0      # per-level gate init; 0.0 = identity warm start, e.g. 0.1 for fresh runs

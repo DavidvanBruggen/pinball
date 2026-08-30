@@ -5686,15 +5686,19 @@ class HierarchicalFlowGAT(nn.Module):
         return torch.cat(pieces, dim=1)
 
     def _refresh_callable(self, eager, cache_attr: str):
-        """Return the torch.compile'd version of a refresh fn in training mode (fixed seq len
-        -> one compile, fused elementwise chains), the eager one otherwise (eval/generation
-        vary lengths and would recompile every step).
+        """Return the torch.compile'd refresh fn during training or fixed-shape evaluation.
+        Variable-length evaluation stays eager to avoid recompilation.
 
         Compilation is lazy, so failures surface on the FIRST EXECUTION (e.g. inductor/triton
         missing support for a new GPU arch), not at torch.compile() time — the probation
         wrapper catches that, logs once, and permanently falls back to eager instead of
         killing the run. After the first successful call the raw compiled fn is cached."""
-        if not (getattr(self, "hier_refresh_compile", False) and self.training):
+        fixed_eval = bool(
+            not self.training
+            and next(self.parameters()).is_cuda
+            and int(getattr(self, "_uf_cache_last_seq_len", -1)) == int(self.max_seq_len)
+        )
+        if not (getattr(self, "hier_refresh_compile", False) and (self.training or fixed_eval)):
             return eager
         fn = getattr(self, cache_attr, None)
         if fn is None:
@@ -5724,15 +5728,20 @@ class HierarchicalFlowGAT(nn.Module):
         return fn
 
     def _layer_callable(self, transformer):
-        """torch.compile'd refinement-layer forward in training mode when hier_layer_compile
-        is on (fixed train shapes -> one compile per layer; fuses the eager orchestration
+        """torch.compile'd refinement-layer forward in training or fixed-shape evaluation
+        when hier_layer_compile is on (one compile per layer; fuses the eager orchestration
         around the flash/pack calls — the launch-bound cost at short sequences). Same lazy +
         probation policy as _refresh_callable: first runtime failure logs once and falls back
-        to eager permanently. Eval/generation always eager (varying shapes would recompile).
+        to eager permanently. Variable-length evaluation remains eager.
 
         The 12 layers share one forward code object, so dynamo needs a cache slot per module
         instance — bump cache_size_limit once so late layers don't silently stay eager."""
-        if not (getattr(self, "hier_layer_compile", False) and self.training):
+        fixed_eval = bool(
+            not self.training
+            and next(transformer.parameters()).is_cuda
+            and int(getattr(self, "_uf_cache_last_seq_len", -1)) == int(self.max_seq_len)
+        )
+        if not (getattr(self, "hier_layer_compile", False) and (self.training or fixed_eval)):
             return transformer
         fn = getattr(transformer, "_pinball_compiled_forward", None)
         if fn is None:
@@ -6205,11 +6214,14 @@ class HierarchicalFlowGAT(nn.Module):
 
     def _resolve_global_tier(self, level_rows: List[torch.Tensor], top_level: int):
         """Levels forming the all-to-all global tier: whole levels top-down while they fit
-        local_pack_top_global_budget ("sqrt" -> floor(sqrt(N))). Budget 0 returns the top
-        level alone, which is the pre-tier behaviour. Returns row tensors, top level first."""
+        local_pack_top_global_budget ("sqrt" -> floor(sqrt(max_seq_len))). Membership is
+        derived from the configured training length, not the current prefix length. Otherwise
+        frontier generation can activate a lower level that was never in the training tier.
+        Budget 0 returns the top level alone. Returns current row tensors, top level first."""
         raw = getattr(self, "local_pack_top_global_budget", 0)
+        reference_sizes = list(self._predict_level_sizes(int(self.max_seq_len)))
         if isinstance(raw, str):
-            n0 = int(level_rows[0].numel()) if level_rows else 0
+            n0 = int(reference_sizes[0]) if reference_sizes else 0
             budget = math.isqrt(max(0, n0)) if raw.strip().lower() == "sqrt" else 0
         else:
             budget = max(0, int(raw or 0))
@@ -6220,12 +6232,14 @@ class HierarchicalFlowGAT(nn.Module):
         sel, tot = [], 0
         for lv in range(top_level, 0, -1):
             r = level_rows[lv] if lv < len(level_rows) else None
-            if r is None or int(r.numel()) == 0:
+            ref_n = int(reference_sizes[lv]) if lv < len(reference_sizes) else 0
+            if ref_n <= 0:
                 continue
-            if sel and tot + int(r.numel()) > budget:
+            if sel and tot + ref_n > budget:
                 break
-            sel.append(r)
-            tot += int(r.numel())
+            if r is not None and int(r.numel()) > 0:
+                sel.append(r)
+            tot += ref_n
         return sel
 
     def _resolved_lane_window(self, spec: Dict[str, Any], lvl_packed: torch.Tensor,
@@ -15515,6 +15529,13 @@ class HierarchicalFlowGAT(nn.Module):
                 frontier_consistent = bool(getattr(self, "gen_frontier_consistent", True))
                 pad_id = int(getattr(self, "pad_token_id", None) or getattr(self, "mask_token_id", 0) or 0)
                 lookahead = self._gen_frontier_lookahead() if frontier_consistent else 0
+                # Training uses compiled fixed-shape refinement layers. Keep generation at
+                # that same shape so evaluation uses the identical compiled function and
+                # does not recompile once per emitted token. Future pad rows are causal-cut.
+                compile_fixed_shape = bool(
+                    getattr(self, "hier_layer_compile", False)
+                    or getattr(self, "hier_refresh_compile", False)
+                )
                 # bf16 autocast: flash local attention rejects fp32 — without this, flash
                 # configs silently fell through to the emergency generation path.
                 import contextlib
@@ -15530,7 +15551,10 @@ class HierarchicalFlowGAT(nn.Module):
                     # Get next token logits by calling forward, completely rebuilding the graph
                     with torch.no_grad(), _gen_amp:
                         cur_len = int(current_ids.size(1))
-                        pad_n = min(lookahead, int(self.max_seq_len) - cur_len)
+                        if frontier_consistent and compile_fixed_shape:
+                            pad_n = int(self.max_seq_len) - cur_len
+                        else:
+                            pad_n = min(lookahead, int(self.max_seq_len) - cur_len)
                         if frontier_consistent and pad_n > 0:
                             padded = torch.cat(
                                 [current_ids, torch.full((current_ids.size(0), pad_n), pad_id,

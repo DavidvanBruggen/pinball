@@ -7345,6 +7345,7 @@ class EnhancedHierarchicalTrainer:
                     int(model_max_len),
                 )
                 return self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            generation_steps = int(target_total_len - prompt_token_len)
 
             model_for_gen = self.ema_model if (use_ema and self.ema_model is not None) else self.model
             autoenc_mode = self._resolve_autoenc_runtime_mode(model_for_gen)
@@ -7405,7 +7406,7 @@ class EnhancedHierarchicalTrainer:
 
                         generate_kwargs = dict(
                             input_ids=input_ids,
-                            max_length=target_total_len,
+                            max_length=generation_steps,
                             temperature=temperature,
                             do_sample=do_sample,
                             top_k=top_k,
@@ -7424,7 +7425,7 @@ class EnhancedHierarchicalTrainer:
                             if hasattr(model_for_gen, "_generate_with_autoenc_query"):
                                 generated_ids = model_for_gen._generate_with_autoenc_query(
                                     input_ids=input_ids,
-                                    max_length=target_total_len,
+                                    max_length=generation_steps,
                                     temperature=temperature,
                                     do_sample=do_sample,
                                     top_k=top_k,
@@ -7441,7 +7442,7 @@ class EnhancedHierarchicalTrainer:
 
                     generate_kwargs = dict(
                         input_ids=input_ids,
-                        max_length=target_total_len,
+                        max_length=generation_steps,
                         temperature=temperature,
                         do_sample=do_sample,
                         top_k=top_k,
@@ -7497,7 +7498,7 @@ class EnhancedHierarchicalTrainer:
 
                     generate_kwargs = dict(
                         input_ids=input_ids,
-                        max_length=target_total_len,
+                        max_length=generation_steps,
                         temperature=temperature,
                         do_sample=do_sample,
                         top_k=top_k,
@@ -7516,7 +7517,7 @@ class EnhancedHierarchicalTrainer:
 
                     generate_kwargs = dict(
                         input_ids=input_ids,
-                        max_length=target_total_len,
+                        max_length=generation_steps,
                         temperature=temperature,
                         do_sample=do_sample,
                         top_k=top_k,
