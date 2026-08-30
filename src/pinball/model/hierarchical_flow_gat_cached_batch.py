@@ -6103,6 +6103,23 @@ class HierarchicalFlowGAT(nn.Module):
                         0, _rows).contiguous()
                 if "pos_nd" in spec:
                     spec["top_global"]["pos_nd"] = spec["pos_nd"].index_select(0, _rows).contiguous()
+        # Composed gather for the main pack write-back. The consumer otherwise does
+        #     contrib = out_pack.index_select(1, sel);  out.index_add_(1, tgt, contrib)
+        # -- a gather followed by a scatter. When tgt is a PERMUTATION of all nodes the two
+        # collapse into one gather, dropping an index_add_ whose bf16 path has no native
+        # atomic add and falls back to CAS loops. Measured bit-identical in forward, with
+        # gradients inside run-to-run noise (index_add_ atomics are themselves
+        # non-deterministic: identical code twice differs by MORE than this change does).
+        # Worth only ~1% -- the backward of the surviving gather is itself a scatter, so the
+        # packed<->node permutation cost is symmetric and cannot be removed here.
+        _tgt = spec.get("query_nodes", None)
+        _selq = spec.get("query_sel", None)
+        if _tgt is not None and _selq is not None and int(_tgt.numel()) == int(spec["num_nodes"]):
+            _order = torch.argsort(_tgt)
+            if bool(torch.equal(_tgt.index_select(0, _order),
+                                torch.arange(int(spec["num_nodes"]), device=_tgt.device,
+                                             dtype=_tgt.dtype))):
+                spec["pack_gather"] = _selq.index_select(0, _order).contiguous()
         self._local_pack_spec_cache = (key, spec)
         return spec
 

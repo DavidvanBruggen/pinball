@@ -4371,6 +4371,13 @@ class HierarchicalMessagePassing(MessagePassing):
             if bool(_coarse_q.any()):
                 out.index_add_(1, tgt[_coarse_q],
                                contrib[:, _coarse_q].to(dtype=out.dtype))
+        elif spec.get("pack_gather", None) is not None:
+            # Fast path: tgt is a permutation of all nodes, so gather+scatter collapses to a
+            # single gather plus a plain add. Exactly equivalent; see _local_pack_build_spec.
+            _g = out_pack.index_select(1, spec["pack_gather"])
+            if source_gates is not None:
+                _g = source_gates["local"] * _g
+            out += _g.to(dtype=out.dtype)
         else:
             out.index_add_(1, tgt, contrib.to(dtype=out.dtype))
 
