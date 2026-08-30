@@ -6,13 +6,13 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt #./data/wikitext_combined.txt
-block_size: 131072 #8196 #16384 #32768 #65536 #131072 #262144 #1024
-batch_size: 1
+block_size: 4096 #8196 #16384 #32768 #65536 #131072 #262144 #1024
+batch_size: 2
 val_split: 0.01
 
-num_epochs: 20
+num_epochs: 300 #20
 samples_per_epoch: 15625 #3125 #25000 #782 #25000
-gradient_accumulation_steps: 1  # accumulate grads over N batches before an optimizer step
+gradient_accumulation_steps: 4  # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
 # in seq-chunks of `chunked_ce_seq_chunk`, never materializing the full [B,T,vocab] logits (+ its
@@ -42,8 +42,8 @@ optimizer: muon_hybrid    # adamw | muon_hybrid (Muon on matrices, AdamW on 1D p
 muon_lr_mult: 6.0
 
 # Transformer shape
-hidden_dim: 192 #768
-num_heads: 3 #12
+hidden_dim: 768 #192 #768
+num_heads: 12 #3 #12
 transformer_n_layer: 12
 transformer_ffn_type: swiglu
 transformer_use_rope: true

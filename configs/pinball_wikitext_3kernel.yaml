@@ -51,13 +51,13 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 131072 #196704 #8196 #16384 #32768 #65536 #131072 #262144 #196704 #1024
-batch_size: 1
+block_size: 4096 #196704 #8196 #16384 #32768 #65536 #131072 #262144 #196704 #1024
+batch_size: 2
 val_split: 0.01
 
 # Training
 train_mode: ar            # ar | masked_diffusion
-learning_rate: 1e-3 #0.0001
+learning_rate: 1e-4 #0.0001
 weight_decay: 0.1
 warmup_steps: 1000
 #max_steps: 20000
@@ -71,9 +71,9 @@ muon_adjust_lr_fn: match_rms_adamw
 # Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
-num_epochs: 20
+num_epochs: 300 #20
 samples_per_epoch: 15625 #651 #15625 #3125 #25000 #782 #25000
-gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
+gradient_accumulation_steps: 4   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
 # in seq-chunks of `chunked_ce_seq_chunk`, never materializing the full [B,T,vocab] logits (+ its
@@ -112,7 +112,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_compileandscalingtests/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_3kernel_run_test/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -150,8 +150,8 @@ drop_static_cross_level_edges: true
 # long_range_distance: 3      # max graph hops for long-range edges
 
 # Core shape
-hidden_dim: 192 #192 #768
-num_heads: 3 #3 #12
+hidden_dim: 768 #192 #768
+num_heads: 12 #3 #12
 # Fat-QKV (sparse paths only): decouple the Q/K and V head dims from hidden_dim/num_heads
 # on the SPARSE-SCATTER attention. Flash local-window attention is unaffected (it requires
 # qk==v head_dim). Both default 1.0 = off (bit-identical).
@@ -207,6 +207,8 @@ hier_downward_refresh: true
 # hier_downward_refresh_pairs: ["0:1","0:2","0:3","1:2","1:3","2:3"]   # default: all downward
 hier_downward_refresh_every: 1
 hier_downward_refresh_gate_init: 0.1
+hier_upward_refresh_direct: false
+hier_upper_seed_direct: false      # same for the one-shot seed (runs once, not per layer)
 # The refreshes are kernel-LAUNCH-bound (many tiny ops x 12 layers): torch.compile fuses them,
 # measured ~14% whole-step win at seq 8196. Training mode only (fixed seq len = one compile);
 # eval/generation stay eager. Additional lever if needed: *_refresh_every: 2 (~12% win, stacks).
@@ -298,8 +300,12 @@ xq_nominate_read_sink: true
 # Fall back to query_levels [0] to keep coarse laterals untouched (+2% cost instead).
 hier_pool_gate: true            # see header: measured load-bearing on DNA
 hier_pool_gate_bias_init: 2.0
+
+local_pack_ring_windows: null
+local_pack_ring_merge: additive    # additive | lse | union -- inert while rings are null
+
 local_pack_cross_level: true
-local_pack_window: 1248             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const) # 156 624 1248
+local_pack_window: 624 #1248             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const) # 156 624 1248
 local_pack_query_levels: [0, 1, 2, 3, 4, 5, 6, 7]   # MUST cover every level
 # Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
 # bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
@@ -314,10 +320,10 @@ local_pack_level_bias: true
 # their old 1024/2048-token spans). Cost ~ the main packed call again (coarse rows are few).
 # Additive to the coarse queries' main-window read (fine detail stays available there).
 local_pack_coarse_lane: true
-local_pack_coarse_window: auto   # sized from real tier spacing; see header
-local_pack_coarse_window_tier_nodes: 3   # >=3 tier nodes must fall in the window
+local_pack_coarse_window: 900 # auto   # sized from real tier spacing; see header
+#local_pack_coarse_window_tier_nodes: 3   # >=3 tier nodes must fall in the window
 local_pack_top_global: true
-local_pack_top_global_budget: sqrt   # 0 | <row budget> | sqrt (self-sizing)
+local_pack_top_global_budget: 400 #sqrt   # 0 | <row budget> | sqrt (self-sizing)
 local_pack_global_block: 0      # the tier replaces it: n_tier^2, not n_block*N
 # UNIFIED SOFTMAX over both windows (2026-07-13): coarse queries read the mixed window and
 # the lane as ONE softmax over the union of both key sets, instead of adding two
@@ -333,7 +339,7 @@ local_pack_flex_union: false
 local_pack_lane_merge: false
 norm_type: layernorm
 dropout: 0.1
-
+hier_node_dropout: 0.1
 # Frontier-consistent AR generation: a raw prefix builds TRUNCATED coarse windows, so the token
 # being predicted reads its own OPEN parent — but in training that parent's full window extends
 # past it and is causal-cut. This pads the prefix forward by the top-level coarse window span
