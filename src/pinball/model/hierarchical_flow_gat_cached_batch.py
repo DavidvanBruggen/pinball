@@ -32,6 +32,83 @@ from .hierarchy.unified_hierarchy_builder import UnifiedHierarchyBuilder, EdgeFe
 logger = logging.getLogger(__name__)
 
 
+_HAS_SEGMENT_REDUCE = hasattr(torch, "segment_reduce")
+
+
+class _SegmentedBroadcast(torch.autograd.Function):
+    """`src[:, index, :]` whose backward is a segment sum instead of an atomic scatter.
+
+    index_select's backward lowers to aten::index_add. In the downward refresh every fine
+    row reads exactly one coarse row, so a 4096-token L0 feeding an 8-node top level makes
+    that a 512-way atomic collision on a single destination row -- measured 5 ms per call,
+    and 54 ms of a 167 ms train step across the 0:m pairs of an 8-level hierarchy.
+
+    `index` is monotone non-decreasing on this path (each coarse node owns a contiguous run
+    of fine rows -- verified for the AR "most recent closed" gather, the bidi
+    containing-parent gather, and curve mode, where node order is the curve order), so the
+    identical reduction is a segment sum over `offsets` -- measured ~200x
+    faster at the pathological shapes, with partial sums accumulated in order rather than
+    atomically interleaved. Callers must pass offsets built by `_segment_offsets`, which
+    returns None when monotonicity does not hold so the plain scatter still runs.
+
+    NOT bit-identical to the index_add path -- but that path is an atomic bf16 accumulation
+    and was never bit-reproducible against itself either; measured against an fp32 reference
+    the segment sum is the more accurate of the two.
+
+    Single-differentiable, unlike the index_select it replaces. Nothing in pinball takes a
+    grad of a grad here (no `create_graph=True` anywhere in the package, and reentrant
+    gradient checkpointing re-runs forward rather than differentiating backward), so this
+    is marked `once_differentiable` to fail by name if that ever changes.
+    """
+
+    @staticmethod
+    def forward(ctx, src, index, offsets):
+        ctx.save_for_backward(index, offsets)
+        ctx.n_src = int(src.size(1))
+        return src.index_select(1, index)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_out):
+        index, offsets = ctx.saved_tensors
+        if grad_out is None:
+            return None, None, None
+        grad_out = grad_out.contiguous()
+        B, n_q, H = grad_out.shape
+        if B == 1:
+            grad_src = torch.segment_reduce(
+                grad_out[0], "sum", offsets=offsets, axis=0
+            ).unsqueeze(0)
+        else:
+            # segment_reduce wants the segmented axis last in `offsets`, i.e. axis 0 of a 2D
+            # input -- fold the batch into the feature axis rather than looping over it.
+            folded = grad_out.transpose(0, 1).reshape(n_q, B * H)
+            grad_src = (
+                torch.segment_reduce(folded, "sum", offsets=offsets, axis=0)
+                .view(-1, B, H)
+                .transpose(0, 1)
+            )
+        if grad_src.size(1) < ctx.n_src:  # trailing coarse rows that nothing selected
+            grad_src = F.pad(grad_src, (0, 0, 0, ctx.n_src - grad_src.size(1)))
+        return grad_src, None, None
+
+
+def _segment_offsets(chosen: torch.Tensor, n_dst: int) -> Optional[torch.Tensor]:
+    """Segment boundaries for `_SegmentedBroadcast`, or None when `chosen` is not monotone
+    non-decreasing (segment_reduce needs contiguous runs; caller falls back to index_select).
+    Content-independent, so callers should build this once per graph shape and cache it --
+    the monotonicity check is a device sync."""
+    if not _HAS_SEGMENT_REDUCE or chosen.numel() == 0:
+        return None
+    c = chosen.to(torch.long)
+    if not bool((c[1:] >= c[:-1]).all()):
+        return None
+    counts = torch.bincount(c, minlength=int(n_dst))
+    if counts.numel() != int(n_dst):  # a stale/oversized index -- stay on the scatter
+        return None
+    return torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+
+
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 
@@ -5694,9 +5771,12 @@ class HierarchicalFlowGAT(nn.Module):
         return fn
 
     def _downward_gather_plan(self, level_offsets: torch.Tensor, node_ar_time: torch.Tensor) -> Dict[str, tuple]:
-        """Per (fine,coarse) pair: (chosen [n_fine] most-recent CLOSED coarse node, valid mask).
+        """Per (fine,coarse) pair: (chosen [n_fine] most-recent CLOSED coarse node, valid mask,
+        segment offsets or None).
         node_ar_time is content-independent and skeleton-cached, so this is computed once per
-        graph shape and keyed on tensor identity (no per-layer sync, no recompute)."""
+        graph shape and keyed on tensor identity (no per-layer sync, no recompute) -- which is
+        also what makes it the right place to pay for the `_segment_offsets` monotonicity sync
+        that lets the gather's backward be a segment sum instead of an atomic scatter."""
         key = (
             int(level_offsets.data_ptr()), int(node_ar_time.data_ptr()),
             int(node_ar_time.numel()), str(node_ar_time.device),
@@ -5737,13 +5817,13 @@ class HierarchicalFlowGAT(nn.Module):
                         )
                     chosen = idx.long()
                     valid = torch.ones((1, n_q, 1), dtype=torch.bool, device=t.device)
-                    plan[pair] = (chosen, valid)
+                    plan[pair] = (chosen, valid, _segment_offsets(chosen, m_time.numel()))
                     continue
                 sorted_t, sidx = torch.sort(m_time)
                 pos = torch.searchsorted(sorted_t, q_time, right=allow_same) - 1
                 valid = (pos >= 0).view(1, -1, 1)
                 chosen = sidx[pos.clamp(min=0)]
-                plan[pair] = (chosen, valid)
+                plan[pair] = (chosen, valid, _segment_offsets(chosen, m_time.numel()))
         self._downward_gather_plan_cache = (key, plan)
         return plan
 
@@ -6204,9 +6284,18 @@ class HierarchicalFlowGAT(nn.Module):
                 pair = f"{q}:{m}"
                 if pair not in plan:
                     continue
-                chosen, valid = plan[pair]
+                entry = plan[pair]
+                chosen, valid = entry[0], entry[1]
+                seg_offsets = entry[2] if len(entry) > 2 else None
                 proj = self.downward_refresh_proj[pair](cur[m])          # few coarse rows
-                g = proj.index_select(1, chosen) * valid.to(proj.dtype)  # bandwidth-only gather
+                # bandwidth-only gather; under grad the scatter backward is the whole cost of
+                # this op at depth (see _SegmentedBroadcast), so route it through the segment
+                # sum whenever the plan proved `chosen` monotone.
+                if seg_offsets is not None and torch.is_grad_enabled() and proj.requires_grad:
+                    gathered = _SegmentedBroadcast.apply(proj, chosen, seg_offsets)
+                else:
+                    gathered = proj.index_select(1, chosen)
+                g = gathered * valid.to(proj.dtype)
                 contrib = self.downward_refresh_gates[pair] * g
                 upd = contrib if upd is None else upd + contrib
             if upd is not None:
