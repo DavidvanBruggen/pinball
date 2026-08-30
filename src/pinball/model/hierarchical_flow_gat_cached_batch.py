@@ -5686,19 +5686,18 @@ class HierarchicalFlowGAT(nn.Module):
         return torch.cat(pieces, dim=1)
 
     def _refresh_callable(self, eager, cache_attr: str):
-        """Return the torch.compile'd refresh fn during training or fixed-shape evaluation.
-        Variable-length evaluation stays eager to avoid recompilation.
+        """Return the torch.compile'd refresh fn during training and CUDA evaluation.
+
+        Evaluation must use the same numerical backend as training at every sequence length.
+        Inductor specializes and caches new shapes; falling back to eager would materialize
+        extra bf16 rounding boundaries and evaluate a measurably different function.
 
         Compilation is lazy, so failures surface on the FIRST EXECUTION (e.g. inductor/triton
         missing support for a new GPU arch), not at torch.compile() time — the probation
         wrapper catches that, logs once, and permanently falls back to eager instead of
         killing the run. After the first successful call the raw compiled fn is cached."""
-        fixed_eval = bool(
-            not self.training
-            and next(self.parameters()).is_cuda
-            and int(getattr(self, "_uf_cache_last_seq_len", -1)) == int(self.max_seq_len)
-        )
-        if not (getattr(self, "hier_refresh_compile", False) and (self.training or fixed_eval)):
+        compiled_eval = bool(not self.training and next(self.parameters()).is_cuda)
+        if not (getattr(self, "hier_refresh_compile", False) and (self.training or compiled_eval)):
             return eager
         fn = getattr(self, cache_attr, None)
         if fn is None:
@@ -5728,20 +5727,17 @@ class HierarchicalFlowGAT(nn.Module):
         return fn
 
     def _layer_callable(self, transformer):
-        """torch.compile'd refinement-layer forward in training or fixed-shape evaluation
+        """torch.compile'd refinement-layer forward in training or CUDA evaluation
         when hier_layer_compile is on (one compile per layer; fuses the eager orchestration
         around the flash/pack calls — the launch-bound cost at short sequences). Same lazy +
         probation policy as _refresh_callable: first runtime failure logs once and falls back
-        to eager permanently. Variable-length evaluation remains eager.
+        to eager permanently. New evaluation shapes are specialized and cached by Inductor so
+        generation buckets and resized DNA sequences retain training's bf16 rounding behavior.
 
         The 12 layers share one forward code object, so dynamo needs a cache slot per module
         instance — bump cache_size_limit once so late layers don't silently stay eager."""
-        fixed_eval = bool(
-            not self.training
-            and next(transformer.parameters()).is_cuda
-            and int(getattr(self, "_uf_cache_last_seq_len", -1)) == int(self.max_seq_len)
-        )
-        if not (getattr(self, "hier_layer_compile", False) and (self.training or fixed_eval)):
+        compiled_eval = bool(not self.training and next(transformer.parameters()).is_cuda)
+        if not (getattr(self, "hier_layer_compile", False) and (self.training or compiled_eval)):
             return transformer
         fn = getattr(transformer, "_pinball_compiled_forward", None)
         if fn is None:
@@ -14834,6 +14830,8 @@ class HierarchicalFlowGAT(nn.Module):
             features: Optional hierarchical features if return_hierarchical_features=True
         """
         batch_size, seq_len = input_ids.shape
+        # Exposed in runtime metrics and useful when diagnosing shape specializations.
+        self._uf_cache_last_seq_len = int(seq_len)
 
         # Handle batching - process each example separately for now
         # A more advanced implementation could process the whole batch at once

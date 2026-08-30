@@ -210,17 +210,16 @@ hier_downward_refresh_gate_init: 0.1
 hier_upward_refresh_direct: false
 hier_upper_seed_direct: false      # same for the one-shot seed (runs once, not per layer)
 # The refreshes are kernel-LAUNCH-bound (many tiny ops x 12 layers): torch.compile fuses them,
-# measured ~14% whole-step win at seq 8196. Fixed-shape validation and generation use the same
-# compiled function as training; variable-length evaluation stays eager. Additional lever if
-# needed: *_refresh_every: 2 (~12% win, stacks).
+# measured ~14% whole-step win at seq 8196. CUDA validation and generation compile every shape
+# they use, preserving training's bf16 rounding behavior; Inductor caches each specialization.
+# Additional lever if needed: *_refresh_every: 2 (~12% win, stacks).
 hier_refresh_compile: true
 # Compile each refinement layer's forward (widest region below the model-level forward,
-# whose cache bookkeeping breaks dynamo). Fixed-shape eval must also compile: fused bf16
+# whose cache bookkeeping breaks dynamo). CUDA eval must also compile at every shape: fused bf16
 # numerics diverge materially from eager over 12 layers, especially at late positions. Fuses
 # the launch-bound eager orchestration —
 # measured +14% at T=64 and +26% at T=1024 alone; 1.8x combined with refresh compile at
-# T=1024 (2026-07-17, 4090 under contention). Training-only, probation fallback to eager.
-# OFF here: flipping it mid-experiment changes step numerics slightly vs your running curve.
+# T=1024 (2026-07-17, 4090 under contention). Lazy, probation fallback to eager.
 hier_layer_compile: true
 # HQD v2 — cross-query-guided nomination (NSA-style selective sparse attention). At the
 # multirate midpoint each L0 query scores the CLOSED L3 windows with the 0:3 refiner's TRAINED
