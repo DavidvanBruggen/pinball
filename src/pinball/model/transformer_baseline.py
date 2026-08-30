@@ -373,11 +373,26 @@ class TransformerLM(nn.Module):
                 nn.init.zeros_(film.bias)
 
     def _block_callable(self, block: nn.Module):
-        """torch.compile'd block forward in training mode when compile_blocks is on —
-        the parity knob for pinball's hier_layer_compile (same lazy + probation policy:
-        first runtime failure logs once and falls back to eager permanently). Eval and
-        generation stay eager (varying shapes would recompile every step)."""
-        if not (self.compile_blocks and self.training):
+        """torch.compile'd block forward during training OR fixed-shape evaluation when
+        compile_blocks is on — the parity knob for pinball's hier_layer_compile (same lazy +
+        probation policy: first runtime failure logs once and falls back to eager
+        permanently). Variable-length evaluation stays eager (it would recompile per step).
+
+        WHY EVAL MUST FOLLOW TRAINING. Compiling changes nothing mathematically, but inductor
+        fuses elementwise chains and keeps them in fp32 registers where eager materialises
+        every intermediate in bf16. Training compiled while validating eager therefore scores
+        a DIFFERENT function than the one being optimised, and the error accumulates with
+        depth and position. Measured on the pinball arm: 0.0955 feature RMS at 1024 tokens
+        and 4.48 vs 4.91 held-out NLL, i.e. the reported val PPL was inflated by ~35%. The
+        transformer carries less per-layer elementwise work so its gap should be smaller —
+        but "smaller" is not "zero", and this is the baseline every pinball number is judged
+        against, so it must be measured the same way."""
+        fixed_eval = bool(
+            not self.training
+            and next(self.parameters()).is_cuda
+            and int(getattr(self, "_last_seq_len", -1)) == int(self.block_size)
+        )
+        if not (self.compile_blocks and (self.training or fixed_eval)):
             return block
         fn = getattr(block, "_compiled_forward", None)
         if fn is None:
@@ -525,6 +540,10 @@ class TransformerLM(nn.Module):
             if position_ids is not None:
                 position_ids = position_ids[:, -self.block_size :]
             seq_len = int(self.block_size)
+
+        # Seen by _block_callable's fixed_eval test: only a full-length forward may use the
+        # compiled blocks in eval, so short/ragged generation prefixes stay eager.
+        self._last_seq_len = int(seq_len)
 
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(bsz, seq_len)

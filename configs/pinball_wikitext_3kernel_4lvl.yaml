@@ -324,7 +324,7 @@ local_pack_ring_windows: null
 local_pack_ring_merge: additive    # additive | lse | union -- inert while rings are null
 
 local_pack_cross_level: true
-local_pack_window: 1248 #156 #624 #1248             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const) # 156 624 1248
+local_pack_window: 156 #1248 #156 #624 #1248             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const) # 156 624 1248
 local_pack_query_levels: [0, 1, 2, 3]   # MUST cover every level
 # Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
 # bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
@@ -358,7 +358,7 @@ local_pack_flex_union: false
 local_pack_lane_merge: false
 norm_type: layernorm
 dropout: 0.1
-hier_node_dropout: 0 #0.1
+hier_node_dropout: 0.1 #0.1
 # Stability normalizations (both default ON; set false only to reproduce a checkpoint
 # trained before they existed). final_norm_fast_path re-applies the terminal norm on exit
 # from the refinement loop, which the fast path had lost -- without it nothing renormalizes
@@ -673,7 +673,7 @@ pinball_cross_query_write_scale_init: 0.1
 # Hierarchy auxiliary (reconstruction) loss. ON: trains L1/L2/L3 to reconstruct (detached) L0
 # features -> shapes L3 into a good L0-abstraction, which is exactly what the downward cross-query
 # (L0/L1/L2 <- L3) needs to be worth reading. Synergises with the copredict head.
-use_aux_loss: true
+use_aux_loss: false
 
 # PREDICTIVE coarse aux (Stage 3, "next-concept" prediction) — the LM objective one timescale up.
 # Each coarse node at window i predicts the DETACHED pooled child summary of window i+h at its own
@@ -683,7 +683,7 @@ use_aux_loss: true
 # abstraction that carries forward. Training-only (forward untouched, no leak surface); targets
 # detached (JEPA-style). OFF here so the current upref_consolidated run is unaffected — flip on
 # for the next run (safe mid-warm-start too: it only adds small per-level predictor MLPs).
-hier_predaux_enable: true  # cleaner-pinball: ON — with the scatter gradient path gone, the
+hier_predaux_enable: false  # cleaner-pinball: ON — with the scatter gradient path gone, the
                            # coarse levels carry their own predictive objective (Stage 3)
 lambda_hier_predaux: 0.05
 hier_predaux_levels: [1, 2, 3]
