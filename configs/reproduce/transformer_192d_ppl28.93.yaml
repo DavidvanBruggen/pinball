@@ -1,0 +1,46 @@
+# GPT-style transformer baseline (same data/tokenizer as the Pinball configs).
+
+model_type: transformer
+modality: text
+tokenizer_name: gpt2
+
+# Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
+text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt #./data/wikitext_combined.txt
+block_size: 8196 #16384 #32768 #1024
+batch_size: 2
+val_split: 0.01
+
+num_epochs: 100
+samples_per_epoch: 3125 #25000 #782 #25000
+gradient_accumulation_steps: 2  # accumulate grads over N batches before an optimizer step
+gradient_checkpointing: false    # trade compute for memory in the refinement stack
+# Long-context diagnostic: every N validations, log next-token PPL bucketed by in-context
+# recurrence distance (never / <128 / 128-511 / 512-2k / >2k). Cheap — reuses the val batches,
+# no extra forward. The split that matters: <128 (inside local window) vs >=128 (needs the
+# hierarchy). 0 = off. longctx_diag_max_seqs caps sequences scanned per run (default 64).
+longctx_diag_every: 1
+# longctx_diag_max_seqs: 64
+# Generation prompt/continuation lengths. gen_prompt_tokens defaults to min(64, block_size//2);
+# raise it for long-range PG19 conditioning (must be <= block_size). Leave sample_prompt unset
+# so the prompt is sampled from held-out val text rather than a fixed short string.
+gen_prompt_tokens: 512
+gen_max_new_tokens: 512
+save_every: 0
+checkpoint_dir: ./transformer/checkpoints_gpt2_longcontext_test_small
+
+train_mode: ar
+learning_rate: 0.0003
+weight_decay: 0.1
+#max_steps: 20000
+warmup_steps: 1000
+optimizer: muon_hybrid    # adamw | muon_hybrid (Muon on matrices, AdamW on 1D params)
+muon_lr_mult: 6.0
+
+# Transformer shape
+hidden_dim: 192 #768
+num_heads: 3 #12
+transformer_n_layer: 12
+transformer_ffn_type: swiglu
+transformer_use_rope: true
+transformer_attn_backend: auto   # auto | flash | sdpa
+dropout: 0.1

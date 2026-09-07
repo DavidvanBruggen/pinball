@@ -1,0 +1,22 @@
+# WikiText-103, 192 hidden dim, 12 layers. Configs recovered from git:
+#   pinball     configs/pinball_wikitext_cleaner_pack.yaml @ 52a5ca4
+#   transformer configs/transformer_wikitext.yaml          @ af52182
+#
+# MATCHED: block_size 8196, 32,784 tokens per optimizer step (pinball batch 4 x accum 1;
+# transformer batch 2 x accum 2), 781 optimizer steps/epoch, 100 epochs, dropout 0.1,
+# muon_hybrid, warmup 1000, val_split 0.01, same text file.
+# NOT matched: learning rate -- pinball 1e-4, transformer 3e-4, i.e. the TRANSFORMER had
+# the higher LR, so this is not an advantage handed to pinball.
+#
+# PARAMETERS ARE THE TRAINED MODEL, dead allocations excluded. The stored checkpoint is
+# 22.97M, but 5.34M of that is per-level q/k/v built unconditionally while the run set
+# cross_level_qkv: shared -- never used, never received gradient (weight std flat at
+# 0.0199-0.0201 across all layers/levels vs the shared projections' 0.076-0.084, and the
+# four levels are mutually independent random draws). Those are a construction bug, not
+# model capacity, and are excluded here. "aux" IS trained but is discarded at inference.
+#
+#   pinball trained    17.63M   (16.82M at inference, excluding aux)
+#   transformer        16.55M
+arm,ppl,total_M,core_M,embed_M,aux_M,hier_M
+Pinball,27.73,17.63,6.71,9.65,0.81,0.46
+Transformer,28.93,16.55,5.33,11.22,0.00,0.00

@@ -1,0 +1,28 @@
+# Pinball vs param-matched flash transformer -- training step time, DNA arms.
+# Measured 2026-08-19, RTX PRO 6000 Blackwell, batch 1, gradient checkpointing ON for
+# every arm, cycled min-of-rounds. Values are ms per training step (fwd+bwd).
+#
+# Caveats that belong in any caption using this data:
+#  * Peak memory goes the OTHER way: +37% for pinball (32k, batch 1, activations only:
+#    transformer 3.97 GiB vs pinball windowed 6.67 GiB).
+#  * The transformer baseline carries a position-embedding table sized by block_size on
+#    top of RoPE, so it grows 198.6M @4k -> 227.9M @32k. Param-matching holds only at
+#    4096; past that the baseline is heavier, which flatters pinball slightly.
+#  * full_context pinball pays the quadratic AND the hierarchy, and is never competitive.
+length,arm,ms
+4096,Transformer,54.6
+8192,Transformer,150.4
+16384,Transformer,457.5
+32768,Transformer,1570.7
+4096,Pinball (full ctx),91.6
+8192,Pinball (full ctx),225.3
+16384,Pinball (full ctx),825.1
+32768,Pinball (full ctx),2620.4
+4096,Pinball (windowed),71.5
+8192,Pinball (windowed),126.1
+16384,Pinball (windowed),417.2
+32768,Pinball (windowed),962.7
+4096,Pinball (linear flexhier),80.8
+8192,Pinball (linear flexhier),173.3
+16384,Pinball (linear flexhier),423.9
+32768,Pinball (linear flexhier),977.9

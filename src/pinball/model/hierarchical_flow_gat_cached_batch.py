@@ -2372,6 +2372,12 @@ class HierarchicalFlowGAT(nn.Module):
         hier_upward_refresh: bool = False,
         hier_upward_refresh_every: int = 1,       # apply after every k-th layer call
         hier_upward_refresh_gate_init: float = 0.0,
+        # Give every refinement layer its OWN refresh gates instead of one set shared
+        # across depth. Default ON: a single gate cannot express a depth profile, and
+        # the hierarchy demonstrably wants one (late ascent -- L3 fills only at layer 11).
+        # Identical at init (every row holds the shared value), and older checkpoints
+        # whose gates are shared-shaped are expanded on load, so this stays loadable.
+        hier_refresh_per_layer_gates: bool = True,
         # Direct (unchained) upward pooling: pool L0 into every coarse level using that
         # level's cumulative window, instead of re-pooling level lvl from the already
         # refreshed level lvl-1. The chained form multiplies per-level factors and repeats
@@ -4217,15 +4223,29 @@ class HierarchicalFlowGAT(nn.Module):
         # --- Per-layer upward refresh (see _apply_upward_refresh) ---
         self.hier_upward_refresh = bool(hier_upward_refresh)
         self.hier_upward_refresh_every = max(1, int(hier_upward_refresh_every))
+        self.hier_refresh_per_layer_gates = bool(hier_refresh_per_layer_gates)
         if self.hier_upward_refresh:
             self.upward_refresh_proj = nn.ModuleList(
                 nn.Linear(self.hidden_dim, self.hidden_dim) for _ in compression_ratios
             )
+            # Kept 1-D even when per-layer (flattened [layer, level], viewed at use time).
+            # A 2-D gate TABLE would be swept into Muon by the `ndim >= 2` split and
+            # orthogonalized -- which forces uniform singular values across the layer x level
+            # grid and destroys the very depth profile this parameter exists to learn. The
+            # exclusion list in cli.py would not help: the DNA runs build their optimizer in
+            # the ChromScape host, not here. Staying 1-D is safe under every such rule.
+            n_gate_rows = self._refresh_gate_rows()
             self.upward_refresh_gates = nn.Parameter(
+                torch.full((n_gate_rows * len(compression_ratios),),
+                           float(hier_upward_refresh_gate_init))
+                if self.hier_refresh_per_layer_gates else
                 torch.full((len(compression_ratios),), float(hier_upward_refresh_gate_init))
             )
-            logger.info("Per-layer upward refresh enabled (every %d layer(s), gate init %.3g).",
-                        self.hier_upward_refresh_every, float(hier_upward_refresh_gate_init))
+            logger.info("Per-layer upward refresh enabled (every %d layer(s), gate init %.3g, "
+                        "%s gates).", self.hier_upward_refresh_every,
+                        float(hier_upward_refresh_gate_init),
+                        f"per-layer x{n_gate_rows}" if self.hier_refresh_per_layer_gates
+                        else "shared-across-depth")
         self.hier_upward_refresh_direct = bool(hier_upward_refresh_direct)
         self.hier_upper_seed_direct = bool(hier_upper_seed_direct)
         if self.hier_upward_refresh_direct or self.hier_upper_seed_direct:
@@ -4279,11 +4299,18 @@ class HierarchicalFlowGAT(nn.Module):
             self.downward_refresh_proj = nn.ModuleDict(
                 {k: nn.Linear(self.hidden_dim, self.hidden_dim) for k in pair_keys}
             )
+            _dn_rows = self._refresh_gate_rows()
             self.downward_refresh_gates = nn.ParameterDict(
-                {k: nn.Parameter(torch.tensor(float(hier_downward_refresh_gate_init))) for k in pair_keys}
+                {k: nn.Parameter(
+                    torch.full((_dn_rows,), float(hier_downward_refresh_gate_init))
+                    if self.hier_refresh_per_layer_gates else
+                    torch.tensor(float(hier_downward_refresh_gate_init)))
+                 for k in pair_keys}
             )
             logger.info("Per-layer downward refresh enabled for pairs %s (every %d layer(s), gate init %.3g).",
                         pair_keys, self.hier_downward_refresh_every, float(hier_downward_refresh_gate_init))
+        if getattr(self, 'hier_upward_refresh', False) or getattr(self, 'hier_downward_refresh', False):
+            self._register_load_state_dict_pre_hook(self._expand_shared_refresh_gates)
         self.hier_refresh_compile = bool(hier_refresh_compile)
         self.hier_layer_compile = bool(hier_layer_compile)
         self.final_norm_fast_path = bool(final_norm_fast_path)
@@ -5649,7 +5676,66 @@ class HierarchicalFlowGAT(nn.Module):
         pieces.append(x_cat[:, offsets[-1] :, :])
         return torch.cat(pieces, dim=1)
 
-    def _apply_upward_refresh(self, x: torch.Tensor, level_offsets: torch.Tensor) -> torch.Tensor:
+    def _refresh_gate_rows(self) -> int:
+        """Number of per-layer gate rows to allocate (1 when gates are shared across depth)."""
+        if not getattr(self, "hier_refresh_per_layer_gates", False):
+            return 1
+        return max(1, int(getattr(self, "num_refinement_layers", 1) or 1))
+
+    def _expand_shared_refresh_gates(self, state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs):
+        """Load a shared-across-depth refresh gate into a per-layer model (and back).
+
+        Checkpoints written before hier_refresh_per_layer_gates carry one gate per level
+        (upward) and a scalar per pair (downward). Broadcasting that value to every layer row
+        reproduces the shared behaviour exactly, so old checkpoints stay loadable under
+        strict=True and evaluate identically. The reverse direction (per-layer checkpoint into
+        a shared build) averages over depth, which is the closest single value available.
+        """
+        rows = self._refresh_gate_rows()
+        key = prefix + "upward_refresh_gates"
+        if key in state_dict and hasattr(self, "upward_refresh_gates"):
+            got, want = state_dict[key], self.upward_refresh_gates
+            if got.shape != want.shape and got.numel() > 0:
+                if self.hier_refresh_per_layer_gates and got.numel() * rows == want.numel():
+                    state_dict[key] = got.repeat(rows)          # [K] -> [rows, K] flattened
+                elif not self.hier_refresh_per_layer_gates and got.numel() % want.numel() == 0:
+                    state_dict[key] = got.view(-1, want.numel()).mean(0)
+        if hasattr(self, "downward_refresh_gates"):
+            for name, param in self.downward_refresh_gates.items():
+                k = f"{prefix}downward_refresh_gates.{name}"
+                if k not in state_dict:
+                    continue
+                got = state_dict[k]
+                if got.shape == param.shape:
+                    continue
+                if self.hier_refresh_per_layer_gates and got.dim() == 0:
+                    state_dict[k] = got.reshape(1).repeat(rows)
+                elif not self.hier_refresh_per_layer_gates and got.dim() == 1:
+                    state_dict[k] = got.mean()
+
+    def _upward_gates_for_layer(self, layer_idx: int) -> torch.Tensor:
+        """The [num_levels-1] gate vector this layer should use.
+
+        Resolved in the EAGER wrapper and passed into the core as a tensor argument, so the
+        compiled core never specializes on the layer index (one graph, not one per layer).
+        """
+        g = self.upward_refresh_gates
+        if not self.hier_refresh_per_layer_gates:
+            return g
+        rows = self._refresh_gate_rows()
+        return g.view(rows, -1)[min(max(int(layer_idx), 0), rows - 1)]
+
+    def _downward_gates_for_layer(self, layer_idx: int) -> Dict[str, torch.Tensor]:
+        """Per-pair 0-dim gate tensors for this layer (see _upward_gates_for_layer)."""
+        if not self.hier_refresh_per_layer_gates:
+            return {k: v for k, v in self.downward_refresh_gates.items()}
+        rows = self._refresh_gate_rows()
+        i = min(max(int(layer_idx), 0), rows - 1)
+        return {k: v[i] for k, v in self.downward_refresh_gates.items()}
+
+    def _apply_upward_refresh(self, x: torch.Tensor, level_offsets: torch.Tensor,
+                              layer_idx: int = 0) -> torch.Tensor:
         """Gated per-layer upward re-pool: parent = parent + gate_l * proj_l(mean of child window).
 
         x: [B, N, H]. Runs bottom-up on the UPDATED lower slice, so one call carries L0's
@@ -5664,9 +5750,10 @@ class HierarchicalFlowGAT(nn.Module):
         """
         offsets = tuple(self._level_offsets_list(level_offsets))
         core = self._refresh_callable(self._upward_refresh_core, "_upward_refresh_compiled")
-        return core(x, offsets)
+        return core(x, offsets, self._upward_gates_for_layer(layer_idx))
 
-    def _upward_refresh_core(self, x: torch.Tensor, offsets: tuple) -> torch.Tensor:
+    def _upward_refresh_core(self, x: torch.Tensor, offsets: tuple,
+                             gates: torch.Tensor) -> torch.Tensor:
         level_sizes = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
         pieces = [x[:, : offsets[1], :]]
         l0 = x[:, offsets[0] : offsets[1], :]
@@ -5678,7 +5765,7 @@ class HierarchicalFlowGAT(nn.Module):
                 pooled = self._pooled_child_window_means(l0, lvl, int(level_sizes[lvl]), c, st)
             else:
                 pooled = self._pooled_child_window_means(lower, lvl, int(level_sizes[lvl]))
-            gate = self.upward_refresh_gates[lvl - 1].to(dtype=pooled.dtype)
+            gate = gates[lvl - 1].to(dtype=pooled.dtype)
             cur = x[:, offsets[lvl] : offsets[lvl + 1], :] + gate * self.upward_refresh_proj[lvl - 1](pooled)
             pieces.append(cur)
             lower = cur
@@ -6269,7 +6356,8 @@ class HierarchicalFlowGAT(nn.Module):
         return max(1, floor_w, (k * (n_bank // max(1, n_tier))) // 2)
 
     def _apply_downward_refresh(
-        self, x: torch.Tensor, level_offsets: torch.Tensor, node_ar_time: torch.Tensor
+        self, x: torch.Tensor, level_offsets: torch.Tensor, node_ar_time: torch.Tensor,
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """Gated per-layer downward gather: fine node t reads, from each configured coarser
         level, that level's most-recent closed node (window_end <= t) — the same node a
@@ -6283,9 +6371,10 @@ class HierarchicalFlowGAT(nn.Module):
         offsets = tuple(self._level_offsets_list(level_offsets))
         plan = self._downward_gather_plan(level_offsets, node_ar_time)
         core = self._refresh_callable(self._downward_refresh_core, "_downward_refresh_compiled")
-        return core(x, offsets, plan)
+        return core(x, offsets, plan, self._downward_gates_for_layer(layer_idx))
 
-    def _downward_refresh_core(self, x: torch.Tensor, offsets: tuple, plan: Dict[str, tuple]) -> torch.Tensor:
+    def _downward_refresh_core(self, x: torch.Tensor, offsets: tuple, plan: Dict[str, tuple],
+                               gates: Dict[str, torch.Tensor]) -> torch.Tensor:
         num_levels = len(offsets) - 1
         cur = {lvl: x[:, offsets[lvl] : offsets[lvl + 1], :] for lvl in range(num_levels)}
         for q in range(num_levels - 2, -1, -1):
@@ -6306,7 +6395,7 @@ class HierarchicalFlowGAT(nn.Module):
                 else:
                     gathered = proj.index_select(1, chosen)
                 g = gathered * valid.to(proj.dtype)
-                contrib = self.downward_refresh_gates[pair] * g
+                contrib = gates[pair] * g
                 upd = contrib if upd is None else upd + contrib
             if upd is not None:
                 cur[q] = cur[q] + upd
@@ -7310,13 +7399,28 @@ class HierarchicalFlowGAT(nn.Module):
                 d[f"copred.L{k}->L0.gate"] = float(g.detach())
         # Per-layer upward refresh (child-window re-pool into parent) gates.
         if getattr(self, "hier_upward_refresh", False) and hasattr(self, "upward_refresh_gates"):
-            for i in range(self.upward_refresh_gates.numel()):
-                d[f"upref.L{i}->L{i + 1}.gate"] = float(self.upward_refresh_gates[i].detach())
+            # Per-layer gates report both the depth MEAN (comparable to a shared-gate run)
+            # and the per-layer values, so a depth profile is readable without extra tooling.
+            if getattr(self, "hier_refresh_per_layer_gates", False):
+                gl = self.upward_refresh_gates.detach().view(self._refresh_gate_rows(), -1)
+                for i in range(gl.shape[1]):
+                    d[f"upref.L{i}->L{i + 1}.gate"] = float(gl[:, i].mean())
+                    for li in range(gl.shape[0]):
+                        d[f"upref.layer{li}.L{i}->L{i + 1}.gate"] = float(gl[li, i])
+            else:
+                for i in range(self.upward_refresh_gates.numel()):
+                    d[f"upref.L{i}->L{i + 1}.gate"] = float(self.upward_refresh_gates[i].detach())
         # Per-layer downward refresh (most-recent-closed coarse gather) gates.
         if getattr(self, "hier_downward_refresh", False) and hasattr(self, "downward_refresh_gates"):
             for k, g in self.downward_refresh_gates.items():
                 q, m = k.split(":")
-                d[f"downref.L{q}<-L{m}.gate"] = float(g.detach())
+                gd = g.detach()
+                if gd.dim() == 0:
+                    d[f"downref.L{q}<-L{m}.gate"] = float(gd)
+                else:
+                    d[f"downref.L{q}<-L{m}.gate"] = float(gd.mean())
+                    for li in range(gd.numel()):
+                        d[f"downref.layer{li}.L{q}<-L{m}.gate"] = float(gd[li])
         # HQD reach: mean selection distance in node ids (curve order for L0) and the
         # fraction landing inside the local window, i.e. slots spent on nodes the packed
         # attention already sees. Watch mean_dist collapsing toward the window half --
@@ -13768,7 +13872,7 @@ class HierarchicalFlowGAT(nn.Module):
                     and base_lo is not None
                     and (layer_step % self.hier_upward_refresh_every) == 0
                 ):
-                    x = self._apply_upward_refresh(x, base_lo)
+                    x = self._apply_upward_refresh(x, base_lo, int(layer_idx))
 
                 # Per-layer downward refresh: broadcast each coarser level's freshest closed
                 # summary back down (dense gather replacement for the bridges scatter edges).
@@ -13778,7 +13882,7 @@ class HierarchicalFlowGAT(nn.Module):
                     and base_ar_time is not None
                     and (layer_step % self.hier_downward_refresh_every) == 0
                 ):
-                    x = self._apply_downward_refresh(x, base_lo, base_ar_time)
+                    x = self._apply_downward_refresh(x, base_lo, base_ar_time, int(layer_idx))
 
                 # Per-layer co-evolution hook: run one memory round in lockstep with this
                 # native layer (memory graph evolves at the same depth as the native graph).

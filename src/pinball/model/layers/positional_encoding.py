@@ -46,7 +46,12 @@ class RotaryPositionalEncoding(nn.Module):
         safe_max_pos = min(max_pos, self.max_seq_len)
         inv_freq_bf = self.inv_freq.to(device).unsqueeze(0)
         position = torch.arange(safe_max_pos, device=device).unsqueeze(1)
-        position_enc = torch.matmul(position.float(), inv_freq_bf)
+        # torch.matmul is on the autocast lower-precision list: under bf16 autocast this
+        # returned bf16 PHASES. Phases are unbounded (up to max_pos), where bf16's 8
+        # significant bits collapse distinct positions (8192 -> 897) and give phase errors
+        # of tens of radians. The elementwise product is not autocast, so it stays fp32 and
+        # matches the compiled branch exactly.
+        position_enc = position.float() * inv_freq_bf
         self.cos_cached = torch.cos(position_enc)
         self.sin_cached = torch.sin(position_enc)
 
@@ -127,7 +132,9 @@ class RotaryPositionalEncoding(nn.Module):
 
         for axis_idx in range(num_axes):
             axis_pos = positions[:, axis_idx].to(device=x.device, dtype=torch.float32)
-            axis_enc = torch.matmul(axis_pos.unsqueeze(1), inv_freq_axis.unsqueeze(0))
+            # Elementwise, not matmul: matmul is autocast to bf16 and these are unbounded
+            # phases (see _precompute_sincos).
+            axis_enc = axis_pos.unsqueeze(1) * inv_freq_axis.unsqueeze(0)
             axis_cos = torch.cos(axis_enc).to(dtype=x.dtype).unsqueeze(1)
             axis_sin = torch.sin(axis_enc).to(dtype=x.dtype).unsqueeze(1)
 

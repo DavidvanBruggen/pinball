@@ -47,7 +47,7 @@
 # narrowest window that works, and lateral reach is the reason this arm exists.
 #
 # Check any edit with:  python bench_hierarchy_plan.py --config <this file> --scan 4096 1048576
-block_size: 4096 #32768 #4096
+block_size: 32768 #4096 #32768 #4096
 model_type: pinball
 tokenizer_name: gpt2            # unused in features mode; build_pinball stubs it
 
@@ -89,8 +89,8 @@ dropout: 0.1
 # Per-level DropNode. Index i = level i; L0 is pinned to 0.0 whatever this says. Level sizes
 # at 4096 are L1 512, L2 256, L3 128, L4 32, L5 8, L6 2 -- dropping 10% of a 2-row level is a
 # 50%-of-the-level event, so the top levels get none.
-hier_node_dropout: 0.1 #0.0
-# hier_node_dropout_per_level: [0.0, 0.1, 0.1, 0.05, 0.0, 0.0, 0.0]
+#hier_node_dropout: 0.1 #0.0
+hier_node_dropout_per_level: [0.0, 0.1, 0.1, 0.05, 0.0, 0.0, 0.0]
 norm_type: layernorm
 attn_backend: flash             # alias -> l0_local_backend
 qkv_sharing: shared
@@ -181,7 +181,7 @@ local_pack_coarse_lane: true
 # 64 -> 70/35/17. Constant in N, because each level's share of the bank is. Must be a
 # scalar or "auto": the per-level list form takes a different spec branch (one flash call
 # per level, measured 1.8x slower at 4096 -- launch-bound, not FLOP-bound).
-local_pack_coarse_window: 900
+local_pack_coarse_window: 128 #900
 # The band, the lane and the tier are three separate flash calls summed. Additive is not
 # one softmax over the union: a coarse row inside BOTH the band and the lane is attended
 # twice (~57 of ~900 lane keys at 32768). That is inherent to the path, not a defect, and

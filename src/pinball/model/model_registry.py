@@ -180,6 +180,7 @@ def build_pinball_model(
         hier_upward_refresh=bool(getattr(args, "hier_upward_refresh", False)),
         hier_upward_refresh_every=int(getattr(args, "hier_upward_refresh_every", 1)),
         hier_upward_refresh_gate_init=float(getattr(args, "hier_upward_refresh_gate_init", 0.0)),
+        hier_refresh_per_layer_gates=bool(getattr(args, "hier_refresh_per_layer_gates", True)),
         hier_upward_refresh_direct=bool(getattr(args, "hier_upward_refresh_direct", False)),
         hier_upper_seed_direct=bool(getattr(args, "hier_upper_seed_direct", False)),
         hier_pool_gate=bool(getattr(args, "hier_pool_gate", False)),

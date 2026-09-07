@@ -1,0 +1,33 @@
+# DNA track prediction, param-matched pinball vs transformer, native 500 kb context.
+# Measured 2026-08-29 with ChromScape/bin/eval_specificity.py, 130 valid windows.
+#
+# TWO AXES, and only one supports a long-range claim:
+#  * across_region -- per track, down the (sequence, position) axis. Peak-vs-background
+#    dominates its variance and is largely readable from local sequence: a profile x depth
+#    model with ZERO distal reach scores 0.93 here. Every ChromScape Pearson to date,
+#    including the notebook val_PearsonR_borzoi ~0.76, is this axis.
+#  * specificity -- Borzoi's hound_eval_spec: quantile-normalise preds and targets across
+#    tracks, subtract the across-track mean per position, correlate the residual down
+#    positions. At a fixed locus the DNA is identical for every track, so nothing local can
+#    separate them. The same profile x depth model scores 0.000 here.
+#
+# CAVEAT (established 2026-08-30): these were measured on the EAGER path, which is ~24%
+# off the fp32 reference for pinball but ~0 for the transformer. Pinball's numbers are
+# therefore likely UNDERSTATED here; re-measure through the compiled path before quoting.
+#
+# ADDED 2026-09-01: the three-kernel ADDITIVE arm (mixed band + windowed coarse lane +
+# all-to-all global tier), configs/pinball_dna_bidi_linear_3kernel.yaml, run
+# ..._3kernel500kb_test_compilefix_hier_do_nottoplvl_lowerlr. Same script, same split,
+# same 130 windows, 0 missing/unexpected keys, no config-staleness warning.
+# CONFOUND: this run used HALF the peak LR (3e-4 vs 6e-4) and per-level hierarchy dropout,
+# so its best checkpoint is ep25 against ep9/ep10 for the arms above. The epoch-20 row is
+# the matched comparison; the "best" row is not. Adjacent saves differ by 0.007 in
+# specificity (ep25 0.4677 vs ep30 0.4608), which is the scale of the run-to-run noise.
+arm,checkpoint,across_region,specificity
+Transformer,best (ep9),0.7877,0.4506
+Pinball (flexhier),best (ep10),0.7833,0.4526
+Transformer,ep20,0.7858,0.4521
+Pinball (flexhier),ep20,0.7648,0.4348
+Pinball (3-kernel additive),best (ep25),0.7825,0.4677
+Pinball (3-kernel additive),ep20,0.7785,0.4455
+Pinball (3-kernel additive),ep30,0.7863,0.4608
