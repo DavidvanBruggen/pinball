@@ -2433,6 +2433,31 @@ class HierarchicalFlowGAT(nn.Module):
         # It is not a no-op — a LayerNorm at weight=1/bias=0 normalizes rather than passing
         # through, so an old checkpoint reloaded with this ON sees a different output scale.
         final_norm_fast_path: bool = True,
+        # STANDARD PRE-NORM RESIDUAL STACK. Each refinement layer is already pre-norm
+        # internally (HierarchicalTransformerLayer.norm1 / .norm2, allocated PER LAYER, like
+        # a transformer block's ln_1/ln_2). On top of that the loop applies ONE SHARED
+        # `pinball_refinement_norm` to the whole residual stream after every layer, which the
+        # transformer baseline has no counterpart for. Two consequences:
+        #   * the residual identity path is broken at every depth -- x_L is no longer
+        #     x_0 + sum(f_l), so each layer's contribution is re-standardized away by every
+        #     later layer instead of accumulating;
+        #   * one gain/bias is shared by all 15 layers, so it cannot express a depth profile;
+        #   * and at the exit it lands immediately before `final_norm`, i.e. two LayerNorms
+        #     with only the gated refresh writes between them.
+        # The shared norm was also doing double duty as the refresh sublayers' pre-norm --
+        # both refreshes read the stream and project it with NO norm of their own. So turning
+        # it off alone would leave those projections reading an unnormalized stream.
+        # This knob does both halves of the standard treatment: drop the stream post-norm and
+        # give each refresh projection its own pre-norm (per level / per pair, matching how
+        # the projections themselves are allocated). Result is the textbook arrangement --
+        # every sublayer pre-normed, the residual stream untouched, one terminal norm.
+        # Adds parameters, so it is FRESH-RUN ONLY -- but default ON is still safe: a
+        # checkpoint saved WITHOUT the refresh pre-norms is detected on load by
+        # _legacy_norm_stack_fallback, which flips this back off for that model and fills the
+        # unused norms with identity, so old checkpoints keep loading strict and evaluating
+        # exactly as they trained. Set it to false explicitly in a config only to force the
+        # legacy stack on a fresh build.
+        hier_clean_norm_stack: bool = True,
         # QK normalization: normalize each head's q and k over head_dim before the dot
         # product, bounding the attention logits instead of relying on the LR staying below
         # the point where they grow. Matters most where one softmax spans several levels at
@@ -4221,6 +4246,10 @@ class HierarchicalFlowGAT(nn.Module):
                         self.hier_copredict_levels, float(hier_copredict_gate_init))
 
         # --- Per-layer upward refresh (see _apply_upward_refresh) ---
+        # Set before the refresh blocks below: they allocate the per-projection pre-norms.
+        self.hier_clean_norm_stack = bool(hier_clean_norm_stack)
+        # Kept so a legacy load can flip the flag off and a later clean load restore it.
+        self._hier_clean_norm_stack_cfg = bool(hier_clean_norm_stack)
         self.hier_upward_refresh = bool(hier_upward_refresh)
         self.hier_upward_refresh_every = max(1, int(hier_upward_refresh_every))
         self.hier_refresh_per_layer_gates = bool(hier_refresh_per_layer_gates)
@@ -4228,6 +4257,15 @@ class HierarchicalFlowGAT(nn.Module):
             self.upward_refresh_proj = nn.ModuleList(
                 nn.Linear(self.hidden_dim, self.hidden_dim) for _ in compression_ratios
             )
+            # Pre-norm on each projection's input (hier_clean_norm_stack). One per level, to
+            # match how the projections are allocated -- per level, shared across depth --
+            # and applied to the POOLED rows, which is both the projection's immediate input
+            # and far cheaper than normalizing L0 before pooling.
+            if self.hier_clean_norm_stack:
+                self.upward_refresh_norms = nn.ModuleList(
+                    make_norm(self.hidden_dim, norm_type=self.norm_type, eps=self.norm_eps)
+                    for _ in compression_ratios
+                )
             # Kept 1-D even when per-layer (flattened [layer, level], viewed at use time).
             # A 2-D gate TABLE would be swept into Muon by the `ndim >= 2` split and
             # orthogonalized -- which forces uniform singular values across the layer x level
@@ -4299,6 +4337,12 @@ class HierarchicalFlowGAT(nn.Module):
             self.downward_refresh_proj = nn.ModuleDict(
                 {k: nn.Linear(self.hidden_dim, self.hidden_dim) for k in pair_keys}
             )
+            # Pre-norm per pair (hier_clean_norm_stack), same rationale as the upward side.
+            if self.hier_clean_norm_stack:
+                self.downward_refresh_norms = nn.ModuleDict(
+                    {k: make_norm(self.hidden_dim, norm_type=self.norm_type, eps=self.norm_eps)
+                     for k in pair_keys}
+                )
             _dn_rows = self._refresh_gate_rows()
             self.downward_refresh_gates = nn.ParameterDict(
                 {k: nn.Parameter(
@@ -4311,11 +4355,19 @@ class HierarchicalFlowGAT(nn.Module):
                         pair_keys, self.hier_downward_refresh_every, float(hier_downward_refresh_gate_init))
         if getattr(self, 'hier_upward_refresh', False) or getattr(self, 'hier_downward_refresh', False):
             self._register_load_state_dict_pre_hook(self._expand_shared_refresh_gates)
+            self._register_load_state_dict_pre_hook(self._legacy_norm_stack_fallback)
         self.hier_refresh_compile = bool(hier_refresh_compile)
         self.hier_layer_compile = bool(hier_layer_compile)
         self.final_norm_fast_path = bool(final_norm_fast_path)
         if self.final_norm_fast_path:
             logger.info("Terminal norm active on the fast path (final_norm_fast_path).")
+        if self.hier_clean_norm_stack:
+            logger.info(
+                "Clean pre-norm stack: stream post-norm OFF, refresh projections pre-normed "
+                "(%d upward, %d downward).",
+                len(getattr(self, "upward_refresh_norms", []) or []),
+                len(getattr(self, "downward_refresh_norms", {}) or {}),
+            )
 
         # --- HQD v2: cross-query-guided nomination (see _cross_query_nominate) ---
         self.xq_nominate_enable = bool(xq_nominate_enable)
@@ -5682,6 +5734,54 @@ class HierarchicalFlowGAT(nn.Module):
             return 1
         return max(1, int(getattr(self, "num_refinement_layers", 1) or 1))
 
+    def _legacy_norm_stack_fallback(self, state_dict, prefix, local_metadata, strict,
+                                    missing_keys, unexpected_keys, error_msgs):
+        """Load a pre-`hier_clean_norm_stack` checkpoint into a clean-stack build.
+
+        The clean stack removes the shared `pinball_refinement_norm` from the residual stream
+        and gives each refresh projection its own pre-norm. Those pre-norms are new
+        parameters, so a checkpoint trained before the switch does not carry them -- and it
+        DID train with the stream post-norm, so simply initialising them would evaluate a
+        different function than the one that was trained.
+
+        Detection: this build expects `*_refresh_norms.*` and the incoming state dict has
+        none, while it does carry refresh projections (so it is a refresh model, not a config
+        without refreshes at all). In that case turn the clean stack off for this model --
+        which restores the stream post-norm the checkpoint trained with, and its trained
+        `pinball_refinement_norm` loads normally -- and fill the now-unused pre-norms with
+        their freshly initialised values so `strict=True` still succeeds.
+
+        A later load of a genuine clean-stack checkpoint restores the configured value, so a
+        process that scores both kinds does not get stuck in legacy mode.
+        """
+        want = bool(getattr(self, "_hier_clean_norm_stack_cfg", False))
+        if not want:
+            return
+        subs = [n for n in ("upward_refresh_norms", "downward_refresh_norms")
+                if getattr(self, n, None) is not None]
+        if not subs:
+            return
+        has_norms = any(k.startswith(prefix + sub + ".") for sub in subs for k in state_dict)
+        if has_norms:
+            self.hier_clean_norm_stack = True          # genuine clean-stack checkpoint
+            return
+        has_proj = any(
+            k.startswith(prefix + "upward_refresh_proj.")
+            or k.startswith(prefix + "downward_refresh_proj.")
+            for k in state_dict
+        )
+        if not has_proj:
+            return                                     # cannot tell; leave as configured
+        self.hier_clean_norm_stack = False
+        for sub in subs:
+            for pname, pval in getattr(self, sub).state_dict().items():
+                state_dict[prefix + sub + "." + pname] = pval.detach().clone()
+        logger.warning(
+            "Legacy checkpoint (no refresh pre-norms): hier_clean_norm_stack turned OFF for "
+            "this model so it evaluates the stack it trained with (shared stream post-norm). "
+            "The %d unused pre-norm module(s) were filled with identity.", len(subs),
+        )
+
     def _expand_shared_refresh_gates(self, state_dict, prefix, local_metadata, strict,
                                      missing_keys, unexpected_keys, error_msgs):
         """Load a shared-across-depth refresh gate into a per-layer model (and back).
@@ -5766,6 +5866,8 @@ class HierarchicalFlowGAT(nn.Module):
             else:
                 pooled = self._pooled_child_window_means(lower, lvl, int(level_sizes[lvl]))
             gate = gates[lvl - 1].to(dtype=pooled.dtype)
+            if self.hier_clean_norm_stack:
+                pooled = self.upward_refresh_norms[lvl - 1](pooled)
             cur = x[:, offsets[lvl] : offsets[lvl + 1], :] + gate * self.upward_refresh_proj[lvl - 1](pooled)
             pieces.append(cur)
             lower = cur
@@ -6386,7 +6488,8 @@ class HierarchicalFlowGAT(nn.Module):
                 entry = plan[pair]
                 chosen, valid = entry[0], entry[1]
                 seg_offsets = entry[2] if len(entry) > 2 else None
-                proj = self.downward_refresh_proj[pair](cur[m])          # few coarse rows
+                src_m = self.downward_refresh_norms[pair](cur[m]) if self.hier_clean_norm_stack else cur[m]
+                proj = self.downward_refresh_proj[pair](src_m)           # few coarse rows
                 # bandwidth-only gather; under grad the scatter backward is the whole cost of
                 # this op at depth (see _SegmentedBroadcast), so route it through the segment
                 # sum whenever the plan proved `chosen` monotone.
@@ -13076,10 +13179,17 @@ class HierarchicalFlowGAT(nn.Module):
 
         x = self.pinball_work_in(x)
 
-        l0_mask = (base_nl == 0)
-        l0_idx = torch.nonzero(l0_mask, as_tuple=False).view(-1)
+        # l0_mask / l0_idx serve ONLY the L0 alpha blend in this forward (14071 builds its
+        # own mask for the edge filter). l0_alpha_enable defaults to False and no config sets
+        # it, so on every current arm this was a torch.nonzero -- data-dependent shape, hence
+        # a device sync -- computed once per forward for a branch that never runs. Build it
+        # lazily; when the blend is on, behaviour is unchanged.
         apply_l0_alpha = bool(getattr(self, "l0_alpha_enable", True) and hasattr(self, "alpha"))
-        x_l0_orig = x.index_select(1, l0_idx).clone() if apply_l0_alpha else None
+        l0_idx = None
+        x_l0_orig = None
+        if apply_l0_alpha:
+            l0_idx = torch.nonzero((base_nl == 0), as_tuple=False).view(-1)
+            x_l0_orig = x.index_select(1, l0_idx).clone()
 
         edge_attr_work = base_ea if bool(self.use_edge_attr) else None
 
@@ -13764,7 +13874,8 @@ class HierarchicalFlowGAT(nn.Module):
                                     _a = self.alpha
                                     _xl0 = _x.index_select(1, _l0i)
                                     _x.index_copy_(1, _l0i, _a * _xl0 + (1.0 - _a) * _l0o)
-                                _x = self.pinball_refinement_norm(_x)
+                                if not self.hier_clean_norm_stack:
+                                    _x = self.pinball_refinement_norm(_x)
                             return _x, _e
                         x, new_edge_attr = torch.utils.checkpoint.checkpoint(
                             _ckpt_refine, x, use_reentrant=False,
@@ -13857,7 +13968,12 @@ class HierarchicalFlowGAT(nn.Module):
                     x_l0 = x.index_select(1, l0_idx)
                     x.index_copy_(1, l0_idx, a * x_l0 + (1.0 - a) * x_l0_orig)
 
-                if pinball_cycle_active:
+                # Stream post-norm. hier_clean_norm_stack drops it: the layer is already
+                # pre-norm internally and the refresh projections carry their own pre-norms,
+                # so the residual stream stays a pure sum until the terminal final_norm.
+                if self.hier_clean_norm_stack:
+                    pass
+                elif pinball_cycle_active:
                     x_normed = self.pinball_refinement_norm(x.index_select(1, active_node_idx))
                     x = x.clone()
                     x.index_copy_(1, active_node_idx, x_normed.to(dtype=x.dtype))

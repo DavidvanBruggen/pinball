@@ -196,6 +196,7 @@ def build_pinball_model(
         # Default ON: both are stability fixes, not experiments. Set either to false in a
         # config to reproduce a checkpoint trained before they became the default.
         final_norm_fast_path=bool(getattr(args, "final_norm_fast_path", True)),
+        hier_clean_norm_stack=bool(getattr(args, "hier_clean_norm_stack", True)),
         qk_norm=bool(getattr(args, "qk_norm", True)),
         qk_norm_type=str(getattr(args, "qk_norm_type", "rms")),
         xq_nominate_enable=bool(getattr(args, "xq_nominate_enable", False)),

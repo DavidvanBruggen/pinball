@@ -89,8 +89,8 @@ dropout: 0.1
 # Per-level DropNode. Index i = level i; L0 is pinned to 0.0 whatever this says. Level sizes
 # at 4096 are L1 512, L2 256, L3 128, L4 32, L5 8, L6 2 -- dropping 10% of a 2-row level is a
 # 50%-of-the-level event, so the top levels get none.
-#hier_node_dropout: 0.1 #0.0
-hier_node_dropout_per_level: [0.0, 0.1, 0.1, 0.05, 0.0, 0.0, 0.0]
+hier_node_dropout: 0 # 0.1 #0.0
+#hier_node_dropout_per_level: [0.0, 0.1, 0.1, 0.05, 0.0, 0.0, 0.0]
 norm_type: layernorm
 attn_backend: flash             # alias -> l0_local_backend
 qkv_sharing: shared
@@ -163,6 +163,17 @@ local_pack_ring_merge: additive    # additive | lse | union -- inert while rings
 # the dot product, bounding the attention logits; it matters most here because one softmax
 # spans all four levels at once. Cost of both together is within noise (~1-2%).
 final_norm_fast_path: true
+# Standard pre-norm residual stack. ON from the 2026-09-08 run onward.
+# ON:  refinement layer (pre-norm norm1/norm2, per layer) -> refresh sublayers each with
+#      their own pre-norm -> residual stream untouched -> one terminal final_norm.
+# OFF: as ON, plus ONE shared LayerNorm applied to the whole residual stream after every
+#      layer -- which breaks the residual identity path, cannot express a depth profile
+#      (one gain for all 15 layers), and lands immediately before final_norm at the exit.
+# Adds 12 norms / +24,576 params, so it is FRESH-RUN ONLY. Checkpoints from BEFORE
+# 2026-09-08 were trained with the legacy stack; they still load and score correctly
+# without touching this line (_legacy_norm_stack_fallback detects the missing pre-norms and
+# turns the clean stack off for that model), but if you ever need to force it, set false.
+hier_clean_norm_stack: true
 qk_norm: true
 qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
 
