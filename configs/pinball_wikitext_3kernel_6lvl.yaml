@@ -131,7 +131,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_3kernel_4lvl/checkpoints
+checkpoint_dir: ./pinball/pooled_proj_3kernel_6lvl/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -143,7 +143,7 @@ ar_graph_causal: true
 # Debug: periodically log the essential learnable gates/scales (copredict head gates, cross-query
 # write scales, upper/top refiner level scales) so you can watch which pathways open or collapse.
 # Also callable directly: model.gate_monitor() -> {name: value}.
-pinball_monitor_gates: true
+pinball_monitor_gates: False
 pinball_monitor_gates_every: 10000    # forward calls between logs
 # Which strictly-past (leak-free) coarse->L0 scheme AR turns on by default so the hierarchy
 # feeds L0 (the AR filter otherwise cuts every downward coarse->L0 edge, going inert):
@@ -186,15 +186,15 @@ num_heads: 12 #3 #12
 attn_sparse_qk_mult: 1.0    # try 2.0 to lift cross-level routing rank 64 -> 128
 attn_sparse_v_mult: 1.0     # try 2.0 / 4.0 for fat-V (both sparse paths)
 num_refinement_layers: 12 #12
-num_layers: [0, 0, 0, 0]     # length = level count (L0 + 7 coarse)
+num_layers: [0, 0, 0, 0, 0, 0, 0]     # length = level count (L0 + 7 coarse)
 internal_cycles: [0, 0, 0, 0]
 refinement_style: unified
 unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0 # set so graph windows are made dense (k=window_size*2+1) for local connectivity. 0 = sparse only.
-compression_ratios: [16, 4, 4]   # sizes @131072 -> [16384, 8192, 4096, 2048, 1024, 512, 256]
-overlap_ratios: [0.5, 0.5, 0.5]
+compression_ratios: [16, 4, 4, 8, 8, 8]   # sizes @131072 -> [16384, 8192, 4096, 2048, 1024, 512, 256]
+overlap_ratios: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 # Coarse-node seeding (the ORIGINAL design, restored). mask = coarse nodes start as mask
 # embeddings and content must climb the hierarchy through the refinement layers (measured:
 # L3 only fills at layer 11 of 12 — the summary forms too late to be read back). pooled =
@@ -326,7 +326,7 @@ local_pack_ring_merge: additive    # additive | lse | union -- inert while rings
 
 local_pack_cross_level: true
 local_pack_window: 156 #1248 #156 #624 #1248             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const) # 156 624 1248
-local_pack_query_levels: [0, 1, 2, 3]   # MUST cover every level
+local_pack_query_levels: [0, 1, 2, 3, 4, 5, 6]   # MUST cover every level
 # Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
 # bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
 # query-dependent level bias) and to V (output carries its source level). Zero init =
@@ -340,7 +340,7 @@ local_pack_level_bias: true
 # their old 1024/2048-token spans). Cost ~ the main packed call again (coarse rows are few).
 # Additive to the coarse queries' main-window read (fine detail stays available there).
 local_pack_coarse_lane: true
-local_pack_coarse_window: 900 # auto   # sized from real tier spacing; see header
+local_pack_coarse_window: 128 #900 # auto   # sized from real tier spacing; see header
 #local_pack_coarse_window_tier_nodes: 3   # >=3 tier nodes must fall in the window
 local_pack_top_global: true
 local_pack_top_global_budget: 400 #sqrt   # 0 | <row budget> | sqrt (self-sizing)
@@ -358,8 +358,6 @@ local_pack_global_block: 0      # the tier replaces it: n_tier^2, not n_block*N
 local_pack_flex_union: false
 local_pack_lane_merge: false
 norm_type: layernorm
-dropout: 0.1
-hier_node_dropout: 0.1 #0.1
 # Stability normalizations (both default ON; set false only to reproduce a checkpoint
 # trained before they existed). final_norm_fast_path re-applies the terminal norm on exit
 # from the refinement loop, which the fast path had lost -- without it nothing renormalizes
@@ -367,6 +365,17 @@ hier_node_dropout: 0.1 #0.1
 # the dot product, bounding the attention logits; it matters most here because one softmax
 # spans all four levels at once. Cost of both together is within noise (~1-2%).
 final_norm_fast_path: true
+# Standard pre-norm residual stack. ON from the 2026-09-08 run onward.
+# ON:  refinement layer (pre-norm norm1/norm2, per layer) -> refresh sublayers each with
+#      their own pre-norm -> residual stream untouched -> one terminal final_norm.
+# OFF: as ON, plus ONE shared LayerNorm applied to the whole residual stream after every
+#      layer -- which breaks the residual identity path, cannot express a depth profile
+#      (one gain for all 15 layers), and lands immediately before final_norm at the exit.
+# Adds 12 norms / +24,576 params, so it is FRESH-RUN ONLY. Checkpoints from BEFORE
+# 2026-09-08 were trained with the legacy stack; they still load and score correctly
+# without touching this line (_legacy_norm_stack_fallback detects the missing pre-norms and
+# turns the clean stack off for that model), but if you ever need to force it, set false.
+hier_clean_norm_stack: true
 qk_norm: true
 qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
 # Frontier-consistent AR generation: a raw prefix builds TRUNCATED coarse windows, so the token
