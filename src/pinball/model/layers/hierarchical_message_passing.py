@@ -548,6 +548,7 @@ class HierarchicalMessagePassing(MessagePassing):
         # overrides it and its L0 entry is forced to 0.
         hier_node_dropout: float = 0.0,
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,
+        local_window_dropout: float = 0.0,
         # Bidirectional pack (MaskGIT/diffusion): when the runtime causal flags are OFF,
         # run the packed mixed window + coarse lane as symmetric two-sided windows instead
         # of skipping pack entirely. Bidi has no AR order to leak, so the "closed window"
@@ -681,18 +682,42 @@ class HierarchicalMessagePassing(MessagePassing):
             self.coarse_global_gate = nn.Parameter(
                 torch.full((), float(local_pack_coarse_global_gate_init)))
         self.local_pack_flex_union = bool(local_pack_flex_union)
-        # Per-level DropNode rates, always length 4 with L0 pinned to 0.0 whatever the
-        # config says: dropping L0 would delete the token content itself rather than the
-        # hierarchy's summary of it.
-        _nd = [0.0, 0.0, 0.0, 0.0]
+        # Per-level DropNode rates, always length num_local_levels with L0 pinned to 0.0 by
+        # DropNode itself (dropping L0 would delete the token content rather than the
+        # hierarchy's summary of it) -- local_window_dropout below is the deliberate
+        # exception.
+        # The length MUST equal the level count: _hier_node_keep does
+        # rate_t.index_select(0, lvl_packed), so a short table is an out-of-bounds GPU index,
+        # which surfaces as a device-side assert ("index out of bounds: 0 <= tmp7 < 4")
+        # inside an inductor kernel, far from here. This used to be seeded to a hardcoded
+        # length 4 and only resized when a rate was actually set, which was harmless only
+        # because a table of all zeros left hier_node_dropout_active False and
+        # _hier_node_keep returned before indexing. local_window_dropout can activate the
+        # table without any coarse rate being set, so the length has to be right up front.
         _base = max(0.0, min(1.0, float(hier_node_dropout)))
         _nlev = max(1, int(num_local_levels))
+        _nd = [0.0] * _nlev
         if _base > 0.0:
             _nd = [0.0] + [_base] * (_nlev - 1)
         if hier_node_dropout_per_level is not None:
             _pl = list(hier_node_dropout_per_level)
             _nd = [0.0 if i == 0 else max(0.0, min(1.0, float(_pl[i])))
                    if i < len(_pl) else 0.0 for i in range(_nlev)]
+        # WINDOW DROPOUT (local_window_dropout). DropNode pins L0 to 0.0 above -- it exists
+        # to regularise the COARSE rows. This is the mirror image: drop L0 rows' values so a
+        # query's own local neighbourhood is randomly thinned and the only intact source of
+        # information left is the hierarchy. The point is not regularisation for its own sake
+        # but GRADIENT PRESSURE: with the local window always complete, the coarse path never
+        # has to explain anything the window already explains.
+        # Same value-side semantics as DropNode (drop values not keys, keep the 1/(1-p)
+        # scaling), so it is unbiased and eval is untouched -- see _hier_node_keep.
+        _l0 = max(0.0, min(1.0, float(local_window_dropout)))
+        if _l0 > 0.0:
+            _nd[0] = _l0
+        if len(_nd) != _nlev:                       # invariant, checked at build not on GPU
+            raise ValueError(
+                f"DropNode rate table has {len(_nd)} entries for {_nlev} levels; "
+                "index_select over packed node levels would read out of bounds")
         self.hier_node_dropout_rates = _nd
         self.hier_node_dropout_active = any(r > 0.0 for r in _nd)
         self.local_pack_bidirectional = bool(local_pack_bidirectional)
@@ -5364,6 +5389,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
         hier_node_dropout: float = 0.0,  # DropNode on coarse rows (value-side, L0 exempt)
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,  # overrides the scalar
+        local_window_dropout: float = 0.0,  # DropNode on L0 rows -- forces use of the hierarchy
         local_pack_bidirectional: bool = False,  # bidi (MaskGIT/diffusion): two-sided packed windows
         local_pack_rope_axial: bool = False,  # axial ND RoPE on the packed path (curve-mode coords)
         hqd_read_prerope: bool = False,   # xq/HQD fetch read + stage-3 score on PRE-RoPE q/k (content-only)
@@ -5461,6 +5487,7 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_flex_union=local_pack_flex_union,
             hier_node_dropout=hier_node_dropout,
             hier_node_dropout_per_level=hier_node_dropout_per_level,
+            local_window_dropout=local_window_dropout,
             local_pack_bidirectional=local_pack_bidirectional,
             local_pack_rope_axial=local_pack_rope_axial,
             hqd_read_prerope=hqd_read_prerope,

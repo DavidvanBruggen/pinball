@@ -61,6 +61,10 @@ tokenizer_name: gpt2            # unused in features mode; build_pinball stubs i
 # stride = max(1, int(comp*(1-overlap))), so comp 2 @ 0.5 gives int(1.0) = 1 and the level
 # does not compress at all.
 compression_ratios: [16, 4, 4, 8, 8, 8]
+# Cut to 4 coarse levels (L0..L4), matching the 3kernel arm. Measured there: 4 levels equal
+# 6 on every metric, and L5/L6 are 8 and 2 rows at 4096 -- a bias channel, not a level.
+# This one knob truncates every level-indexed list (registry apply_hier_level_limit).
+hier_level_limit: 4
 overlap_ratios: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 
 hidden_dim: 1024
@@ -95,8 +99,12 @@ dropout: 0.1
 # Per-level DropNode. Index i = level i; L0 is pinned to 0.0 whatever this says. Level sizes
 # at 4096 are L1 512, L2 256, L3 128, L4 32, L5 8, L6 2 -- dropping 10% of a 2-row level is a
 # 50%-of-the-level event, so the top levels get none.
-hier_node_dropout: 0.0
-hier_node_dropout_per_level: [0.0, 0.1, 0.1, 0.05, 0.0, 0.0, 0.0]
+# 2026-09-10: flat 0.1 to match the 3kernel arm. The per-level list is DELETED, not just
+# left at its old value: hier_node_dropout_per_level OVERRIDES this scalar
+# (hierarchical_message_passing.py:692-693), so with the list present, setting the scalar
+# here would silently do nothing. With hier_level_limit: 4 the 2- and 8-row top levels the
+# list existed to protect no longer exist.
+hier_node_dropout: 0.1
 norm_type: layernorm
 attn_backend: flash             # alias -> l0_local_backend
 qkv_sharing: shared
@@ -118,10 +126,14 @@ local_pack_rope_axial: false
 
 upper_init: pooled
 upper_seed_gate_init: 1.0
-hier_upward_refresh: true
+# 2026-09-10: OFF, to match the 3kernel arm. Measured there with mean controls: the
+# upward refresh is inert under the clean norm stack (+0.0002 specificity for 4.2M params)
+# and the downward one carries only scale/bias. Turning them off also removes the second,
+# un-modelled path to the same rows that the reach comment above warns about.
+hier_upward_refresh: false
 hier_upward_refresh_every: 1
 hier_upward_refresh_gate_init: 0.1
-hier_downward_refresh: true
+hier_downward_refresh: false
 hier_downward_refresh_every: 1
 hier_downward_refresh_gate_init: 0.1
 hier_refresh_compile: true
@@ -134,7 +146,10 @@ hier_layer_compile: true
 # the upward refresh: pooled = mean_j(sigmoid(<u_l, x_j> + b_l) * x_j). Normalising by the
 # window count rather than the gate sum lets an all-low-gate window yield a small vector
 # instead of a rescaled average. ~0.1% compute, +6,150 params. Compiled: +1.7% @4096 B=2.
-hier_pool_gate: false
+# 2026-09-10: ON for parameter parity with the 3kernel arm (the 4,100-param difference
+# between the two builds was exactly this). NOT dead weight -- measured to train
+# (0.091/0.288 moved between ep0 and ep15) and it still gates the pooled upper seed.
+hier_pool_gate: true
 # Trade-off, not a formality: ~10 reproduces the plain mean but saturates the gate
 # (sigmoid'(10)=4.5e-5) so it never trains. Use ~10 only to warm-start a checkpoint.
 hier_pool_gate_bias_init: 2.0
@@ -169,6 +184,12 @@ local_pack_ring_merge: additive    # additive | lse | union -- inert while rings
 # the dot product, bounding the attention logits; it matters most here because one softmax
 # spans all four levels at once. Cost of both together is within noise (~1-2%).
 final_norm_fast_path: true
+# Standard pre-norm stack: drop the shared post-norm on the residual stream and give each
+# refresh projection its own pre-norm instead. Ctor default is already true -- recorded here
+# so the specificity tests can turn it off explicitly. On the 3kernel arm this removed both
+# val collapses (0 dips over 16 epochs vs legacy's ep7 and ep13) and fixed the conditioning
+# at the pinball->CNN seam (|mu|/sigma 1.01 at ep15 vs 10.84).
+hier_clean_norm_stack: true
 qk_norm: true
 qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
 

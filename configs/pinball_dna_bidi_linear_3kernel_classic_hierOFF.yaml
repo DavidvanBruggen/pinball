@@ -1,39 +1,60 @@
 # ============================================================================
-# LEGACY-MATCH + REFRESH PRE-NORM ARM  (2026-09-11)
+# HIERARCHY-OFF ABLATION FOR THE *CLASSIC* ARM (refreshes OFF).
+# 2026-09-11: the live config was renamed -- this file pairs with
+# pinball_dna_bidi_linear_3kernel_CLASSIC.yaml, NOT the current 3kernel.yaml. Its two
+# toggles are NOT sufficient once refreshes are on (measured: max|d| 1.31 vs the full
+# model's 1.46, i.e. barely ablated) -- the downward refresh is a third coarse->L0 route.
+# For the refresh-on arm use pinball_dna_bidi_linear_3kernel_hierOFF.yaml instead.
+# Originally written as: identical to pinball_dna_bidi_linear_3kernel.yaml
+# except for the two lines marked "HIER-OFF ABLATION" below. Keep the two files in
+# sync by hand; this one exists so the control can train beside the live run.
 #
-# The cell nobody has run. Evidence that points here, all measured:
+# WHAT IT ABLATES. In this config the hierarchy reaches L0 by exactly TWO routes
+# (refreshes off, drop_static_cross_level_edges true, HQD off, xq off, aux off):
+#   1. local_pack_cross_level -- coarse rows sit inside L0's packed attention window
+#   2. hier_copredict_l0      -- coarse summaries projected into L0 pre-head
+# Both must go. Verified 2026-09-11 by replacing every coarse row with noise inside the
+# refinement loop and measuring the output change (scratchpad/hier_off_check.py):
 #
-#   arm              post-norm  refreshes  refresh pre-norms  collapses  |mu|/sigma  spec@ep15
-#   legacy              ON         ON            no              2         40.32      0.46333
-#   betternormstack     off        ON            yes             0          0.83      0.42833
-#   post-norm only      ON         off           n/a             0          1.00      (0.42527@10)
-#   THIS ARM            ON         ON           YES              ?            ?          ?
+#   BASE (hierarchy on)                          max|d| = 4.131e-01
+#   ablate_levels [1,2,3,4] only                 max|d| = 4.189e-01   <- NO-OP, see below
+#   ablate_levels + copredict off                max|d| = 3.452e-01   <- still connected
+#   cross_level off only                         max|d| = 0.000e+00   <- MISLEADING, see below
+#   cross_level off + copredict off  (THIS FILE) max|d| = 0.000e+00   <- genuinely off
 #
-# The single unstable cell is the only one where the refresh projections had no pre-norm of
-# their own (they read the shared stream norm, which normalises everything incl. L0, rather
-# than the pooled rows the projection actually consumes). And legacy is not a specificity-
-# only artifact: at ep15 it also had the best val loss of any arm (0.37566 vs the clean
-# arm's 0.37884, matching the transformer's 0.37596) -- objective and specificity agree.
+# DO NOT USE ablate_levels HERE. It is the purpose-named knob
+# (cached_batch:2772, _apply_level_ablation:7986) but it filters unified_edge_index, and
+# this config does its cross-level mixing in the PACKED ATTENTION path, which never
+# touches edge_index -- with drop_static_cross_level_edges true there are no edges left
+# to cut. It is silently inert, same class of trap as the flex_union no-op.
 #
-# Needs hier_refresh_prenorm, added 2026-09-11 to decouple the two halves of
-# hier_clean_norm_stack. Default None = follow that flag, so every other config and every
-# checkpoint is untouched -- verified bit-identical in all four (stack x refresh) cells,
-# weightdiff and outdiff 0.000e+00, one process per cell; and the real legacy ep15 checkpoint
-# still reloads strict and scores 0.4633286517452208 exactly through the fallback hook.
+# "cross_level off only" is ALSO invalid despite reading 0.000e+00: hier_copredict_gate_init
+# is 0.0, so an UNTRAINED model's copredict contributes nothing whatever it is wired to.
+# Set the gates to the value the real run reached by ep20 and the hierarchy comes back:
+#   gates at init 0.0  -> max|d| = 0.0000e+00
+#   gates at     0.09  -> max|d| = 1.1328e-01
+# The gates receive gradient in that configuration (params_with_grad 265 vs 261), so they
+# would grow and silently reconnect the hierarchy mid-training.
 #
-# DELIBERATE DEVIATIONS FROM LEGACY (everything else matches it):
-#   hier_refresh_prenorm: true   <- the point of the run
-#   local_window_dropout: 0      <- legacy predates it. Set 0.1 to keep the one intervention
-#                                   that measurably raised distal signal (+24-67% hierarchy-
-#                                   mediated effect) -- but note the post-norm already
-#                                   suppressed those gains back to baseline by ep10, so
-#                                   little is given up by matching legacy here.
+# WINDOW MATCHING (measured, scratchpad/window_composition.py). With the packed path off,
+# L0 falls back to local_attn_windows[0], which flash treats as a RADIUS
+# (win = (window, window), hierarchical_message_passing.py:3645). An L0 query's +-156
+# packed window is 81.5% L0 rows / 18.5% coarse at BOTH 8k and 32k, i.e. a true span of
+# +-127 tokens -- against local_attn_windows[0] = 128 here. Matched to within one token;
+# do not "fix" it.
 #
-# WATCH FOR THE COLLAPSE. Legacy hit |mu|/sigma 40.32 at the pinball/CNN mixing site by ep5
-# and its borzoi R fell to 0.34842 at ep7. Run scratchpad/cond_probe.py on the ep1/ep2
-# checkpoints: healthy is ~1.0 (this build measured 0.996@ep5, 1.064@ep10 with refreshes
-# off). Anything trending toward double digits means the pre-norm did NOT fix it -- kill the
-# run rather than spending 15 epochs.
+# THREE CONFOUNDS TO REPORT WITH ANY RESULT FROM THIS ARM:
+#   1. -4,198,404 params (2%), all copredict projections. No knob exists to keep them
+#      allocated but disconnected, so the control is slightly smaller.
+#   2. The coarse levels are still BUILT and still attend within themselves, receiving zero
+#      gradient. Wasted compute -- but it keeps step time close, so a wallclock-matched
+#      comparison is meaningful.
+#   3. local_window_dropout GOES SILENTLY INERT. _hier_node_keep is called from exactly one
+#      site (hierarchical_message_passing.py:4382, inside _apply_local_pack_out), so with the
+#      packed path off there is no DropNode at all. This arm therefore loses that regularizer
+#      while the live run keeps it. Arguable -- window dropout exists to force gradient
+#      through a hierarchy this arm does not have -- but it is an asymmetry, not neutral,
+#      and plain dropout: 0.1 is not an equivalent substitute.
 # ============================================================================
 
 # DNA backbone -- loaded via build_pinball(cfg_path=..., num_tracks=<dim>).
@@ -123,7 +144,7 @@ unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0
-dropout: 0.3
+dropout: 0.1
 # Per-level DropNode. Index i = level i; L0 is pinned to 0.0 whatever this says. Level sizes
 # at 4096 are L1 512, L2 256, L3 128, L4 32, L5 8, L6 2 -- dropping 10% of a 2-row level is a
 # 50%-of-the-level event, so the top levels get none.
@@ -150,10 +171,10 @@ local_pack_rope_axial: false
 
 upper_init: pooled
 upper_seed_gate_init: 1.0
-hier_upward_refresh: true      # LEGACY MATCH (was false)
+hier_upward_refresh: false
 hier_upward_refresh_every: 1
 hier_upward_refresh_gate_init: 0.1
-hier_downward_refresh: true    # LEGACY MATCH (was false)
+hier_downward_refresh: false
 hier_downward_refresh_every: 1
 hier_downward_refresh_gate_init: 0.1
 hier_refresh_compile: true
@@ -185,14 +206,14 @@ hier_pool_gate_bias_init: 2.0
 # mirror image (that one is pinned to 0.0 on L0 by design). Thins a query's own local
 # neighbourhood so the coarse path has to explain what the window no longer can. Train-only,
 # unbiased (values not keys, 1/(1-p) kept), exact no-op at 0.0.
-local_window_dropout: 0.0      # LEGACY MATCH (legacy predates this knob)
+local_window_dropout: 0.1
 
 # COARSE CO-PREDICTION: project each coarse level's summary straight into L0's pre-head
 # features through a learnable gate. This is a DIRECT loss->coarse gradient path that does
 # not depend on the coarse rows winning attention mass, which is the failure mode the
 # retention curve would show as node_spec high + ablation null.
 # gate_init 0.0 = exact identity at step 0, so it can only help if it earns its way in.
-hier_copredict_l0: false       # LEGACY MATCH (legacy had no copredict)
+hier_copredict_l0: false        # HIER-OFF ABLATION (was true) -- cuts route 2
 hier_copredict_levels: [1, 2, 3, 4]
 hier_copredict_gate_init: 0.0
 # "auto" -> "containing" here, because local_pack_bidirectional is true: each L0 position
@@ -259,21 +280,7 @@ final_norm_fast_path: true
 # LAST layer only, or replace it with a per-layer LayerScale/ReZero scalar that damps the
 # stream without destroying the residual identity.
 # Note the polarity: true = the CLEAN stack = NO extra norm. false = the extra norm is back.
-hier_clean_norm_stack: false   # post-norm ON, as legacy had it
-# Decouples the other half of the flag: give each refresh projection its OWN pre-norm
-# (per level up / per pair down, applied to the pooled rows) WHILE keeping the stream
-# post-norm. Not expressible before 2026-09-11. This is the whole point of the arm.
-hier_refresh_prenorm: true
-# 2026-09-12: drop the pre-norms' learnable gain/bias. The Linear immediately after can
-# represent both exactly (Linear(w*xhat+b) = (W.*w)xhat + (Wb+b_lin)), so the affine is
-# redundant by construction -- 24,576 params, and a third multiplicative scale in series
-# with the Linear and the gate. Measured on this arm at ep35: near pairs damp (gain
-# 0.75-0.82) but the TOP pair inverts -- 0:6 gain 1.336 / |bias| 0.376, ~50x the near
-# pairs, re-scaling the normalization away and acting as a bias channel (a drift already
-# recorded at ep5 and still growing). Zeroing 0:6's affine on the trained checkpoint costs
-# only 0.0031 specificity, so little is lost; with this false the route cannot form.
-# FRESH-RUN ONLY: removes parameters, so old checkpoints will not load against it.
-hier_refresh_prenorm_affine: false
+hier_clean_norm_stack: false
 
 # ONE-KNOB LEVEL COUNT. Truncates/filters every level-indexed list at once
 # (compression_ratios, overlap_ratios, num_layers, hier_node_dropout_per_level,
@@ -281,8 +288,7 @@ hier_refresh_prenorm_affine: false
 # level count can be changed without editing them one by one and silently mis-sizing the
 # model when one is missed. Counts COARSE levels: 4 gives L0..L4. null/0 = use the lists as
 # written. At N=4096 the levels are [512, 256, 128, 32, 8, 2], so L5/L6 hold 8 and 2 nodes.
-hier_level_limit: null     # LEGACY MATCH: 6 coarse levels (L0..L6). The '8 and 2
-                           # nodes' note was for N=4096; at N=32768 L5=64 and L6=16.
+hier_level_limit: 4        # 2026-09-09 run: drop L5/L6 (8 and 2 nodes at N=4096)
 
 # SIGREG latent constraint (see _compute_sigreg_loss). Sliced isotropic-Gaussian
 # goodness-of-fit per level: forbids both a collapsed direction and a constant offset, which
@@ -329,7 +335,7 @@ qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
 local_attn_windows: [128, 128, 128, 128, 128, 128, 128]
 l0_local_window: 128
 
-local_pack_cross_level: true
+local_pack_cross_level: false   # HIER-OFF ABLATION (was true) -- cuts route 1
 local_pack_query_levels: [0, 1, 2, 3, 4, 5, 6]   # MUST cover every level
 local_pack_level_bias: true
 local_pack_coarse_lane: true

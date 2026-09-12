@@ -173,6 +173,43 @@ def _build_node_pos_local_from_offsets(
     return node_pos_local
 
 
+_LATENT_EXIT_NORM_MEMBERS = ("aux", "predaux", "sigreg")
+
+
+def _resolve_latent_exit_norm(value: Union[str, Sequence[str], None]) -> frozenset:
+    """Normalize the hier_latent_exit_norm setting to a frozenset of member names.
+
+    Accepts None/"none"/"" (empty), "all", a single member name, or any sequence of them.
+    Raises on an unknown member rather than silently ignoring it -- a misspelt entry here
+    would otherwise look exactly like the legacy behaviour.
+    """
+    if value is None:
+        return frozenset()
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in ("", "none", "off", "false"):
+            return frozenset()
+        if token in ("all", "true"):
+            return frozenset(_LATENT_EXIT_NORM_MEMBERS)
+        items = [tok for tok in token.replace(",", " ").split() if tok]
+    else:
+        items = [str(tok).strip().lower() for tok in value]
+    out = set()
+    for item in items:
+        if item in ("", "none"):
+            continue
+        if item in ("all", "true"):
+            out.update(_LATENT_EXIT_NORM_MEMBERS)
+            continue
+        if item not in _LATENT_EXIT_NORM_MEMBERS:
+            raise ValueError(
+                f"hier_latent_exit_norm: unknown member {item!r}; "
+                f"expected any of {_LATENT_EXIT_NORM_MEMBERS}, 'all', or 'none'"
+            )
+        out.add(item)
+    return frozenset(out)
+
+
 def _expand_int_list(value: Optional[Union[List[int], Tuple[int, ...]]], length: int, default: int) -> List[int]:
     if value is None:
         items: List[int] = []
@@ -2155,7 +2192,23 @@ def compute_hierarchy_aux_loss(
     w_l0_from_l1: float = 1.0,
     w_l0_from_l3: float = 0.25,   # smaller weight by default
     loss_mode: str = "mse",       # "mse" | "mse_norm" | "cosine" (hier_aux_loss_mode)
+    pairs: Optional[List[Tuple[int, int, float]]] = None,
 ) -> torch.Tensor:
+    """`pairs` as [(low, high, weight), ...] overrides the four hardcoded L0-L3 terms below,
+    which silently leave L4+ unregularized on a deeper hierarchy. Built by
+    _hier_aux_pairs so it follows the runtime level count (hence hier_level_limit).
+    None keeps the legacy behaviour for any other caller."""
+    if pairs is not None:
+        _dev = g.x.device
+        _tot = torch.zeros((), device=_dev, dtype=g.x.dtype)
+        for _lo, _hi, _w in pairs:
+            if float(_w) == 0.0:
+                continue
+            _det = detach_target and not (int(_lo) == 0 and link_low0)
+            _tot = _tot + float(_w) * _compute_pair_aux_loss(
+                g, low_level=int(_lo), high_level=int(_hi),
+                detach_target=_det, loss_mode=loss_mode)
+        return _tot
     """
     Combined hierarchy aux loss:
 
@@ -2332,6 +2385,11 @@ class HierarchicalFlowGAT(nn.Module):
         hier_aux_w_l1_from_l2: float = 1.0,
         hier_aux_w_l0_from_l1: float = 1.0,
         hier_aux_w_l0_from_l3: float = 0.25,
+        # Generic weights for the level-count-driven pair set (see _hier_aux_pairs). The four
+        # legacy hier_aux_w_* knobs above still name their specific pairs and win where they
+        # apply, and their defaults equal these, so a 4-level model is unchanged.
+        hier_aux_w_adjacent: float = 1.0,
+        hier_aux_w_l0_from_top: float = 0.25,
         hier_aux_ar_strict: bool = False,
         hier_aux_ar_disable_l0_from_l3: bool = False,
         hier_ar_enable: bool = False,  # Enable hierarchy-level autoregressive edge filtering
@@ -2358,6 +2416,13 @@ class HierarchicalFlowGAT(nn.Module):
         hier_copredict_l0: bool = False,
         hier_copredict_levels: Optional[List[int]] = None,  # default [1,2,3]; clipped to available coarse levels
         hier_copredict_gate_init: float = 0.0,
+        # WHICH coarse node each L0 position reads. "causal" takes the most-recent CLOSED
+        # node (window_end <= t) -- correct for an AR model, but in a BIDIRECTIONAL run it
+        # silently makes this one pathway one-directional, so a position gets upstream
+        # context only while every other pathway is two-sided. "containing" takes the node
+        # whose window covers t (the parent), which is the symmetric analogue.
+        # "auto" = containing when local_pack_bidirectional is on, causal otherwise.
+        hier_copredict_mode: str = "auto",
         # Debug monitor: periodically log the essential learnable gates/scales (copredict, cross-query
         # write scales, upper/top refiner level scales) so you can watch which pathways open/collapse.
         pinball_monitor_gates: bool = False,
@@ -2458,6 +2523,36 @@ class HierarchicalFlowGAT(nn.Module):
         # exactly as they trained. Set it to false explicitly in a config only to force the
         # legacy stack on a fresh build.
         hier_clean_norm_stack: bool = True,
+        # DECOUPLES the two halves of hier_clean_norm_stack. That flag does BOTH "drop the
+        # shared stream post-norm" AND "give each refresh projection its own pre-norm", so
+        # post-norm ON + refresh pre-norms ON was not expressible -- yet that is the one cell
+        # the DNA arms never ran, and the evidence points straight at it:
+        #   legacy      post-norm ON,  refreshes ON,  pre-norms NO  -> 2 val collapses,
+        #               |mu|/sigma 40.32 at the pinball/CNN mixing site, BUT spec 0.46333@ep15
+        #               and the best val loss of any arm (0.37566).
+        #   clean       post-norm off, refreshes ON,  pre-norms yes -> stable, spec decays.
+        #   post-norm   post-norm ON,  refreshes off, pre-norms n/a -> stable (|mu|/sigma
+        #               1.00@ep10), decay halted but slope only +0.0005/ep vs legacy +0.0099.
+        # The single unstable cell is the only one where the refresh projections had no
+        # pre-norm of their own. None -> follow hier_clean_norm_stack exactly (the historical
+        # coupled behaviour, so every existing config and checkpoint is untouched).
+        hier_refresh_prenorm: Optional[bool] = None,
+        # Learnable gain/bias on the refresh pre-norms. FALSE is the principled setting and
+        # the default is True only so existing checkpoints keep loading (the affine is
+        # 2 x hidden_dim params per norm; dropping it changes the state dict).
+        # Why false is right: the pre-norm feeds a Linear IMMEDIATELY, and that Linear can
+        # absorb both the gain and the bias exactly --
+        #     Linear(w*xhat + b) = (W .* w) xhat + (W b + b_lin)
+        # -- so the affine is redundant BY CONSTRUCTION (24,576 params at 6+6 pairs, H=1024),
+        # and it leaves three multiplicative scales in series: pre-norm gain, Linear weight,
+        # gate. It is also an escape hatch the model demonstrably uses: measured at ep35 on
+        # the legacy-match arm, near pairs damp (gain 0.75-0.82, |bias| 0.007-0.034) but the
+        # TOP pair drifts the other way -- 0:6 gain 1.336 (max 2.446), |bias| 0.376, ~50x the
+        # near pairs -- i.e. it re-scales the normalization it was given and becomes a bias
+        # channel. That drift was predicted at ep5 (bias 0.026 -> 0.203) and has continued.
+        # Zeroing 0:6's affine on the trained checkpoint costs 0.0031 specificity / 0.0015
+        # across-region, so it carries little; with affine off the route does not exist.
+        hier_refresh_prenorm_affine: bool = True,
         # QK normalization: normalize each head's q and k over head_dim before the dot
         # product, bounding the attention logits instead of relying on the LR staying below
         # the point where they grow. Matters most where one softmax spans several levels at
@@ -2623,6 +2718,10 @@ class HierarchicalFlowGAT(nn.Module):
         # (batch, row, step). L0 never dropped; residual stream and refresh paths untouched.
         hier_node_dropout: float = 0.0,
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,
+        # Value-side dropout on L0 rows in the packed local attention. DropNode's mirror:
+        # thins the local window so the coarse path has to carry what the window loses.
+        # Train-only, unbiased, exact no-op at 0.0. See _hier_node_keep.
+        local_window_dropout: float = 0.0,
         # Bidi pack (MaskGIT/diffusion): when the runtime causal flags are off, run the packed
         # windows two-sided instead of skipping pack. flex_union/lane_merge -> additive in bidi.
         local_pack_bidirectional: bool = False,
@@ -2648,6 +2747,55 @@ class HierarchicalFlowGAT(nn.Module):
         # per-level head also predicts the PREVIOUS non-overlapping window, turning the loss
         # into masked-window summary prediction (the meaningful bidirectional analogue).
         hier_predaux_directions: str = "next",    # next | both
+        # SIGReg: a LATENT DISTRIBUTION constraint on the hierarchy (sliced isotropic-Gaussian
+        # goodness-of-fit, Epps-Pulley form). Projects each level's nodes onto random unit
+        # directions and compares the empirical characteristic function against the standard
+        # normal's, integrated over knots t in [0,3]. Training-only, reads x and nothing else,
+        # so the forward is untouched (no leak surface).
+        #
+        # Why this and not VICReg: VICReg CENTRES before its variance hinge, so a component
+        # shared by every node in a level -- exactly the constant-bias degeneracy the top
+        # levels drift into -- is removed before it is ever penalised. SIGReg does not centre;
+        # it tests against N(0,1), so a mean offset along any direction shows up directly.
+        #
+        # Unlike the reconstruction aux (parent ~= its children, which the pooled seeding
+        # already satisfies and which is minimised by COLLAPSE), this is minimised by the level
+        # using its dimensions. And unlike the predictive aux it needs no target, so it does
+        # not degrade on an unmasked bidirectional graph where every target is readable.
+        sigreg_enable: bool = False,
+        lambda_sigreg: float = 0.01,
+        # "auto" = every level with at least sigreg_min_nodes rows (L0 governed by
+        # sigreg_include_l0); "all" = every level regardless of size; or an explicit list of
+        # level indices. A distributional test on a handful of rows is meaningless -- at
+        # N=4096 the DNA arm's L5/L6 hold 8 and 2 nodes -- so "auto" is the honest default.
+        sigreg_levels: Any = "auto",
+        sigreg_min_nodes: int = 64,
+        sigreg_include_l0: bool = False,   # L0 is the token stream, not the hierarchy
+        sigreg_sample_size: int = 4096,    # per level; caps the [n, proj, knots] intermediate
+        sigreg_knots: int = 17,
+        sigreg_num_proj: int = 128,
+        # Divide each level's statistic by its row count. The Epps-Pulley n-scaling is right
+        # for a hypothesis TEST, but summed across levels of wildly different size it makes L1
+        # (512 rows) outweigh L4 (32 rows) 16x purely on size. Off = the literal test statistic.
+        sigreg_normalize_n: bool = True,
+        sigreg_train_only: bool = True,
+        # WHICH REPRESENTATION THE LATENT CONSTRAINTS SEE. The refinement stack is pre-norm,
+        # so the last layer's output is a bare residual sum; `final_norm` outside the loop is
+        # the only thing that closes the ladder, and it is what `output_projection` and the
+        # host head consume. The aux losses, however, read `tb_graph.x` -- the stream BEFORE
+        # that norm (measured on a fresh build at N=1024: RMS 1.29 at L0 and ~4.8 at every
+        # coarse level, all mapped to exactly 1.0 by final_norm). So the head and the
+        # constraints were being trained on two different representations.
+        # Members: "aux" (hierarchy consistency), "predaux" (predictive coarse aux), "sigreg".
+        # "none" = read the raw stream (legacy); "all" = every member; or list the ones to
+        # move. Reuses self.final_norm, so it adds NO parameters and no checkpoint keys --
+        # only the value of the auxiliary losses changes.
+        # NOTE for sigreg specifically: LayerNorm pins every row to zero channel-mean and unit
+        # channel-variance, which pins the sliced statistic's variance to 1 for free and (by
+        # concentration of measure at H=1024) drives random 1-D projections toward N(0,1)
+        # whatever the representation does. Measure before assuming it is an improvement --
+        # a constraint that reads ~0 by construction is a constraint that does nothing.
+        hier_latent_exit_norm: Union[str, Sequence[str]] = "none",
         l0_alpha_enable: bool = False, # Whether to apply a learnable alpha to L0 features in the recon head
         l0_local_backend: str = "flash",  # pyg | flash | xformers | sdpa
         l0_local_window: int = 128,
@@ -3074,6 +3222,10 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_coarse_global_gate_init = float(local_pack_coarse_global_gate_init)
         self.local_pack_flex_union = bool(local_pack_flex_union)
         self.hier_node_dropout = float(hier_node_dropout)
+        self.local_window_dropout = float(local_window_dropout)
+        if self.local_window_dropout > 0.0:
+            logger.info("Window dropout active on L0 rows (p=%.3g): the local window is thinned "
+                        "so the hierarchy has to carry the difference.", self.local_window_dropout)
         self.hier_node_dropout_per_level = (
             list(hier_node_dropout_per_level) if hier_node_dropout_per_level is not None else None)
         self.local_pack_bidirectional = bool(local_pack_bidirectional)
@@ -3265,44 +3417,34 @@ class HierarchicalFlowGAT(nn.Module):
         self.hier_aux_w_l1_from_l2 = float(hier_aux_w_l1_from_l2)
         self.hier_aux_w_l0_from_l1 = float(hier_aux_w_l0_from_l1)
         self.hier_aux_w_l0_from_l3 = float(hier_aux_w_l0_from_l3)
+        self.hier_aux_w_adjacent = float(hier_aux_w_adjacent)
+        self.hier_aux_w_l0_from_top = float(hier_aux_w_l0_from_top)
         self.hier_aux_ar_strict = bool(hier_aux_ar_strict)
         self.hier_aux_ar_disable_l0_from_l3 = bool(hier_aux_ar_disable_l0_from_l3)
         self.hier_aux_pair_predictors: Optional[nn.ModuleDict] = None
         if self.hier_aux_mode == "jepa_mlp":
-            if self.hier_aux_predictor_type == "mlp":
-                self.hier_aux_pair_predictors = nn.ModuleDict(
-                    {
-                        "l2_from_l3": nn.Sequential(
-                            nn.Linear(hidden_dim, hidden_dim * 2),
-                            nn.SiLU(),
-                            nn.Linear(hidden_dim * 2, hidden_dim),
-                        ),
-                        "l1_from_l2": nn.Sequential(
-                            nn.Linear(hidden_dim, hidden_dim * 2),
-                            nn.SiLU(),
-                            nn.Linear(hidden_dim * 2, hidden_dim),
-                        ),
-                        "l0_from_l1": nn.Sequential(
-                            nn.Linear(hidden_dim, hidden_dim * 2),
-                            nn.SiLU(),
-                            nn.Linear(hidden_dim * 2, hidden_dim),
-                        ),
-                        "l0_from_l3": nn.Sequential(
-                            nn.Linear(hidden_dim, hidden_dim * 2),
-                            nn.SiLU(),
-                            nn.Linear(hidden_dim * 2, hidden_dim),
-                        ),
-                    }
-                )
-            else:
-                self.hier_aux_pair_predictors = nn.ModuleDict(
-                    {
-                        "l2_from_l3": nn.Linear(hidden_dim, hidden_dim),
-                        "l1_from_l2": nn.Linear(hidden_dim, hidden_dim),
-                        "l0_from_l1": nn.Linear(hidden_dim, hidden_dim),
-                        "l0_from_l3": nn.Linear(hidden_dim, hidden_dim),
-                    }
-                )
+            # One predictor per pair, keyed off the LEVEL COUNT (same set as _hier_aux_pairs).
+            # These used to be four hardcoded keys, and a pair with no predictor makes
+            # _compute_hier_aux_pair_loss_jepa return 0 SILENTLY -- so on a hierarchy deeper
+            # than 4 levels the top pairs were dropped with no warning at all.
+            def _aux_pred():
+                if self.hier_aux_predictor_type == "mlp":
+                    return nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 2),
+                        nn.SiLU(),
+                        nn.Linear(hidden_dim * 2, hidden_dim),
+                    )
+                return nn.Linear(hidden_dim, hidden_dim)
+
+            self.hier_aux_pair_predictors = nn.ModuleDict(
+                {f"l{_lo}_from_l{_hi}": _aux_pred()
+                 for _lo, _hi, _ in self._hier_aux_pairs(None)}
+            )
+            logger.info("Hierarchy aux (jepa_mlp): %d pair predictor(s) %s (%s), %s params.",
+                        len(self.hier_aux_pair_predictors),
+                        list(self.hier_aux_pair_predictors.keys()),
+                        self.hier_aux_predictor_type,
+                        f"{sum(p.numel() for p in self.hier_aux_pair_predictors.parameters()):,}")
         self.hier_ar_enable = bool(hier_ar_enable)
         self.hier_ar_allow_same_time = bool(hier_ar_allow_same_time)
         self.hier_ar_filter_zip = bool(hier_ar_filter_zip)
@@ -3904,6 +4046,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
+                        local_window_dropout=float(getattr(self, "local_window_dropout", 0.0)),
                         local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
                         local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
@@ -4002,6 +4145,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
+                        local_window_dropout=float(getattr(self, "local_window_dropout", 0.0)),
                         local_pack_bidirectional=bool(getattr(self, "local_pack_bidirectional", False)),
                         local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
@@ -4231,6 +4375,12 @@ class HierarchicalFlowGAT(nn.Module):
 
         # --- Coarse co-prediction into L0 pre-head features (see _copredict_inject) ---
         self.hier_copredict_l0 = bool(hier_copredict_l0)
+        _cpm = str(hier_copredict_mode).lower()
+        if _cpm not in ("auto", "causal", "containing"):
+            raise ValueError("hier_copredict_mode must be 'auto', 'causal' or 'containing'")
+        if _cpm == "auto":
+            _cpm = "containing" if bool(getattr(self, "local_pack_bidirectional", False)) else "causal"
+        self.hier_copredict_mode = _cpm
         num_levels = len(compression_ratios) + 1
         _copred_levels = [1, 2, 3] if hier_copredict_levels is None else list(hier_copredict_levels)
         self.hier_copredict_levels = [int(l) for l in _copred_levels if 1 <= int(l) <= num_levels - 1]
@@ -4250,6 +4400,22 @@ class HierarchicalFlowGAT(nn.Module):
         self.hier_clean_norm_stack = bool(hier_clean_norm_stack)
         # Kept so a legacy load can flip the flag off and a later clean load restore it.
         self._hier_clean_norm_stack_cfg = bool(hier_clean_norm_stack)
+        # None = follow the stack flag (historical coupling). Explicit True/False decouples.
+        self.hier_refresh_prenorm = (
+            bool(hier_clean_norm_stack) if hier_refresh_prenorm is None
+            else bool(hier_refresh_prenorm)
+        )
+        self._hier_refresh_prenorm_cfg = bool(self.hier_refresh_prenorm)
+        self.hier_refresh_prenorm_affine = bool(hier_refresh_prenorm_affine)
+        if self.hier_refresh_prenorm and not self.hier_refresh_prenorm_affine:
+            logger.info("Refresh pre-norms are NON-AFFINE (gain/bias dropped; the following "
+                        "projection can represent them exactly).")
+        if self.hier_refresh_prenorm != self.hier_clean_norm_stack:
+            logger.info(
+                "Norm stack DECOUPLED: stream post-norm %s, refresh pre-norms %s.",
+                "OFF" if self.hier_clean_norm_stack else "ON",
+                "ON" if self.hier_refresh_prenorm else "OFF",
+            )
         self.hier_upward_refresh = bool(hier_upward_refresh)
         self.hier_upward_refresh_every = max(1, int(hier_upward_refresh_every))
         self.hier_refresh_per_layer_gates = bool(hier_refresh_per_layer_gates)
@@ -4261,9 +4427,10 @@ class HierarchicalFlowGAT(nn.Module):
             # match how the projections are allocated -- per level, shared across depth --
             # and applied to the POOLED rows, which is both the projection's immediate input
             # and far cheaper than normalizing L0 before pooling.
-            if self.hier_clean_norm_stack:
+            if self.hier_refresh_prenorm:
                 self.upward_refresh_norms = nn.ModuleList(
-                    make_norm(self.hidden_dim, norm_type=self.norm_type, eps=self.norm_eps)
+                    make_norm(self.hidden_dim, norm_type=self.norm_type, eps=self.norm_eps,
+                              elementwise_affine=self.hier_refresh_prenorm_affine)
                     for _ in compression_ratios
                 )
             # Kept 1-D even when per-layer (flattened [layer, level], viewed at use time).
@@ -4338,9 +4505,10 @@ class HierarchicalFlowGAT(nn.Module):
                 {k: nn.Linear(self.hidden_dim, self.hidden_dim) for k in pair_keys}
             )
             # Pre-norm per pair (hier_clean_norm_stack), same rationale as the upward side.
-            if self.hier_clean_norm_stack:
+            if self.hier_refresh_prenorm:
                 self.downward_refresh_norms = nn.ModuleDict(
-                    {k: make_norm(self.hidden_dim, norm_type=self.norm_type, eps=self.norm_eps)
+                    {k: make_norm(self.hidden_dim, norm_type=self.norm_type, eps=self.norm_eps,
+                                  elementwise_affine=self.hier_refresh_prenorm_affine)
                      for k in pair_keys}
                 )
             _dn_rows = self._refresh_gate_rows()
@@ -4361,10 +4529,11 @@ class HierarchicalFlowGAT(nn.Module):
         self.final_norm_fast_path = bool(final_norm_fast_path)
         if self.final_norm_fast_path:
             logger.info("Terminal norm active on the fast path (final_norm_fast_path).")
-        if self.hier_clean_norm_stack:
+        if self.hier_clean_norm_stack or self.hier_refresh_prenorm:
             logger.info(
-                "Clean pre-norm stack: stream post-norm OFF, refresh projections pre-normed "
-                "(%d upward, %d downward).",
+                "Norm stack: stream post-norm %s, refresh pre-norms %s (%d upward, %d downward).",
+                "OFF" if self.hier_clean_norm_stack else "ON",
+                "ON" if self.hier_refresh_prenorm else "OFF",
                 len(getattr(self, "upward_refresh_norms", []) or []),
                 len(getattr(self, "downward_refresh_norms", {}) or {}),
             )
@@ -4444,6 +4613,45 @@ class HierarchicalFlowGAT(nn.Module):
             logger.info("Predictive coarse aux enabled for levels %s (lambda %.3g, loss %s, dir %s).",
                         self.hier_predaux_levels, self.lambda_hier_predaux,
                         self.hier_predaux_loss_mode, self.hier_predaux_directions)
+
+        # --- SIGReg latent constraint (see _compute_sigreg_loss) ---
+        self.sigreg_enable = bool(sigreg_enable)
+        self.lambda_sigreg = float(lambda_sigreg)
+        self.sigreg_levels_cfg = sigreg_levels
+        self.sigreg_min_nodes = max(2, int(sigreg_min_nodes))
+        self.sigreg_include_l0 = bool(sigreg_include_l0)
+        self.sigreg_sample_size = max(2, int(sigreg_sample_size))
+        self.sigreg_knots = max(2, int(sigreg_knots))
+        self.sigreg_num_proj = max(1, int(sigreg_num_proj))
+        self.sigreg_normalize_n = bool(sigreg_normalize_n)
+        self.sigreg_train_only = bool(sigreg_train_only)
+        self.hier_latent_exit_norm = _resolve_latent_exit_norm(hier_latent_exit_norm)
+        if self.hier_latent_exit_norm:
+            logger.info(
+                "Latent constraints read the POST-final_norm stream for: %s.",
+                ", ".join(sorted(self.hier_latent_exit_norm)),
+            )
+        self._last_sigreg_loss: Optional[torch.Tensor] = None
+        self._last_sigreg_per_level: Dict[str, float] = {}
+        if self.sigreg_enable:
+            # Trapezoid quadrature over t in [0,3], weighted by phi so the tail knots (where
+            # the empirical CF is noisiest) count less. Non-persistent: they are constants, and
+            # keeping them out of the state dict means enabling SIGReg adds no checkpoint keys.
+            _t = torch.linspace(0.0, 3.0, self.sigreg_knots, dtype=torch.float32)
+            _dt = 3.0 / float(max(1, self.sigreg_knots - 1))
+            _w = torch.full((self.sigreg_knots,), _dt, dtype=torch.float32)
+            _w[0] = _w[-1] = 0.5 * _dt
+            _phi = torch.exp(-0.5 * _t.square())
+            self.register_buffer("_sigreg_t", _t, persistent=False)
+            self.register_buffer("_sigreg_phi", _phi, persistent=False)
+            self.register_buffer("_sigreg_weights", _w * _phi, persistent=False)
+            logger.info(
+                "SIGReg enabled (lambda %.3g, levels %s, min_nodes %d, include_l0 %s, "
+                "%d proj x %d knots, sample %d, normalize_n %s).",
+                self.lambda_sigreg, self.sigreg_levels_cfg, self.sigreg_min_nodes,
+                self.sigreg_include_l0, self.sigreg_num_proj, self.sigreg_knots,
+                self.sigreg_sample_size, self.sigreg_normalize_n,
+            )
 
         # Debug gate/scale monitor (see gate_monitor()).
         self.pinball_monitor_gates = bool(pinball_monitor_gates)
@@ -5754,7 +5962,8 @@ class HierarchicalFlowGAT(nn.Module):
         A later load of a genuine clean-stack checkpoint restores the configured value, so a
         process that scores both kinds does not get stuck in legacy mode.
         """
-        want = bool(getattr(self, "_hier_clean_norm_stack_cfg", False))
+        want = bool(getattr(self, "_hier_clean_norm_stack_cfg", False)) or bool(
+            getattr(self, "_hier_refresh_prenorm_cfg", False))
         if not want:
             return
         subs = [n for n in ("upward_refresh_norms", "downward_refresh_norms")
@@ -5763,7 +5972,10 @@ class HierarchicalFlowGAT(nn.Module):
             return
         has_norms = any(k.startswith(prefix + sub + ".") for sub in subs for k in state_dict)
         if has_norms:
-            self.hier_clean_norm_stack = True          # genuine clean-stack checkpoint
+            # Genuine checkpoint that carries refresh pre-norms: restore BOTH configured
+            # values, so one process can score decoupled, clean and legacy checkpoints.
+            self.hier_clean_norm_stack = bool(getattr(self, "_hier_clean_norm_stack_cfg", True))
+            self.hier_refresh_prenorm = bool(getattr(self, "_hier_refresh_prenorm_cfg", True))
             return
         has_proj = any(
             k.startswith(prefix + "upward_refresh_proj.")
@@ -5772,7 +5984,10 @@ class HierarchicalFlowGAT(nn.Module):
         )
         if not has_proj:
             return                                     # cannot tell; leave as configured
+        # No refresh pre-norms in the checkpoint: it trained with the shared stream
+        # post-norm and no per-projection pre-norm, so BOTH must go legacy for this model.
         self.hier_clean_norm_stack = False
+        self.hier_refresh_prenorm = False
         for sub in subs:
             for pname, pval in getattr(self, sub).state_dict().items():
                 state_dict[prefix + sub + "." + pname] = pval.detach().clone()
@@ -5866,7 +6081,7 @@ class HierarchicalFlowGAT(nn.Module):
             else:
                 pooled = self._pooled_child_window_means(lower, lvl, int(level_sizes[lvl]))
             gate = gates[lvl - 1].to(dtype=pooled.dtype)
-            if self.hier_clean_norm_stack:
+            if self.hier_refresh_prenorm:
                 pooled = self.upward_refresh_norms[lvl - 1](pooled)
             cur = x[:, offsets[lvl] : offsets[lvl + 1], :] + gate * self.upward_refresh_proj[lvl - 1](pooled)
             pieces.append(cur)
@@ -6488,7 +6703,7 @@ class HierarchicalFlowGAT(nn.Module):
                 entry = plan[pair]
                 chosen, valid = entry[0], entry[1]
                 seg_offsets = entry[2] if len(entry) > 2 else None
-                src_m = self.downward_refresh_norms[pair](cur[m]) if self.hier_clean_norm_stack else cur[m]
+                src_m = self.downward_refresh_norms[pair](cur[m]) if self.hier_refresh_prenorm else cur[m]
                 proj = self.downward_refresh_proj[pair](src_m)           # few coarse rows
                 # bandwidth-only gather; under grad the scatter backward is the whole cost of
                 # this op at depth (see _SegmentedBroadcast), so route it through the segment
@@ -7427,16 +7642,79 @@ class HierarchicalFlowGAT(nn.Module):
                 continue
             ptime = node_ar_time[s:e].to(torch.long)
             sorted_t, sidx = torch.sort(ptime)
-            # most-recent coarse node with window_end <= t (allow_same) or < t (strict AR)
-            pos = torch.searchsorted(sorted_t, q_time, right=allow_same) - 1
-            valid = (pos >= 0)
-            chosen = sidx[pos.clamp(min=0)]                    # [T_graph]
+            if getattr(self, "hier_copredict_mode", "causal") == "containing":
+                # First node whose window ENDS at or after t, i.e. the node covering t.
+                # Symmetric: t sits inside this window, so the summary carries both sides.
+                # Only valid where such a node exists (t past the last window end has none).
+                pos = torch.searchsorted(sorted_t, q_time, right=False)
+                valid = (pos < sorted_t.numel())
+                chosen = sidx[pos.clamp(max=sorted_t.numel() - 1)]
+            else:
+                # most-recent coarse node with window_end <= t (allow_same) or < t (strict AR)
+                pos = torch.searchsorted(sorted_t, q_time, right=allow_same) - 1
+                valid = (pos >= 0)
+                chosen = sidx[pos.clamp(min=0)]                # [T_graph]
             coarse = x_final[:, s:e, :]                        # [B, n_lvl, H]
             gathered = coarse.index_select(1, chosen.to(coarse.device)).to(dev)
             gathered = gathered * valid.to(dev, gathered.dtype).view(1, -1, 1)
             proj = self.copredict_proj[str(lvl)](gathered)
             out = out + self.copredict_gate[str(lvl)] * proj
         return out
+
+    @torch.no_grad()
+    def _measure_hier_node_specificity(self, x_bnh: torch.Tensor,
+                                       level_offsets: Optional[torch.Tensor]) -> None:
+        """Per coarse level: how much of the representation is NODE-SPECIFIC?
+
+            node_spec = E_i||x_i - mu||^2 / E_i||x_i||^2,   mu = mean over that level's rows
+
+        0.0 = every node of the level is its own level's mean, i.e. the level is a constant
+        bias channel carrying no per-node information. Rising toward 1.0 = the rows differ
+        from each other and from zero-mean.
+
+        This is the cheap, every-step proxy for the expensive mean-control ablation (replace
+        each coarse row by its level mean and re-score): the ablation measures whether the
+        node-specific part is USED, this measures whether it EXISTS. Read them together --
+        node_spec high with a null ablation delta means the hierarchy has signal that nothing
+        downstream reads (a routing problem); node_spec near 0 means there is no signal to
+        read (a representation problem). They point at different fixes.
+
+        Stored as tensors and only converted to floats in gate_monitor(), so the forward
+        never syncs on them.
+        """
+        if level_offsets is None or x_bnh.dim() != 3:
+            return
+        try:
+            lo = [int(v) for v in level_offsets.tolist()]
+        except Exception:
+            return
+        n_total = int(x_bnh.shape[1])
+        stats: Dict[str, torch.Tensor] = {}
+        for lvl in range(1, len(lo)):
+            a = lo[lvl]
+            b = lo[lvl + 1] if lvl + 1 < len(lo) else n_total
+            if b - a < 2:
+                continue
+            rows = x_bnh[:, a:b, :].float()
+            mu = rows.mean(dim=1, keepdim=True)
+            denom = rows.pow(2).mean()
+            stats[f"hier.L{lvl}.node_spec"] = (rows - mu).pow(2).mean() / denom.clamp_min(1e-12)
+            stats[f"hier.L{lvl}.rms"] = denom.sqrt()
+        self._last_hier_node_spec = stats
+
+    def _latent_exit_norm_apply(self, x_bnh: torch.Tensor, member: str) -> torch.Tensor:
+        """Return the stream as `member`'s loss should see it (see hier_latent_exit_norm).
+
+        Identity unless `member` is enabled, in which case the terminal `final_norm` is
+        applied -- the same module and the same affine the head consumes, so the constraint
+        and the output are defined on one representation instead of two.
+        """
+        if member not in getattr(self, "hier_latent_exit_norm", frozenset()):
+            return x_bnh
+        norm = getattr(self, "final_norm", None)
+        if norm is None:
+            return x_bnh
+        return norm(x_bnh)
 
     def _compute_predictive_aux_loss(
         self,
@@ -7490,12 +7768,114 @@ class HierarchicalFlowGAT(nn.Module):
             return None
         return torch.stack(losses).mean()
 
+    def _sigreg_active_levels(self, level_sizes: List[int]) -> List[int]:
+        """Which levels SIGReg scores, for an ARBITRARY level count.
+
+        "auto" keeps every level holding at least ``sigreg_min_nodes`` rows (L0 only when
+        ``sigreg_include_l0``); "all" keeps every level regardless of size; a list is taken
+        literally, still filtered to levels that exist. Sizes are read from the runtime
+        level_offsets, so this follows the hierarchy at whatever length it was built for --
+        a level that is large at 32768 and degenerate at 4096 is included at one and skipped
+        at the other without touching the config.
+        """
+        cfg = getattr(self, "sigreg_levels_cfg", "auto")
+        n_levels = len(level_sizes)
+        if isinstance(cfg, str):
+            mode = cfg.lower()
+            lo = 0 if getattr(self, "sigreg_include_l0", False) else 1
+            if mode == "all":
+                return [l for l in range(lo, n_levels)]
+            floor = int(getattr(self, "sigreg_min_nodes", 64))
+            return [l for l in range(lo, n_levels) if int(level_sizes[l]) >= floor]
+        try:
+            wanted = [int(v) for v in cfg]
+        except TypeError:
+            return []
+        return [l for l in wanted if 0 <= l < n_levels]
+
+    def _compute_sigreg_loss(
+        self,
+        x_bnh: torch.Tensor,
+        level_offsets: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Sliced isotropic-Gaussian goodness-of-fit on each level's node features.
+
+        For a level's rows X [n, H]: draw `num_proj` random unit directions a, project
+        (X @ a), and compare the empirical characteristic function of each 1-D projection
+        against the standard normal's phi(t)=exp(-t^2/2) at `knots` values of t in [0,3]:
+
+            err(a,t) = (mean cos(t <x,a>) - phi(t))^2 + (mean sin(t <x,a>))^2
+
+        integrated with trapezoid weights times phi, then averaged over directions. This is
+        the Epps-Pulley statistic; minimising it pushes every 1-D slice of the level toward
+        N(0,1), which forbids BOTH a collapsed direction (no variance) and a constant offset
+        (non-zero mean) -- the sin term is what catches the offset, and it is exactly what a
+        centred VICReg variance hinge cannot see.
+
+        Training-only and read-only: it consumes x and touches nothing the forward returns.
+        Returns None when disabled, so a caller can leave the call unconditional.
+        """
+        if not bool(getattr(self, "sigreg_enable", False)):
+            return None
+        if bool(getattr(self, "sigreg_train_only", True)) and not self.training:
+            return None
+        if x_bnh is None or level_offsets is None or x_bnh.dim() != 3:
+            return None
+        offsets = [int(o) for o in level_offsets.tolist()]
+        if len(offsets) < 2:
+            return None
+        level_sizes = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
+        levels = self._sigreg_active_levels(level_sizes)
+        if not levels:
+            return None
+
+        t = self._sigreg_t.to(device=x_bnh.device)
+        phi = self._sigreg_phi.to(device=x_bnh.device)
+        weights = self._sigreg_weights.to(device=x_bnh.device)
+        cap = int(self.sigreg_sample_size)
+        num_proj = int(self.sigreg_num_proj)
+        per_level: Dict[str, float] = {}
+        stats = []
+        for lvl in levels:
+            rows = x_bnh[:, offsets[lvl] : offsets[lvl + 1], :]
+            xf = rows.reshape(-1, rows.size(-1)).float()
+            n = int(xf.size(0))
+            if n < 2:
+                continue
+            if n > cap:
+                # Subsample per level, never globally: a global sample would be dominated by
+                # L0/L1 and would essentially never draw a small upper level's rows.
+                xf = xf.index_select(0, torch.randperm(n, device=xf.device)[:cap])
+                n = cap
+            a = torch.randn(xf.size(-1), num_proj, device=xf.device, dtype=xf.dtype)
+            a = a / a.norm(p=2, dim=0, keepdim=True).clamp_min(1e-8)
+            proj = (xf @ a).unsqueeze(-1) * t            # [n, num_proj, knots]
+            err = (proj.cos().mean(dim=0) - phi).square() + proj.sin().mean(dim=0).square()
+            stat = (err @ weights).mean()
+            if not bool(getattr(self, "sigreg_normalize_n", True)):
+                stat = stat * float(n)
+            stats.append(stat)
+            per_level[f"sigreg.L{lvl}"] = float(stat.detach())
+        if not stats:
+            return None
+        self._last_sigreg_per_level = per_level
+        return torch.stack(stats).mean().to(dtype=x_bnh.dtype)
+
     def gate_monitor(self) -> Dict[str, float]:
         """Flat dict of the essential learnable gates/scales, so you can watch which pathways
         open up or collapse during training. Call it anywhere (eval loop, debugger), or flip
         pinball_monitor_gates to have the forward log it every pinball_monitor_gates_every calls.
         All near-0 = pathway unused; growing magnitude = the model is leaning on it."""
         d: Dict[str, float] = {}
+        # SIGReg per-level statistic from the last training forward (see _compute_sigreg_loss).
+        # Rising = that level's distribution is drifting away from isotropic (a direction
+        # collapsing, or a constant offset appearing).
+        d.update(getattr(self, "_last_sigreg_per_level", {}) or {})
+        # Per-level node-specificity (see _measure_hier_node_specificity). Near 0 = that
+        # level is a constant bias channel; pair it with the mean-control ablation, which
+        # says whether the node-specific part is actually read.
+        for _k, _v in (getattr(self, "_last_hier_node_spec", {}) or {}).items():
+            d[_k] = float(_v)
         # Coarse co-prediction into L0 (per-level head gate).
         if getattr(self, "hier_copredict_l0", False) and hasattr(self, "copredict_gate"):
             for k, g in self.copredict_gate.items():
@@ -8497,6 +8877,44 @@ class HierarchicalFlowGAT(nn.Module):
 
         return self._compute_hier_aux_pair_loss(pred, target)
 
+    def _hier_aux_pairs(self, g=None) -> List[Tuple[int, int, float]]:
+        """Hierarchy-aux (low, high, weight) pairs for the ACTUAL level count.
+
+        Same pattern the four hardcoded terms encoded: every ADJACENT pair (q, q+1), plus
+        L0 <- TOP at a smaller weight. At 3 coarse levels that reproduces L0<-L1, L1<-L2,
+        L2<-L3 and L0<-L3 exactly, weights included, so an existing config is unchanged; at 4
+        it also adds L3<-L4 and moves the long-range term to L0<-L4 instead of leaving the top
+        level unconstrained.
+
+        The count comes from the runtime level_offsets when available (so it follows
+        hier_level_limit, and any level that collapsed at short N) and otherwise from the
+        configured compression_ratios -- which is what the constructor uses, before any graph
+        exists, to size the jepa predictors.
+        """
+        n_levels = 0
+        lo = getattr(g, "level_offsets", None) if g is not None else None
+        if lo is not None:
+            try:
+                n_levels = max(0, len(list(lo)) - 1)
+            except TypeError:
+                n_levels = 0
+        if n_levels <= 0:
+            n_levels = len(getattr(self, "compression_ratios", []) or []) + 1
+        top = n_levels - 1
+        if top < 1:
+            return []
+        legacy = {0: "hier_aux_w_l0_from_l1", 1: "hier_aux_w_l1_from_l2", 2: "hier_aux_w_l2_from_l3"}
+        pairs: List[Tuple[int, int, float]] = []
+        for q in range(top):
+            name = legacy.get(q)
+            w = float(getattr(self, name)) if name else float(getattr(self, "hier_aux_w_adjacent", 1.0))
+            pairs.append((q, q + 1, w))
+        if top >= 2:   # at top == 1 the long-range term IS the adjacent one
+            w_top = (float(getattr(self, "hier_aux_w_l0_from_l3"))
+                     if top == 3 else float(getattr(self, "hier_aux_w_l0_from_top", 0.25)))
+            pairs.append((0, top, w_top))
+        return pairs
+
     def _compute_hierarchy_aux_loss_runtime(self, g) -> torch.Tensor:
         mode = str(getattr(self, "hier_aux_mode", "mean_mse")).lower()
         if mode == "mean_mse":
@@ -8506,19 +8924,12 @@ class HierarchicalFlowGAT(nn.Module):
                     g,
                     detach_target=bool(getattr(self, "hier_aux_detach_target", True)),
                     link_low0=bool(getattr(self, "hier_aux_link_l0_target", False)),
-                    w_l2_from_l3=float(getattr(self, "hier_aux_w_l2_from_l3", 1.0)),
-                    w_l1_from_l2=float(getattr(self, "hier_aux_w_l1_from_l2", 1.0)),
-                    w_l0_from_l1=float(getattr(self, "hier_aux_w_l0_from_l1", 1.0)),
-                    w_l0_from_l3=float(getattr(self, "hier_aux_w_l0_from_l3", 0.25)),
                     loss_mode=str(getattr(self, "hier_aux_loss_mode", "mse")),
+                    pairs=self._hier_aux_pairs(g),
                 )
 
-            pair_defs = [
-                ("l2_from_l3", 2, 3, float(getattr(self, "hier_aux_w_l2_from_l3", 1.0))),
-                ("l1_from_l2", 1, 2, float(getattr(self, "hier_aux_w_l1_from_l2", 1.0))),
-                ("l0_from_l1", 0, 1, float(getattr(self, "hier_aux_w_l0_from_l1", 1.0))),
-                ("l0_from_l3", 0, 3, float(getattr(self, "hier_aux_w_l0_from_l3", 0.25))),
-            ]
+            pair_defs = [(f"l{_lo}_from_l{_hi}", _lo, _hi, _w)
+                         for _lo, _hi, _w in self._hier_aux_pairs(g)]
 
             loss_total = torch.zeros((), device=g.x.device, dtype=g.x.dtype)
             pair_log: Dict[str, float] = {}
@@ -8528,7 +8939,7 @@ class HierarchicalFlowGAT(nn.Module):
                 if (
                     bool(getattr(self, "hier_ar_enable", False))
                     and bool(getattr(self, "hier_aux_ar_disable_l0_from_l3", True))
-                    and str(pair_key) == "l0_from_l3"
+                    and int(low_lvl) == 0 and int(high_lvl) > 1   # L0 <- TOP, any level count
                 ):
                     if not bool(getattr(self, "_hier_aux_l0_from_l3_disabled_logged", False)):
                         logger.info("Hierarchy aux (AR strict): disabling l0_from_l3 pair to avoid future-context contamination")
@@ -8545,12 +8956,8 @@ class HierarchicalFlowGAT(nn.Module):
             self._last_hier_aux_pair_losses = pair_log
             return loss_total
 
-        pair_defs = [
-            ("l2_from_l3", 2, 3, float(getattr(self, "hier_aux_w_l2_from_l3", 1.0))),
-            ("l1_from_l2", 1, 2, float(getattr(self, "hier_aux_w_l1_from_l2", 1.0))),
-            ("l0_from_l1", 0, 1, float(getattr(self, "hier_aux_w_l0_from_l1", 1.0))),
-            ("l0_from_l3", 0, 3, float(getattr(self, "hier_aux_w_l0_from_l3", 0.25))),
-        ]
+        pair_defs = [(f"l{_lo}_from_l{_hi}", _lo, _hi, _w)
+                     for _lo, _hi, _w in self._hier_aux_pairs(g)]
 
         loss_total = torch.zeros((), device=g.x.device, dtype=g.x.dtype)
         pair_log: Dict[str, float] = {}
@@ -8560,7 +8967,7 @@ class HierarchicalFlowGAT(nn.Module):
             if (
                 bool(getattr(self, "hier_ar_enable", False))
                 and bool(getattr(self, "hier_aux_ar_disable_l0_from_l3", True))
-                and str(pair_key) == "l0_from_l3"
+                and int(low_lvl) == 0 and int(high_lvl) > 1   # L0 <- TOP, any level count
             ):
                 if not bool(getattr(self, "_hier_aux_l0_from_l3_disabled_logged", False)):
                     logger.info("Hierarchy aux (AR strict): disabling l0_from_l3 pair to avoid future-context contamination")
@@ -14416,13 +14823,17 @@ class HierarchicalFlowGAT(nn.Module):
                 if tb_lo is not None:
                     tb_lo = torch.as_tensor(tb_lo, device=device)
                 self._last_hier_aux_loss = self._compute_true_batch_aux_loss(
-                    x_bnh=x_tb,
+                    x_bnh=self._latent_exit_norm_apply(x_tb, "aux"),
                     base_ei=getattr(tb_graph, "edge_index_full", tb_graph.edge_index).to(device),
                     base_nl=tb_graph.node_level.to(device),
                     base_lo=tb_lo,
                     base_ar_time=getattr(tb_graph, "node_ar_time", None),
                 )
-                self._last_hier_predaux_loss = self._compute_predictive_aux_loss(x_tb, tb_lo)
+                self._last_hier_predaux_loss = self._compute_predictive_aux_loss(
+                    self._latent_exit_norm_apply(x_tb, "predaux"), tb_lo)
+                self._last_sigreg_loss = self._compute_sigreg_loss(
+                    self._latent_exit_norm_apply(x_tb, "sigreg"), tb_lo)
+                self._measure_hier_node_specificity(x_tb, tb_lo)
                 self._set_true_batch_nozip_tail_metrics(
                     cycles_used=num_cycles,
                     zip_added_total=getattr(tb_graph, "zip_added_total", None),
@@ -14855,6 +15266,7 @@ class HierarchicalFlowGAT(nn.Module):
 
             self._last_hier_aux_loss = aux_loss
             self._last_hier_predaux_loss = None  # predictive aux runs on the fast path only
+            self._last_sigreg_loss = None        # SIGReg likewise
 
             # 7. Reshape and Restore
             unified_graph.x = g_work.x.view(B, N, H)# if B > 1 else g_work.x.view(N, H)

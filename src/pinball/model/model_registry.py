@@ -120,6 +120,96 @@ def build_transformer_model(
 
 
 
+# Level-indexed config keys, by SHAPE. hier_level_limit truncates/filters all of them at
+# once so a level count can be changed with ONE knob instead of editing every list.
+#   coarse : one entry per COARSE level          (len == n_coarse)
+#   total  : one entry per level including L0    (len == n_coarse + 1)
+#   index  : a list of level INDICES to filter   (order preserved)
+#   paired : an index list plus a value list of the same length, filtered together
+_LEVEL_KEYS_COARSE = (
+    "compression_ratios", "overlap_ratios",
+    "local_pack_l0_coarse_windows", "local_pack_ring_windows",
+)
+_LEVEL_KEYS_TOTAL = (
+    "num_layers", "hier_node_dropout_per_level",
+    "per_level_ffn_dims", "per_level_attn_mult",
+)
+_LEVEL_KEYS_INDEX = (
+    "local_pack_query_levels", "local_attn_causal_levels", "hier_predaux_levels",
+    "hier_copredict_levels", "ablate_levels", "hqd_coarse_route_levels",
+    "hqd_read_levels", "hqd_window_bag_levels", "witness_levels",
+)
+_LEVEL_KEYS_PAIRED = (("local_attn_levels", "local_attn_windows"),)
+
+
+def apply_hier_level_limit(args) -> Optional[int]:
+    """Cut the hierarchy to ``hier_level_limit`` COARSE levels, in one place.
+
+    The level count is otherwise implied by the LENGTH of a dozen independent lists
+    (``num_layers``, ``compression_ratios``, ``overlap_ratios``, the per-level dropout,
+    the pack query levels, ...), so changing it by hand means editing all of them
+    consistently and silently mis-sizing the model when one is missed. This truncates every
+    level-indexed key from a single integer and logs each change.
+
+    ``hier_level_limit`` counts COARSE levels: 3 gives L0..L3. None/0/negative, or a value at
+    or above the current count, is a no-op. Returns the resulting coarse-level count, or None
+    when nothing was done.
+    """
+    limit = getattr(args, "hier_level_limit", None)
+    if limit is None:
+        return None
+    limit = int(limit)
+    if limit <= 0:
+        return None
+    current = len(list(getattr(args, "compression_ratios", None) or []))
+    if current and limit >= current:
+        logger.info("hier_level_limit=%d >= the configured %d coarse levels; no change.",
+                    limit, current)
+        return current
+    changed = []
+    for key in _LEVEL_KEYS_COARSE:
+        val = getattr(args, key, None)
+        if isinstance(val, (list, tuple)) and len(val) > limit:
+            setattr(args, key, list(val)[:limit]); changed.append(f"{key}[:{limit}]")
+    for key in _LEVEL_KEYS_TOTAL:
+        val = getattr(args, key, None)
+        if isinstance(val, (list, tuple)) and len(val) > limit + 1:
+            setattr(args, key, list(val)[:limit + 1]); changed.append(f"{key}[:{limit + 1}]")
+    for key in _LEVEL_KEYS_INDEX:
+        val = getattr(args, key, None)
+        if isinstance(val, (list, tuple)):
+            kept = [v for v in val if int(v) <= limit]
+            if len(kept) != len(val):
+                setattr(args, key, kept); changed.append(f"{key}->{kept}")
+    for idx_key, val_key in _LEVEL_KEYS_PAIRED:
+        idx = getattr(args, idx_key, None)
+        vals = getattr(args, val_key, None)
+        if isinstance(idx, (list, tuple)) and isinstance(vals, (list, tuple)) and len(idx) == len(vals):
+            pairs = [(i, v) for i, v in zip(idx, vals) if int(i) <= limit]
+            if len(pairs) != len(idx):
+                setattr(args, idx_key, [i for i, _ in pairs])
+                setattr(args, val_key, [v for _, v in pairs])
+                changed.append(f"{idx_key}/{val_key}->{len(pairs)}")
+        else:
+            # Unpaired (a bare per-level window list): treat as total-indexed.
+            if isinstance(vals, (list, tuple)) and len(vals) > limit + 1:
+                setattr(args, val_key, list(vals)[:limit + 1]); changed.append(f"{val_key}[:{limit + 1}]")
+            if isinstance(idx, (list, tuple)):
+                kept = [v for v in idx if int(v) <= limit]
+                if len(kept) != len(idx):
+                    setattr(args, idx_key, kept); changed.append(f"{idx_key}->{kept}")
+    # "fine:coarse" refresh pairs naming a level that no longer exists.
+    pairs_cfg = getattr(args, "hier_downward_refresh_pairs", None)
+    if isinstance(pairs_cfg, (list, tuple)):
+        kept = [p for p in pairs_cfg
+                if all(int(v) <= limit for v in str(p).split(":") if v.strip().lstrip("-").isdigit())]
+        if len(kept) != len(pairs_cfg):
+            setattr(args, "hier_downward_refresh_pairs", kept); changed.append(f"refresh_pairs->{kept}")
+    logger.info("hier_level_limit=%d: hierarchy cut from %d to %d coarse levels. Adjusted: %s",
+                limit, current, limit, ", ".join(changed) if changed else "nothing")
+    return limit
+
+
 def build_pinball_model(
     args,
     tokenizer,
@@ -129,6 +219,8 @@ def build_pinball_model(
     max_seq_len: int,
     class_cond_enable: bool = False,
 ):
+    # Single-knob level control; must run before anything reads a level-indexed key.
+    apply_hier_level_limit(args)
     model = EnhancedHierarchicalFlowGAT(
         tokenizer=tokenizer,
         vocab_size=int(vocab_size),
@@ -175,6 +267,7 @@ def build_pinball_model(
         hier_copredict_levels=(list(getattr(args, "hier_copredict_levels", None))
                                if getattr(args, "hier_copredict_levels", None) else None),
         hier_copredict_gate_init=float(getattr(args, "hier_copredict_gate_init", 0.0)),
+        hier_copredict_mode=str(getattr(args, "hier_copredict_mode", "auto")),
         pinball_monitor_gates=bool(getattr(args, "pinball_monitor_gates", False)),
         pinball_monitor_gates_every=int(getattr(args, "pinball_monitor_gates_every", 100)),
         hier_upward_refresh=bool(getattr(args, "hier_upward_refresh", False)),
@@ -197,6 +290,23 @@ def build_pinball_model(
         # config to reproduce a checkpoint trained before they became the default.
         final_norm_fast_path=bool(getattr(args, "final_norm_fast_path", True)),
         hier_clean_norm_stack=bool(getattr(args, "hier_clean_norm_stack", True)),
+        # None (default) = follow hier_clean_norm_stack, i.e. the historical coupling.
+        hier_refresh_prenorm=(
+            None if getattr(args, "hier_refresh_prenorm", None) is None
+            else bool(getattr(args, "hier_refresh_prenorm"))
+        ),
+        hier_refresh_prenorm_affine=bool(getattr(args, "hier_refresh_prenorm_affine", True)),
+        sigreg_enable=bool(getattr(args, "sigreg_enable", False)),
+        lambda_sigreg=float(getattr(args, "lambda_sigreg", 0.01)),
+        sigreg_levels=getattr(args, "sigreg_levels", "auto"),
+        sigreg_min_nodes=int(getattr(args, "sigreg_min_nodes", 64)),
+        sigreg_include_l0=bool(getattr(args, "sigreg_include_l0", False)),
+        sigreg_sample_size=int(getattr(args, "sigreg_sample_size", 4096)),
+        sigreg_knots=int(getattr(args, "sigreg_knots", 17)),
+        sigreg_num_proj=int(getattr(args, "sigreg_num_proj", 128)),
+        sigreg_normalize_n=bool(getattr(args, "sigreg_normalize_n", True)),
+        sigreg_train_only=bool(getattr(args, "sigreg_train_only", True)),
+        hier_latent_exit_norm=getattr(args, "hier_latent_exit_norm", "none"),
         qk_norm=bool(getattr(args, "qk_norm", True)),
         qk_norm_type=str(getattr(args, "qk_norm_type", "rms")),
         xq_nominate_enable=bool(getattr(args, "xq_nominate_enable", False)),
@@ -242,6 +352,7 @@ def build_pinball_model(
         local_pack_ring_merge=str(getattr(args, "local_pack_ring_merge", "additive")),
         hier_node_dropout=float(getattr(args, "hier_node_dropout", 0.0)),
         hier_node_dropout_per_level=getattr(args, "hier_node_dropout_per_level", None),
+        local_window_dropout=float(getattr(args, "local_window_dropout", 0.0)),
         local_pack_bidirectional=bool(getattr(args, "local_pack_bidirectional", False)),
         spatial_curve=str(getattr(args, "spatial_curve", "none")),
         spatial_dims=(list(getattr(args, "spatial_dims", None))
@@ -364,6 +475,18 @@ def build_pinball_model(
         hier_aux_loss_mode=str(getattr(args, "hier_aux_loss_mode", "mse")),
         hier_aux_unit_norm=bool(getattr(args, "hier_aux_unit_norm", False)),
         hier_aux_link_l0_target=bool(getattr(args, "hier_aux_link_l0_target", False)),
+        # Per-pair aux weights. These were NOT threaded before, so a config setting any of
+        # them was silently ignored and the ctor defaults always won.
+        hier_aux_w_l2_from_l3=float(getattr(args, "hier_aux_w_l2_from_l3", 1.0)),
+        hier_aux_w_l1_from_l2=float(getattr(args, "hier_aux_w_l1_from_l2", 1.0)),
+        hier_aux_w_l0_from_l1=float(getattr(args, "hier_aux_w_l0_from_l1", 1.0)),
+        hier_aux_w_l0_from_l3=float(getattr(args, "hier_aux_w_l0_from_l3", 0.25)),
+        hier_aux_w_adjacent=float(getattr(args, "hier_aux_w_adjacent", 1.0)),
+        hier_aux_w_l0_from_top=float(getattr(args, "hier_aux_w_l0_from_top", 0.25)),
+        hier_aux_detach_target=bool(getattr(args, "hier_aux_detach_target", True)),
+        hier_aux_predictor_type=str(getattr(args, "hier_aux_predictor_type", "mlp")),
+        hier_aux_ar_strict=bool(getattr(args, "hier_aux_ar_strict", False)),
+        hier_aux_ar_disable_l0_from_l3=bool(getattr(args, "hier_aux_ar_disable_l0_from_l3", False)),
         # --- AR graph connectivity (causal edge construction for autoregressive training) ---
         hier_ar_enable=bool(getattr(args, "hier_ar_enable", False)),
         hier_ar_allow_same_time=bool(getattr(args, "hier_ar_allow_same_time", True)),

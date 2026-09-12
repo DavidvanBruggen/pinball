@@ -1,41 +1,3 @@
-# ============================================================================
-# LEGACY-MATCH + REFRESH PRE-NORM ARM  (2026-09-11)
-#
-# The cell nobody has run. Evidence that points here, all measured:
-#
-#   arm              post-norm  refreshes  refresh pre-norms  collapses  |mu|/sigma  spec@ep15
-#   legacy              ON         ON            no              2         40.32      0.46333
-#   betternormstack     off        ON            yes             0          0.83      0.42833
-#   post-norm only      ON         off           n/a             0          1.00      (0.42527@10)
-#   THIS ARM            ON         ON           YES              ?            ?          ?
-#
-# The single unstable cell is the only one where the refresh projections had no pre-norm of
-# their own (they read the shared stream norm, which normalises everything incl. L0, rather
-# than the pooled rows the projection actually consumes). And legacy is not a specificity-
-# only artifact: at ep15 it also had the best val loss of any arm (0.37566 vs the clean
-# arm's 0.37884, matching the transformer's 0.37596) -- objective and specificity agree.
-#
-# Needs hier_refresh_prenorm, added 2026-09-11 to decouple the two halves of
-# hier_clean_norm_stack. Default None = follow that flag, so every other config and every
-# checkpoint is untouched -- verified bit-identical in all four (stack x refresh) cells,
-# weightdiff and outdiff 0.000e+00, one process per cell; and the real legacy ep15 checkpoint
-# still reloads strict and scores 0.4633286517452208 exactly through the fallback hook.
-#
-# DELIBERATE DEVIATIONS FROM LEGACY (everything else matches it):
-#   hier_refresh_prenorm: true   <- the point of the run
-#   local_window_dropout: 0      <- legacy predates it. Set 0.1 to keep the one intervention
-#                                   that measurably raised distal signal (+24-67% hierarchy-
-#                                   mediated effect) -- but note the post-norm already
-#                                   suppressed those gains back to baseline by ep10, so
-#                                   little is given up by matching legacy here.
-#
-# WATCH FOR THE COLLAPSE. Legacy hit |mu|/sigma 40.32 at the pinball/CNN mixing site by ep5
-# and its borzoi R fell to 0.34842 at ep7. Run scratchpad/cond_probe.py on the ep1/ep2
-# checkpoints: healthy is ~1.0 (this build measured 0.996@ep5, 1.064@ep10 with refreshes
-# off). Anything trending toward double digits means the pre-norm did NOT fix it -- kill the
-# run rather than spending 15 epochs.
-# ============================================================================
-
 # DNA backbone -- loaded via build_pinball(cfg_path=..., num_tracks=<dim>).
 # Architecture keys only: the host harness owns the loop, data, optimizer and batching.
 #
@@ -123,7 +85,7 @@ unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0
-dropout: 0.3
+dropout: 0.1
 # Per-level DropNode. Index i = level i; L0 is pinned to 0.0 whatever this says. Level sizes
 # at 4096 are L1 512, L2 256, L3 128, L4 32, L5 8, L6 2 -- dropping 10% of a 2-row level is a
 # 50%-of-the-level event, so the top levels get none.
@@ -150,10 +112,10 @@ local_pack_rope_axial: false
 
 upper_init: pooled
 upper_seed_gate_init: 1.0
-hier_upward_refresh: true      # LEGACY MATCH (was false)
+hier_upward_refresh: false
 hier_upward_refresh_every: 1
 hier_upward_refresh_gate_init: 0.1
-hier_downward_refresh: true    # LEGACY MATCH (was false)
+hier_downward_refresh: false
 hier_downward_refresh_every: 1
 hier_downward_refresh_gate_init: 0.1
 hier_refresh_compile: true
@@ -185,14 +147,14 @@ hier_pool_gate_bias_init: 2.0
 # mirror image (that one is pinned to 0.0 on L0 by design). Thins a query's own local
 # neighbourhood so the coarse path has to explain what the window no longer can. Train-only,
 # unbiased (values not keys, 1/(1-p) kept), exact no-op at 0.0.
-local_window_dropout: 0.0      # LEGACY MATCH (legacy predates this knob)
+local_window_dropout: 0.1
 
 # COARSE CO-PREDICTION: project each coarse level's summary straight into L0's pre-head
 # features through a learnable gate. This is a DIRECT loss->coarse gradient path that does
 # not depend on the coarse rows winning attention mass, which is the failure mode the
 # retention curve would show as node_spec high + ablation null.
 # gate_init 0.0 = exact identity at step 0, so it can only help if it earns its way in.
-hier_copredict_l0: false       # LEGACY MATCH (legacy had no copredict)
+hier_copredict_l0: true
 hier_copredict_levels: [1, 2, 3, 4]
 hier_copredict_gate_init: 0.0
 # "auto" -> "containing" here, because local_pack_bidirectional is true: each L0 position
@@ -259,21 +221,7 @@ final_norm_fast_path: true
 # LAST layer only, or replace it with a per-layer LayerScale/ReZero scalar that damps the
 # stream without destroying the residual identity.
 # Note the polarity: true = the CLEAN stack = NO extra norm. false = the extra norm is back.
-hier_clean_norm_stack: false   # post-norm ON, as legacy had it
-# Decouples the other half of the flag: give each refresh projection its OWN pre-norm
-# (per level up / per pair down, applied to the pooled rows) WHILE keeping the stream
-# post-norm. Not expressible before 2026-09-11. This is the whole point of the arm.
-hier_refresh_prenorm: true
-# 2026-09-12: drop the pre-norms' learnable gain/bias. The Linear immediately after can
-# represent both exactly (Linear(w*xhat+b) = (W.*w)xhat + (Wb+b_lin)), so the affine is
-# redundant by construction -- 24,576 params, and a third multiplicative scale in series
-# with the Linear and the gate. Measured on this arm at ep35: near pairs damp (gain
-# 0.75-0.82) but the TOP pair inverts -- 0:6 gain 1.336 / |bias| 0.376, ~50x the near
-# pairs, re-scaling the normalization away and acting as a bias channel (a drift already
-# recorded at ep5 and still growing). Zeroing 0:6's affine on the trained checkpoint costs
-# only 0.0031 specificity, so little is lost; with this false the route cannot form.
-# FRESH-RUN ONLY: removes parameters, so old checkpoints will not load against it.
-hier_refresh_prenorm_affine: false
+hier_clean_norm_stack: false
 
 # ONE-KNOB LEVEL COUNT. Truncates/filters every level-indexed list at once
 # (compression_ratios, overlap_ratios, num_layers, hier_node_dropout_per_level,
@@ -281,8 +229,7 @@ hier_refresh_prenorm_affine: false
 # level count can be changed without editing them one by one and silently mis-sizing the
 # model when one is missed. Counts COARSE levels: 4 gives L0..L4. null/0 = use the lists as
 # written. At N=4096 the levels are [512, 256, 128, 32, 8, 2], so L5/L6 hold 8 and 2 nodes.
-hier_level_limit: null     # LEGACY MATCH: 6 coarse levels (L0..L6). The '8 and 2
-                           # nodes' note was for N=4096; at N=32768 L5=64 and L6=16.
+hier_level_limit: 4        # 2026-09-09 run: drop L5/L6 (8 and 2 nodes at N=4096)
 
 # SIGREG latent constraint (see _compute_sigreg_loss). Sliced isotropic-Gaussian
 # goodness-of-fit per level: forbids both a collapsed direction and a constant offset, which

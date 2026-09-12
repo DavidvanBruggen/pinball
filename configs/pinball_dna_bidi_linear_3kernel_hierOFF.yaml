@@ -1,4 +1,25 @@
 # ============================================================================
+# HIERARCHY-OFF ABLATION for the REFRESH-ON arm (pairs with
+# pinball_dna_bidi_linear_3kernel.yaml). Three toggles, marked "HIER-OFF" below.
+#
+# THREE routes reach L0 here, not two. Verified 2026-09-11 by replacing every coarse row
+# with noise inside the refinement loop (scratchpad/hieroff_under_refresh.py):
+#   live arm (refreshes ON)                     max|d| = 1.4590e+00
+#   cross_level off + copredict off             max|d| = 1.3105e+00  <- NOT an ablation
+#   + hier_downward_refresh: false              max|d| = 0.0000e+00  <- genuinely off
+#   + hier_upward_refresh off as well           max|d| = 0.0000e+00  (no further effect)
+#
+# UPWARD REFRESH DELIBERATELY LEFT ON: it only writes L0 -> coarse, so with nothing reading
+# coarse it cannot affect the output (proved by the last row above), while keeping its
+# projections allocated and its compute in the step -- so params and wallclock stay closer
+# to the full arm than switching it off would.
+#
+# Same three confounds as the classic ablation, see that file: copredict params absent
+# (-4.2M), coarse levels computed with zero gradient, and local_window_dropout inert because
+# _hier_node_keep is only reachable from the packed path (already 0.0 in this arm, so moot).
+# ============================================================================
+
+# ============================================================================
 # LEGACY-MATCH + REFRESH PRE-NORM ARM  (2026-09-11)
 #
 # The cell nobody has run. Evidence that points here, all measured:
@@ -123,7 +144,7 @@ unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0
-dropout: 0.3
+dropout: 0.1
 # Per-level DropNode. Index i = level i; L0 is pinned to 0.0 whatever this says. Level sizes
 # at 4096 are L1 512, L2 256, L3 128, L4 32, L5 8, L6 2 -- dropping 10% of a 2-row level is a
 # 50%-of-the-level event, so the top levels get none.
@@ -153,7 +174,7 @@ upper_seed_gate_init: 1.0
 hier_upward_refresh: true      # LEGACY MATCH (was false)
 hier_upward_refresh_every: 1
 hier_upward_refresh_gate_init: 0.1
-hier_downward_refresh: true    # LEGACY MATCH (was false)
+hier_downward_refresh: false   # HIER-OFF route 3 (coarse -> L0 gather) -- the dominant one
 hier_downward_refresh_every: 1
 hier_downward_refresh_gate_init: 0.1
 hier_refresh_compile: true
@@ -264,16 +285,6 @@ hier_clean_norm_stack: false   # post-norm ON, as legacy had it
 # (per level up / per pair down, applied to the pooled rows) WHILE keeping the stream
 # post-norm. Not expressible before 2026-09-11. This is the whole point of the arm.
 hier_refresh_prenorm: true
-# 2026-09-12: drop the pre-norms' learnable gain/bias. The Linear immediately after can
-# represent both exactly (Linear(w*xhat+b) = (W.*w)xhat + (Wb+b_lin)), so the affine is
-# redundant by construction -- 24,576 params, and a third multiplicative scale in series
-# with the Linear and the gate. Measured on this arm at ep35: near pairs damp (gain
-# 0.75-0.82) but the TOP pair inverts -- 0:6 gain 1.336 / |bias| 0.376, ~50x the near
-# pairs, re-scaling the normalization away and acting as a bias channel (a drift already
-# recorded at ep5 and still growing). Zeroing 0:6's affine on the trained checkpoint costs
-# only 0.0031 specificity, so little is lost; with this false the route cannot form.
-# FRESH-RUN ONLY: removes parameters, so old checkpoints will not load against it.
-hier_refresh_prenorm_affine: false
 
 # ONE-KNOB LEVEL COUNT. Truncates/filters every level-indexed list at once
 # (compression_ratios, overlap_ratios, num_layers, hier_node_dropout_per_level,
@@ -329,7 +340,7 @@ qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
 local_attn_windows: [128, 128, 128, 128, 128, 128, 128]
 l0_local_window: 128
 
-local_pack_cross_level: true
+local_pack_cross_level: false  # HIER-OFF route 1 (packed window)
 local_pack_query_levels: [0, 1, 2, 3, 4, 5, 6]   # MUST cover every level
 local_pack_level_bias: true
 local_pack_coarse_lane: true
