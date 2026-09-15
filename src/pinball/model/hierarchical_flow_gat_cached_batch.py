@@ -173,7 +173,73 @@ def _build_node_pos_local_from_offsets(
     return node_pos_local
 
 
-_LATENT_EXIT_NORM_MEMBERS = ("aux", "predaux", "sigreg")
+class _PCPerOffsetDecoder(nn.Module):
+    """Parent -> its OWN children, one distinct prediction per child offset.
+
+    This is the generative map predictive coding actually needs. The earlier form applied a
+    single H->H projection to a parent, so every child of that parent received the SAME
+    prediction -- and the only way to drive that error to zero is to make the children
+    identical. Measured: the loss fell 3.0 -> 0.04 on text, which is what falling into that
+    degenerate minimum looks like, not what learning looks like.
+
+    With a per-offset map, zero loss is reachable WITH distinct children, so the incentive to
+    flatten them disappears. Low-rank keeps it affordable: a shared H->r bottleneck per pair
+    and an r->H map per offset, so cost is H*r + comp*r*H instead of comp*H*H (1.33M instead
+    of 14.2M at H=768, comp=[16,4,4]).
+    """
+
+    def __init__(self, hidden: int, comp: int, rank: int):
+        super().__init__()
+        self.comp = int(comp)
+        self.rank = int(rank)
+        self.down = nn.Linear(hidden, self.rank, bias=False)
+        self.up = nn.Parameter(torch.empty(self.comp, hidden, self.rank))
+        nn.init.kaiming_uniform_(self.up, a=5 ** 0.5)
+        self.bias = nn.Parameter(torch.zeros(self.comp, hidden))
+
+    def forward(self, parent_feats: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+        """parent_feats [E, H] (one row per child-parent EDGE), offsets [E] -> [E, H].
+
+        Grouped by offset rather than gathering `up` per edge: gathering would materialise
+        [E, H, r], which is 4.3e9 elements on the DNA arm. Grouping costs one small matmul
+        per offset (comp <= 16) and never exceeds [E, H].
+        """
+        v = self.down(parent_feats)                       # [E, r]
+        # ONE einsum over all offsets, then pick each edge's own. The obvious alternative --
+        # loop the comp offsets and mask -- costs comp tiny matmuls plus comp index_puts per
+        # call and is launch-bound, not FLOP-bound: measured +51.8% on the step at comp
+        # 16/4/4. Gathering `up` per edge instead would materialise [E, H, r], which is 4.3e9
+        # elements on the DNA arm, so the all-offsets form is the affordable middle.
+        allo = torch.einsum("er,ohr->eoh", v, self.up.to(v.dtype))   # [E, comp, H]
+        allo = allo + self.bias.to(v.dtype).unsqueeze(0)
+        return allo.gather(
+            1, offsets.view(-1, 1, 1).expand(-1, 1, allo.shape[-1])).squeeze(1)
+
+    def forward_by_parent(self, parent_feats: torch.Tensor, parent_row: torch.Tensor,
+                          offsets: torch.Tensor) -> torch.Tensor:
+        """Same result, but decode each PARENT once and index per edge.
+
+        With overlapping windows a parent appears in `comp` or more edges, so decoding per
+        edge repeats the same work; here the einsum runs over unique parents ([P, comp, H])
+        and every edge is a gather. Cheaper whenever E > P, which is the normal case.
+        """
+        v = self.down(parent_feats)                                   # [P, r]
+        allo = torch.einsum("pr,ohr->poh", v, self.up.to(v.dtype))     # [P, comp, H]
+        allo = allo + self.bias.to(v.dtype).unsqueeze(0)
+        return allo[parent_row, offsets]
+
+
+def _pc_head_auto(hidden: int) -> "nn.Module":
+    """Dedicated predictive-coding head for a pair with no downward projection to reuse.
+
+    Two layers, matching hier_aux's jepa_mlp predictor shape: a single linear map can be
+    absorbed into the levels' own projections, which lets the pair satisfy the PC error by
+    reshaping representations rather than by learning a generative map.
+    """
+    return nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, hidden))
+
+
+_LATENT_EXIT_NORM_MEMBERS = ("aux", "predaux", "sigreg", "pc")
 
 
 def _resolve_latent_exit_norm(value: Union[str, Sequence[str], None]) -> frozenset:
@@ -2736,6 +2802,113 @@ class HierarchicalFlowGAT(nn.Module):
         # objective one timescale up. Unlike the reconstruction aux (which rewards summarizing
         # the PAST, i.e. copying scores), a summary only scores here by being PREDICTIVE.
         # Training-only loss; the forward pass is untouched (no leak surface).
+        # PREDICTIVE CODING (hier_pc): true top-down PC over the hierarchy. Level l+1 predicts
+        # level l's own features through the DOWNWARD refresh projection, and the error
+        # ||x(l) - W(l) x(l+1)||^2 is added to the objective. Unlike hier_aux/hier_predaux the
+        # target is NOT a detached pooled summary -- it is the child's live representation, and
+        # the chain is anchored at the bottom by whatever task loss already exists (coverage on
+        # DNA, CE on text). That anchor is what makes it collapse-free without SIGReg: the task
+        # forces L0 to vary with position, so L1 must vary to predict L0, L2 to predict L1, and
+        # so on transitively. Contrast the JEPA-style aux, whose target is a free learned
+        # representation that both sides can drift to a constant -- the reason SIGReg exists.
+        #
+        # Note the irreducible floor: all children of a parent share one prediction, so
+        # within-window variance can never be explained. That is the coarse level correctly
+        # predicting the window mean, not a failure.
+        hier_pc_enable: bool = False,
+        lambda_hier_pc: float = 0.05,
+        hier_pc_pairs: Optional[List[str]] = None,  # None = every adjacent (l, l+1)
+        # mse_norm, NOT mse: PC needs magnitude sensitivity (cosine discards exactly the signal
+        # it runs on), but raw mse on unnormalised features is unbounded and tracks feature-norm
+        # growth quadratically -- that is what made the original mse aux blow up 0.1 -> 20.
+        hier_pc_loss_mode: str = "mse_norm",        # mse | mse_norm | cosine
+        hier_pc_detach_target: bool = False,        # TRUE PC is joint; True gives the JEPA variant
+        # auto            reuse a downward projection where one exists for the pair, allocate
+        #                 a dedicated head where it does not. Lets the PC loss be measured on
+        #                 an ADJACENT CHAIN without rewiring the forward's downward path,
+        #                 which above 4 levels is the 0:m star.
+        # reuse_downward  reuse only; RAISES if a pair has no projection
+        # linear | mlp    dedicated heads for every pair; the forward is untouched
+        # per_offset      THE CORRECT PC DECODER: parent -> one distinct prediction per child
+        #                 offset, low-rank (see _PCPerOffsetDecoder). Default.
+        # auto            reuse a downward projection where one exists, allocate elsewhere.
+        #                 DEGENERATE for PC: one prediction shared by all of a parent's
+        #                 children, so zero loss requires making the children identical.
+        #                 Kept only to reproduce the arms measured before 2026-09-14.
+        # reuse_downward  reuse only; RAISES if a pair has no projection. Same degeneracy.
+        # linear | mlp    dedicated H->H heads. Same degeneracy.
+        hier_pc_predictor: str = "per_offset",
+        hier_pc_rank: int = 64,           # bottleneck for the per-offset decoder
+        # CAUSAL PAIRING. On an AR model, "parent reconstructs its own children" is nearly
+        # empty: a node's ar_time is its window END, so the filter keeps only children at or
+        # after that end -- measured 1080 -> 128 edges with 98% at a single offset. Shift the
+        # target forward instead, so a CLOSED parent predicts the children of a LATER window.
+        # That is the staggered read the forward already uses (hier_downward_refresh gathers
+        # the most-recent CLOSED coarse node), it exercises every offset, and it makes the
+        # objective genuine forecasting rather than reconstruction.
+        #   "auto" -> shift by ceil(comp/stride) windows when hier_ar_enable, else 0 (bidi
+        #             models need no shift: nothing is filtered and all offsets are used)
+        #   0      -> never shift;  N -> shift by N windows
+        #   [a, b] -> BOTH terms, averaged (e.g. [0, 2] = reconstruct own window AND forecast)
+        hier_pc_causal_horizon: Union[str, int, Sequence[int]] = "auto",
+        # DETACH THE HORIZON-0 TARGET? Default NO, because classical PC says no.
+        # In Rao-Ballard / free-energy PC the error eps_l = x_l - g(x_{l+1}) updates BOTH sides:
+        # x_{l+1} learns to predict, and x_l moves toward the top-down prediction. That downward
+        # influence is the mechanism. Detaching every target leaves a stack of independent
+        # autoencoders in which level l+1's error never reaches level l.
+        # What prevents collapse in PC is the CLAMP AT THE SENSORY LEVEL, and that clamp already
+        # exists here and is not this flag: hier_pc_l0_target: input captures token_embeds
+        # .detach(), so the 0:1 target is fixed unconditionally. This flag therefore only ever
+        # touches the INTERMEDIATE pairs (1:2, 2:3, ...) -- exactly where PC wants attachment.
+        # The measured L1 collapse (participation 1.0, top-1 0.998) under attached targets came
+        # from horizon 2, where L1's own downward job was NOT working (0:1 pinned at 1.004, the
+        # mean predictor, because a 16-token-ahead forecast is near-impossible). The eps_0 term
+        # that should pin L1 in place was effectively absent, so the attached eps_1 term was free
+        # to collapse it -- evidence against the HORIZON, not against attachment. At horizon 0
+        # the job is achievable by construction (the parent pooled those children).
+        # Set true as the one-key fallback if L1 goes rank-1 again with the anchor working; it
+        # also removes the "child pushed toward a value derived from its own future" pressure,
+        # which is a mild smoothing force, not a causal leak (the forward's masking is separate).
+        hier_pc_own_window_detach: bool = False,
+        # CENTRE THE mse_norm DENOMINATOR. mse_norm divides by the target's raw second moment,
+        # which includes the constant every node of a level shares -- so INFLATING that constant
+        # lowers the loss for free. Measured drift: bias/content at L0 went 1.48 -> 3.58 over
+        # training. Centring divides by the target's VARIANCE instead, which (a) removes that
+        # incentive, (b) makes 1.0 mean "no better than predicting the mean", and (c) stops the
+        # coarse pairs being silently down-weighted by their own bias (content is 38% of
+        # magnitude at L0 but only 2.5% at L2, so they currently enter the objective ~15x
+        # weaker for no principled reason). Both pred and target shift by the same vector, so
+        # the NUMERATOR is unchanged -- this is a reweighting, not a different objective.
+        # Only affects loss_mode mse_norm. Runs before this flag are not comparable on the
+        # value of the PC loss (the ranking of a run against its own control is unaffected).
+        hier_pc_center_target: bool = True,
+        # PREDICT TOKENS, NOT FEATURES, FOR THE L0 PAIR. The 0:1 pair asks one parent to
+        # reproduce comp=16 children whose effective rank is ~46 -- roughly 733 dimensions of
+        # information into a 768-dim vector, ~95% of capacity, while that vector also serves the
+        # forward pass. Measured consequence: 0:1 sits exactly at the mean predictor (0.997-1.003)
+        # at every lambda that does not wreck L0. The coarse pairs ask for ~8% of capacity and
+        # learn fine. Scoring L0 in TOKEN space instead needs ~250 bits rather than 733 continuous
+        # dimensions, and the target becomes DATA -- so that pair cannot be satisfied by flattening
+        # the representation, which may also be what drives L1 to rank-1.
+        # NOTE the reported 0:1 value becomes CROSS-ENTROPY IN NATS, not an mse_norm ratio:
+        # ~10.8 = uniform over the vocabulary, ~7 = unigram. Not comparable to the coarse pairs.
+        # WHAT THE LOWEST PAIR PREDICTS.
+        #   "features" : refined L0 -- the original formulation. Self-referential: the model can
+        #                satisfy it by making L0 easier to predict, and the capacity ask is large
+        #                (comp 16 x L0's effective rank ~46 = ~733 dims into 768, ~95%).
+        #   "input"    : the CLAMPED input representation the hierarchy was built from -- token
+        #                embeddings for text, the CNN/UNet features for the DNA host, captured in
+        #                _get_embeddings and DETACHED. This is the classic PC bottom: x(0) is the
+        #                observation, not an internal state. It keeps the chain LEVEL-TO-LEVEL
+        #                (unlike hier_pc_l0_ce, which predicts tokens from L1 and so stops
+        #                constraining L1 against L0 at all) while removing the self-reference.
+        #                Measured bonus: the input representation is LOWER RANK than refined L0
+        #                (token embeddings 16-25 participation vs L0's 46-51), so the capacity ask
+        #                drops from ~733 to ~400 of 768.
+        hier_pc_l0_target: str = "features",   # features | input
+        hier_pc_l0_ce: bool = False,
+        hier_pc_l0_ce_chunk: int = 512,   # rows per logits chunk; bounds the [E, vocab] tensor
+        hier_pc_level_weights: Optional[List[float]] = None,
         hier_predaux_enable: bool = False,
         lambda_hier_predaux: float = 0.05,
         hier_predaux_levels: Optional[List[int]] = None,  # default [1,2,3]; clipped to coarse levels
@@ -4521,6 +4694,163 @@ class HierarchicalFlowGAT(nn.Module):
             )
             logger.info("Per-layer downward refresh enabled for pairs %s (every %d layer(s), gate init %.3g).",
                         pair_keys, self.hier_downward_refresh_every, float(hier_downward_refresh_gate_init))
+
+        # ----- predictive coding over the hierarchy -----
+        self.hier_pc_enable = bool(hier_pc_enable)
+        self.lambda_hier_pc = float(lambda_hier_pc)
+        self.hier_pc_detach_target = bool(hier_pc_detach_target)
+        _pc_mode = str(hier_pc_loss_mode).lower()
+        if _pc_mode not in {"mse", "mse_norm", "nmse", "cosine"}:
+            logger.warning("Unknown hier_pc_loss_mode='%s'; falling back to 'mse_norm'", hier_pc_loss_mode)
+            _pc_mode = "mse_norm"
+        self.hier_pc_loss_mode = _pc_mode
+        self.hier_pc_predictor = str(hier_pc_predictor).lower()
+        self.hier_pc_center_target = bool(hier_pc_center_target)
+        self.hier_pc_own_window_detach = bool(hier_pc_own_window_detach)
+        self.hier_pc_l0_target = str(hier_pc_l0_target).lower()
+        if self.hier_pc_l0_target not in ("features", "input"):
+            logger.warning("Unknown hier_pc_l0_target=%r; using 'features'", hier_pc_l0_target)
+            self.hier_pc_l0_target = "features"
+        self._pc_input_feats: Optional[torch.Tensor] = None
+        self.hier_pc_l0_ce = bool(hier_pc_l0_ce)
+        self.hier_pc_l0_ce_chunk = int(hier_pc_l0_ce_chunk)
+        self._pc_token_ids: Optional[torch.Tensor] = None
+        self._last_hier_pc_loss: Optional[torch.Tensor] = None
+        self.hier_pc_pair_keys: List[str] = []
+        self.hier_pc_pair_weights: Dict[str, float] = {}
+        if self.hier_pc_enable:
+            # The PC term rides the _last_hier_aux_loss channel so hosts need no new wiring
+            # (the ChromScape notebook and train/trainer.py both already consume it). Summing
+            # two different objectives into one logged number would be untraceable, so refuse.
+            if bool(use_aux_loss):
+                raise ValueError(
+                    "hier_pc_enable and use_aux_loss are both set. The PC term reuses the "
+                    "_last_hier_aux_loss channel, so enabling both would silently sum two "
+                    "different objectives into one logged value. Turn off use_aux_loss.")
+            if hier_pc_pairs is None:
+                # TRUE top-down PC is a CHAIN: L0<-L1<-L2<-... Each level predicts the one
+                # directly below, and the chain terminates in the task-anchored L0. Do NOT
+                # quietly substitute the 0:m star here -- that is a different model (every
+                # level predicting L0 directly), and the difference is the user's to choose.
+                keys = [f"{l}:{l + 1}" for l in range(int(num_levels) - 1)]
+            else:
+                keys = []
+                for p in hier_pc_pairs:
+                    q, m = (int(v) for v in str(p).split(":"))
+                    if 0 <= q < m <= int(num_levels) - 1:
+                        keys.append(f"{q}:{m}")
+            if self.hier_pc_predictor == "per_offset":
+                # comp/stride follow the SAME window rule as _pooled_child_window_means:
+                # for pair (l, l+1) the parent level is l+1, so index the ratios by l.
+                self.hier_pc_rank = int(hier_pc_rank)
+                self.hier_pc_comp: Dict[str, int] = {}
+                self.hier_pc_stride: Dict[str, int] = {}
+                self.hier_pc_horizon: Dict[str, Tuple[int, ...]] = {}
+                dec = {}
+                for k in keys:
+                    lo_l = int(k.split(":")[0])
+                    comp = int(self.compression_ratios[lo_l])
+                    stride = max(1, int(comp * (1 - self.overlap_ratios[lo_l])))
+                    self.hier_pc_comp[k] = comp
+                    self.hier_pc_stride[k] = stride
+                    if isinstance(hier_pc_causal_horizon, str):
+                        if str(hier_pc_causal_horizon).lower() == "auto":
+                            # first window that starts at/after this one ENDS
+                            hs = (-(-comp // stride) if bool(hier_ar_enable) else 0,)
+                        else:
+                            hs = (0,)
+                    elif isinstance(hier_pc_causal_horizon, (list, tuple)):
+                        hs = tuple(sorted({int(v) for v in hier_pc_causal_horizon}))
+                    else:
+                        hs = (int(hier_pc_causal_horizon),)
+                    if any(h < 0 for h in hs):
+                        raise ValueError(f"hier_pc_causal_horizon must be >= 0, got {hs}")
+                    self.hier_pc_horizon[k] = hs
+                    dec[k] = _PCPerOffsetDecoder(self.hidden_dim, comp, self.hier_pc_rank)
+                self.hier_pc_decoder = nn.ModuleDict(dec)
+                logger.info(
+                    "hier_pc predictor=per_offset rank=%d: %s (+%s params). Each parent "
+                    "predicts its children INDIVIDUALLY, so low loss no longer requires "
+                    "identical children.", self.hier_pc_rank,
+                    {k: f"comp{self.hier_pc_comp[k]}/stride{self.hier_pc_stride[k]}"
+                        f"/h{','.join(str(h) for h in self.hier_pc_horizon[k])}"
+                        for k in keys},
+                    f"{sum(p.numel() for p in self.hier_pc_decoder.parameters()):,}")
+            elif self.hier_pc_predictor == "auto":
+                # Reuse what exists, allocate the rest. Keeps the PC loss on the requested
+                # topology (an adjacent chain by default) while leaving the forward's downward
+                # wiring alone -- those are separate questions and rewiring the forward is its
+                # own experiment. Note the consequence: pairs that get a fresh head do NOT
+                # train the existing downward projections, so on a 0:m-wired model only the
+                # 0:1 link trains a live wire. If reviving the measured-dead downward wires is
+                # the goal, set hier_pc_pairs to the 0:m list instead.
+                have = set(getattr(self, "downward_refresh_proj", {}) or {})
+                self._hier_pc_reused = [k for k in keys if k in have]
+                alloc = [k for k in keys if k not in have]
+                if alloc:
+                    self.hier_pc_proj = nn.ModuleDict({k: _pc_head_auto(self.hidden_dim) for k in alloc})
+                logger.info(
+                    "hier_pc predictor=auto: reusing downward_refresh_proj for %s, dedicated "
+                    "heads for %s (+%s params).", self._hier_pc_reused, alloc,
+                    f"{sum(p.numel() for p in self.hier_pc_proj.parameters()):,}" if alloc else "0")
+            elif self.hier_pc_predictor == "reuse_downward":
+                # The whole point is to train the existing downward projections -- the
+                # generative direction measured inert (gates 0.1 -> 0.004). Drop pairs that
+                # have no projection rather than silently scoring zero for them.
+                have = set(getattr(self, "downward_refresh_proj", {}) or {})
+                missing = [k for k in keys if k not in have]
+                if missing:
+                    # RAISE, never skip. Above 4 levels the downward refresh defaults to the
+                    # 0:m pairs only (coarse<-coarse measured dead), so silently dropping the
+                    # missing links would reduce a 6-link chain to the single 0:1 pair and
+                    # leave levels 2+ with no PC pressure at all -- an arm that looks like it
+                    # ran the experiment but did not.
+                    raise ValueError(
+                        f"hier_pc: no downward_refresh_proj for pairs {missing} "
+                        f"(available {sorted(have)}). PC would silently train only "
+                        f"{[k for k in keys if k in have]}. Fix by EITHER setting "
+                        f"hier_downward_refresh_pairs to include {missing} (same projection "
+                        f"count at this level count, but it rewires the forward's downward "
+                        f"path), OR hier_pc_predictor='linear'/'mlp' for dedicated PC heads "
+                        f"(leaves the forward untouched but does not train the existing "
+                        f"downward wires), OR set hier_pc_pairs explicitly to accept a "
+                        f"different topology.")
+            else:
+                self.hier_pc_proj = nn.ModuleDict(
+                    {k: (nn.Linear(self.hidden_dim, self.hidden_dim)
+                         if self.hier_pc_predictor == "linear"
+                         else _pc_head_auto(self.hidden_dim)) for k in keys})
+            self.hier_pc_pair_keys = keys
+            if hier_pc_level_weights:
+                w = [float(v) for v in hier_pc_level_weights]
+                self.hier_pc_pair_weights = {
+                    k: (w[i] if i < len(w) else 1.0) for i, k in enumerate(keys)}
+            # The PC term is added into _last_hier_aux_loss, and train/trainer.py scales that
+            # channel by model.lambda_hier_aux. Point it at lambda_hier_pc so the config key
+            # that names this objective is the one that actually weights it. (The ChromScape
+            # notebook multiplies by its own hier_aux_weight variable -- set that to the same
+            # value there; configure_hier_aux_loss writes it back onto the model anyway.)
+            self.lambda_hier_aux = float(self.lambda_hier_pc)
+            if bool(hier_ar_enable) and bool(hier_aux_ar_strict):
+                # MEASURED 2026-09-14 on the causal text arm: strict filtering zeroes the PC
+                # loss exactly (2.794892 -> 0.000000). A node's ar_time is its WINDOW END, so a
+                # child's own parent always has parent_time == child_time and `parent_time <
+                # child_time` drops every pair. Non-strict (<=) is the correct filter here and
+                # is still leak-free: it keeps parents whose window ENDS at the child and drops
+                # any window reaching past it. Strict is not "safer", it is inert.
+                logger.warning(
+                    "hier_pc: hier_ar_enable and hier_aux_ar_strict are BOTH on. Strict AR "
+                    "filtering drops every child/parent pair (a parent's ar_time is its window "
+                    "end, so it is never strictly before its own child) and the PC loss will be "
+                    "identically 0. Set hier_aux_ar_strict: false -- non-strict is still "
+                    "leak-free, it keeps only parents whose window ends at or before the child.")
+            if not keys:
+                logger.warning("hier_pc_enable is on but no usable pairs resolved; the PC term is inert.")
+            else:
+                logger.info(
+                    "Predictive coding enabled: pairs %s, predictor=%s, loss_mode=%s, "
+                    "detach_target=%s, lambda=%.3g", keys, self.hier_pc_predictor,
+                    self.hier_pc_loss_mode, self.hier_pc_detach_target, self.lambda_hier_pc)
         if getattr(self, 'hier_upward_refresh', False) or getattr(self, 'hier_downward_refresh', False):
             self._register_load_state_dict_pre_hook(self._expand_shared_refresh_gates)
             self._register_load_state_dict_pre_hook(self._legacy_norm_stack_fallback)
@@ -4886,6 +5216,13 @@ class HierarchicalFlowGAT(nn.Module):
         
         # Apply rotary positional encoding
         #embeddings = self.rotary_pos_enc(token_embeds)
+
+        # Clamped bottom for predictive coding (hier_pc_l0_target: input). Captured HERE because
+        # this is the one place both modalities pass through: token ids for text, and the host's
+        # CNN/UNet features for DNA (feature mode projects them with the same module). Detached:
+        # it is an observation, not a target the PC term may reshape.
+        if str(getattr(self, "hier_pc_l0_target", "features")) == "input":
+            self._pc_input_feats = token_embeds.detach()
         
         return token_embeds
 
@@ -5969,6 +6306,15 @@ class HierarchicalFlowGAT(nn.Module):
         subs = [n for n in ("upward_refresh_norms", "downward_refresh_norms")
                 if getattr(self, n, None) is not None]
         if not subs:
+            return
+        # NON-AFFINE PRE-NORMS LOOK EXACTLY LIKE A LEGACY CHECKPOINT and must not trip this.
+        # With hier_refresh_prenorm_affine False the norms are allocated but hold NO
+        # parameters, so they contribute zero keys -- the very signature used below to detect
+        # a pre-2026-09-08 checkpoint. Firing here would turn the pre-norms OFF for a model
+        # that trained WITH them, i.e. score a different function (observed 2026-09-13 on the
+        # flexhier arm before this guard existed). Absence of keys is only evidence of a
+        # legacy checkpoint when this build actually expects some.
+        if not any(any(True for _ in getattr(self, n).parameters()) for n in subs):
             return
         has_norms = any(k.startswith(prefix + sub + ".") for sub in subs for k in state_dict)
         if has_norms:
@@ -8772,7 +9118,19 @@ class HierarchicalFlowGAT(nn.Module):
         low_level: int,
         high_level: int,
         predictor_key: str,
+        predictor: Optional[nn.Module] = None,
+        detach_target: Optional[bool] = None,
+        reduce_fn=None,
     ) -> torch.Tensor:
+        """Predict level `low_level` from the mean of its level-`high_level` neighbours.
+
+        The three optional arguments exist so the predictive-coding term can reuse this
+        geometry unchanged; all three default to the JEPA aux behaviour, so leaving them
+        unset is bit-identical to before they existed.
+          predictor     explicit module instead of hier_aux_pair_predictors[predictor_key]
+          detach_target None -> _hier_aux_should_detach(low_level); PC passes False (joint)
+          reduce_fn     None -> _compute_hier_aux_pair_loss (reads hier_aux_loss_mode)
+        """
         x = g.x
         node_level = getattr(g, "node_level", None)
         edge_index = getattr(g, "edge_index", None)
@@ -8781,9 +9139,11 @@ class HierarchicalFlowGAT(nn.Module):
         if node_level is None or edge_index is None:
             return torch.zeros((), device=device, dtype=x.dtype)
 
-        predictors = getattr(self, "hier_aux_pair_predictors", None)
-        if predictors is None or predictor_key not in predictors:
-            return torch.zeros((), device=device, dtype=x.dtype)
+        if predictor is None:
+            predictors = getattr(self, "hier_aux_pair_predictors", None)
+            if predictors is None or predictor_key not in predictors:
+                return torch.zeros((), device=device, dtype=x.dtype)
+            predictor = predictors[predictor_key]
 
         src, dst = edge_index
         mask_lh = (node_level[src] == int(low_level)) & (node_level[dst] == int(high_level))
@@ -8817,13 +9177,306 @@ class HierarchicalFlowGAT(nn.Module):
             return torch.zeros((), device=device, dtype=x.dtype)
 
         pred_context = agg[low_mask] / cnt[low_mask].clamp_min(1.0)
-        predictor = predictors[predictor_key]
         pred = predictor(pred_context)
         target = x[low_mask]
-        if self._hier_aux_should_detach(low_level):
+        if self._hier_aux_should_detach(low_level) if detach_target is None else bool(detach_target):
             target = target.detach()
 
-        return self._compute_hier_aux_pair_loss(pred, target)
+        return (self._compute_hier_aux_pair_loss if reduce_fn is None else reduce_fn)(pred, target)
+
+    # ------------------------------------------------------------------ predictive coding
+    def _compute_pc_pair_reduction(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Reduction for the PC error, reading hier_pc_loss_mode (NOT hier_aux_loss_mode)."""
+        mode = str(getattr(self, "hier_pc_loss_mode", "mse_norm")).lower()
+        if mode in {"mse_norm", "nmse"}:
+            sq_err = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
+            ref = target
+            if bool(getattr(self, "hier_pc_center_target", True)) and target.shape[0] > 1:
+                # divide by CONTENT variance, not raw magnitude -- see hier_pc_center_target
+                ref = target - target.mean(dim=0, keepdim=True)
+            denom = ref.pow(2).mean(dim=-1).clamp_min(1e-8)
+            return (sq_err / denom).mean()
+        if mode == "cosine":
+            cos = F.cosine_similarity(pred, target, dim=-1, eps=1e-8)
+            return ((1.0 - cos) * 0.5).mean()
+        return F.mse_loss(pred, target, reduction="mean")
+
+    def _pc_predictor_for(self, pair_key: str):
+        """f(W(l)) for a pair -- the RAW downward projection, deliberately ungated.
+
+        The forward path multiplies this projection by downward_refresh_gates. Training the
+        PC error through the gate would make one scalar serve two masters: the task loss
+        wants it at whatever mixing weight helps, the PC loss wants it large enough to match
+        the child. Using the raw projection lets PC teach W to be a good generative map while
+        the forward path's gate stays free to decide how much of it to use.
+
+        Mirrors the forward's composition (pre-norm then projection, see the
+        downward_refresh_proj call site) so PC trains the same function the model applies.
+        """
+        mode = str(getattr(self, "hier_pc_predictor", "auto")).lower()
+        # Under "auto" the split is per-pair: a pair whose downward projection exists reuses
+        # it, the rest get dedicated heads. Dispatch on membership, not on the mode alone --
+        # keying hier_pc_proj for a reused pair is a KeyError.
+        if mode in ("linear", "mlp") or (
+                mode == "auto" and pair_key not in (getattr(self, "downward_refresh_proj", {}) or {})):
+            return self.hier_pc_proj[pair_key]
+        proj = self.downward_refresh_proj[pair_key]
+        if not self.hier_refresh_prenorm:
+            return proj
+        norm = self.downward_refresh_norms[pair_key]
+        return lambda t: proj(norm(t))
+
+    def _compute_hier_pc_pair_loss_per_offset(self, g, low_level: int, high_level: int,
+                                              pair_key: str) -> Optional[torch.Tensor]:
+        """PC error for one pair with a PER-CHILD prediction, averaged over its horizons.
+
+        Differs from the jepa-style gather in the one way that matters: the parent features are
+        NOT averaged before projection. Each (child, parent) EDGE is decoded with the child's
+        own offset inside that parent's window, and only then are a child's ~2 parent
+        predictions averaged. With overlap 0.5 the same child sits at different offsets in its
+        two parents, so collapsing them beforehand throws the distinction away -- which is
+        exactly what made the shared-projection form degenerate.
+        """
+        node_level = getattr(g, "node_level", None)
+        level_offsets = getattr(g, "level_offsets", None)
+        if node_level is None or level_offsets is None:
+            return None
+        offs = [int(o) for o in level_offsets.tolist()]
+        horizons = getattr(self, "hier_pc_horizon", {}).get(pair_key, (0,))
+        if isinstance(horizons, int):
+            horizons = (horizons,)
+        parts = []
+        for h in horizons:
+            part = self._compute_hier_pc_pair_loss_one_horizon(
+                g, int(low_level), int(high_level), pair_key, int(h), offs)
+            if part is not None:
+                parts.append(part)
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else sum(parts) / float(len(parts))
+
+    def _compute_hier_pc_pair_loss_one_horizon(self, g, low_level: int, high_level: int,
+                                               pair_key: str, horizon: int,
+                                               offs: List[int]) -> Optional[torch.Tensor]:
+        """One (pair, horizon) term.
+
+        The pairing is built from LEVEL GEOMETRY, not from ``edge_index``:
+
+        * ``horizon > 0`` -- the shifted/forecasting term. A CLOSED parent predicts the children
+          of a window ``horizon`` strides ahead, so those edges do not exist in the graph at all
+          (the forward only connects a parent to the children it pools). Leak-free by
+          construction: with ``horizon = ceil(comp/stride)`` the target window starts at or after
+          the parent window ENDS.
+        * ``horizon == 0`` -- the reconstruction term: a parent predicts the children it pooled.
+          These edges DO exist, but routing them through ``edge_index`` would put them through
+          the AR filter (``parent_ar_time <= child_ar_time``), which on a causal model keeps only
+          the last child of each window -- measured 1080 edges -> 128 with 98% at a single
+          offset, i.e. "recover the last element of a window from a summary containing it".
+          Skipping that filter costs no causality: the forward is masked on its own and this
+          decoder is never part of it, so the filter was only ever shaping the PAIRING. The
+          geometric enumeration is used instead, and every offset is exercised.
+
+        Both branches therefore share one construction, and a bidirectional model -- where the AR
+        filter never ran anyway -- gets exactly the pairs it got before.
+        """
+        x = g.x
+        node_level = g.node_level
+        device = x.device
+        comp = int(self.hier_pc_comp[pair_key])
+        stride = int(self.hier_pc_stride[pair_key])
+        n_low = offs[int(low_level) + 1] - offs[int(low_level)]
+        n_high = offs[int(high_level) + 1] - offs[int(high_level)]
+        if n_low <= 0 or n_high <= 0:
+            return None
+
+        j = torch.arange(n_high, device=device)
+        o = torch.arange(comp, device=device)
+        child_within = (j + int(horizon)).unsqueeze(1) * stride + o.unsqueeze(0)  # [n_high, comp]
+        ok = child_within < n_low
+        if not bool(ok.any()):
+            # No valid targets: the shifted window runs off the end of the level. Return
+            # None, NOT zero -- a zero is indistinguishable from a perfect score and would
+            # silently deflate the summed loss, making a pair that is not being trained at
+            # all look like the best one.
+            return None
+        parent_idx = (offs[int(high_level)] + j).unsqueeze(1).expand_as(child_within)[ok]
+        child_idx = offs[int(low_level)] + child_within[ok]
+        offset = o.unsqueeze(0).expand_as(child_within)[ok]
+
+        uniq_p, prow = torch.unique(parent_idx, return_inverse=True)
+        pred_e = self.hier_pc_decoder[pair_key].forward_by_parent(x[uniq_p], prow, offset)
+        n_nodes, hidden = x.shape
+        agg = torch.zeros(n_nodes, hidden, device=device, dtype=pred_e.dtype)
+        cnt = torch.zeros(n_nodes, 1, device=device, dtype=pred_e.dtype)
+        agg.index_add_(0, child_idx, pred_e)
+        cnt.index_add_(0, child_idx, torch.ones(child_idx.size(0), 1, device=device,
+                                                dtype=pred_e.dtype))
+        low_mask = (node_level == int(low_level)) & (cnt.squeeze(-1) > 0)
+        if not bool(low_mask.any()):
+            return None
+        pred = agg[low_mask] / cnt[low_mask].clamp_min(1.0)
+
+        ce = self._pc_l0_token_ce(pred, low_mask, offs, int(low_level))
+        if ce is not None:
+            return ce
+        target = self._pc_l0_input_target(low_mask, offs, int(low_level))
+        if target is None:
+            target = x[low_mask]
+        # A horizon-0 target is the parent's OWN window. Left ATTACHED by default: true PC lets
+        # the top-down prediction shape the level below, and the clamp that stops collapse lives
+        # at the sensory end (hier_pc_l0_target: input is a detached capture, so 0:1 is fixed
+        # whatever these flags say). This override therefore only bites on 1:2, 2:3, ...
+        detach = bool(getattr(self, "hier_pc_detach_target", False))
+        if int(horizon) == 0 and bool(getattr(self, "hier_pc_own_window_detach", True)):
+            detach = True
+        if detach:
+            target = target.detach()
+        return self._compute_pc_pair_reduction(pred, target.to(pred.dtype))
+
+    def _pc_l0_input_target(self, low_mask: torch.Tensor, offs: List[int],
+                           low_level: int) -> Optional[torch.Tensor]:
+        """The clamped input representation as the L0 pair's target (hier_pc_l0_target: input).
+
+        Returns None unless the mode is on, this pair's child level is L0, and the captured
+        features line up with the rows being scored -- in which case the caller falls back to the
+        refined-L0 target rather than silently scoring against the wrong tensor.
+        """
+        if str(getattr(self, "hier_pc_l0_target", "features")) != "input" or int(low_level) != 0:
+            return None
+        feats = getattr(self, "_pc_input_feats", None)
+        if feats is None or feats.dim() != 3:
+            return None
+        rows = low_mask.nonzero().flatten() - int(offs[0])
+        seq = feats.shape[1]
+        if rows.numel() == 0 or int(rows.max()) >= seq or int(rows.min()) < 0:
+            return None
+        return feats[0].index_select(0, rows)
+
+    def _pc_stash_token_ids(self, input_ids) -> None:
+        """Stash token ids for the L0 cross-entropy PC term (hier_pc_l0_ce).
+
+        Stashed rather than threaded through the refinement call chain, which is long and shared
+        with the image and feature paths. MUST be called from every forward that can reach the
+        PC loss -- EnhancedHierarchicalFlowGAT overrides forward, so the base implementation
+        alone leaves it None and the CE branch silently falls back to the feature objective.
+        Only set when the input really is ids: feature-mode hosts pass a float [B, T, C] tensor,
+        which must never be read as a vocabulary index.
+        """
+        self._pc_token_ids = (
+            input_ids if (bool(getattr(self, "hier_pc_l0_ce", False))
+                          and torch.is_tensor(input_ids) and input_ids.dim() == 2
+                          and not torch.is_floating_point(input_ids)) else None)
+
+    def _pc_l0_token_ce(self, pred: torch.Tensor, low_mask: torch.Tensor,
+                        offs: List[int], low_level: int) -> Optional[torch.Tensor]:
+        """Score an L0 prediction in TOKEN space: output_projection -> CE against the real ids.
+
+        Returns None unless hier_pc_l0_ce is on, this pair's child level is L0, and the forward
+        was given token ids. Chunked over rows because the logits are [rows, vocab] and vocab is
+        50k -- 2048 rows would be a 200 MB tensor per sample before autograd.
+
+        The target is DATA, so this pair cannot be satisfied by flattening the representation --
+        unlike the feature objective, whose degenerate minimum is a low-rank level.
+        """
+        if not bool(getattr(self, "hier_pc_l0_ce", False)) or int(low_level) != 0:
+            return None
+        ids = getattr(self, "_pc_token_ids", None)
+        head = getattr(self, "output_projection", None)
+        if ids is None or head is None:
+            return None
+        # rows of `pred` are the L0 nodes selected by low_mask, in node order; L0 node k is
+        # sequence position k, so the token is ids[batch0, k].
+        rows = low_mask.nonzero().flatten() - int(offs[0])
+        seq = ids.shape[-1]
+        keep = (rows >= 0) & (rows < seq)
+        if not bool(keep.any()):
+            return None
+        pred, rows = pred[keep], rows[keep]
+        tgt = ids[0].index_select(0, rows).long()
+        chunk = max(1, int(getattr(self, "hier_pc_l0_ce_chunk", 512)))
+        total, n = None, 0
+        for i in range(0, pred.shape[0], chunk):
+            pc, tc = pred[i:i + chunk], tgt[i:i + chunk]
+            lg = head(pc).float()
+            part = F.cross_entropy(lg, tc, reduction="sum")
+            total = part if total is None else total + part
+            n += tc.numel()
+        return total / max(1, n)
+
+    def _compute_hierarchy_pc_loss(self, g) -> Optional[torch.Tensor]:
+        """Top-down predictive-coding error over the hierarchy: sum_l ||x(l) - W(l) x(l+1)||.
+
+        Returns None when disabled or not training. The bottom of the chain is anchored by
+        whatever task loss the host already applies to L0, which is what keeps this from
+        collapsing -- see the hier_pc_enable docstring in __init__.
+        """
+        if not (self.training and getattr(self, "hier_pc_enable", False)):
+            return None
+        keys = getattr(self, "hier_pc_pair_keys", None)
+        if not keys:
+            return None
+        weights = getattr(self, "hier_pc_pair_weights", {}) or {}
+        total = None
+        per_offset = str(getattr(self, "hier_pc_predictor", "per_offset")).lower() == "per_offset"
+        live = []
+        for key in keys:
+            low, high = (int(v) for v in key.split(":"))
+            if per_offset:
+                loss = self._compute_hier_pc_pair_loss_per_offset(g, low, high, key)
+                if loss is None:
+                    continue
+                live.append(key)
+                w = float(weights.get(key, 1.0))
+                total = (w * loss) if total is None else (total + w * loss)
+                continue
+            loss = self._compute_hier_aux_pair_loss_jepa(
+                g, low_level=low, high_level=high, predictor_key=key,
+                predictor=self._pc_predictor_for(key),
+                detach_target=bool(getattr(self, "hier_pc_detach_target", False)),
+                reduce_fn=self._compute_pc_pair_reduction,
+            )
+            w = float(weights.get(key, 1.0))
+            live.append(key)
+            total = (w * loss) if total is None else (total + w * loss)
+        if per_offset and len(live) != len(keys) and not getattr(self, "_hier_pc_warned_empty", False):
+            self._hier_pc_warned_empty = True
+            logger.warning(
+                "hier_pc: only %s of %s pairs have targets at this sequence length (%s are "
+                "empty -- the shifted window runs off the end of the level). The summed PC "
+                "loss covers ONLY the live pairs; do not read it as all pairs scoring well. "
+                "Use a longer block_size or a smaller hier_pc_causal_horizon.",
+                live, keys, [k for k in keys if k not in live])
+        self._hier_pc_live_pairs = list(live)
+        return total
+
+    def _compute_true_batch_pc_loss(
+        self,
+        x_bnh: torch.Tensor,
+        base_ei: torch.Tensor,
+        base_nl: torch.Tensor,
+        base_lo: Optional[torch.Tensor],
+        base_ar_time: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Per-sample PC loss on the fast path, mirroring _compute_true_batch_aux_loss."""
+        from torch_geometric.data import Data
+
+        if not (self.training and getattr(self, "hier_pc_enable", False)):
+            return None
+        if not getattr(self, "hier_pc_pair_keys", None):
+            return None
+        losses = []
+        for b in range(x_bnh.size(0)):
+            g_pc = Data(x=x_bnh[b], edge_index=base_ei, node_level=base_nl)
+            if base_lo is not None:
+                g_pc.level_offsets = base_lo      # per_offset needs within-level indices
+            if base_ar_time is not None:
+                g_pc.node_ar_time = base_ar_time
+            one = self._compute_hierarchy_pc_loss(g_pc)
+            if one is not None:
+                losses.append(one)
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
 
     def _compute_hier_aux_pair_loss_mean_causal(
         self,
@@ -14829,6 +15482,26 @@ class HierarchicalFlowGAT(nn.Module):
                     base_lo=tb_lo,
                     base_ar_time=getattr(tb_graph, "node_ar_time", None),
                 )
+                # Predictive coding rides the _last_hier_aux_loss channel so no host needs new
+                # wiring (both train/trainer.py and the ChromScape notebook already consume it).
+                # The constructor refuses use_aux_loss + hier_pc_enable together, so the aux
+                # value being added to here is a structural zero whenever PC is on.
+                # Guarded at the call site, not just inside: with PC off NOTHING new runs,
+                # so the disabled path is unchanged down to the call graph (tests/test_hier_pc.py
+                # booby-traps every PC entry point and runs a forward to hold this).
+                self._last_hier_pc_loss = None
+                if getattr(self, "hier_pc_enable", False):
+                    self._last_hier_pc_loss = self._compute_true_batch_pc_loss(
+                        x_bnh=self._latent_exit_norm_apply(x_tb, "pc"),
+                        base_ei=getattr(tb_graph, "edge_index_full", tb_graph.edge_index).to(device),
+                        base_nl=tb_graph.node_level.to(device),
+                        base_lo=tb_lo,
+                        base_ar_time=getattr(tb_graph, "node_ar_time", None),
+                    )
+                if self._last_hier_pc_loss is not None:
+                    self._last_hier_aux_loss = (
+                        self._last_hier_pc_loss if self._last_hier_aux_loss is None
+                        else self._last_hier_aux_loss + self._last_hier_pc_loss)
                 self._last_hier_predaux_loss = self._compute_predictive_aux_loss(
                     self._latent_exit_norm_apply(x_tb, "predaux"), tb_lo)
                 self._last_sigreg_loss = self._compute_sigreg_loss(
@@ -15267,6 +15940,10 @@ class HierarchicalFlowGAT(nn.Module):
             self._last_hier_aux_loss = aux_loss
             self._last_hier_predaux_loss = None  # predictive aux runs on the fast path only
             self._last_sigreg_loss = None        # SIGReg likewise
+            if getattr(self, "hier_pc_enable", False) and self.training:
+                logger.warning("hier_pc_enable is on but this forward took the non-fast path; "
+                               "the PC term is INERT for this step.")
+            self._last_hier_pc_loss = None       # predictive coding likewise
 
             # 7. Reshape and Restore
             unified_graph.x = g_work.x.view(B, N, H)# if B > 1 else g_work.x.view(N, H)
@@ -15446,6 +16123,7 @@ class HierarchicalFlowGAT(nn.Module):
         reveal_target_ids: Optional[torch.Tensor] = None,
         reveal_mask: Optional[torch.Tensor] = None,
     ):
+        self._pc_stash_token_ids(input_ids)
         """
         Forward pass through the unified hierarchical graph transformer.
         

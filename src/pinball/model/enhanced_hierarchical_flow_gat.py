@@ -1689,6 +1689,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         Forward pass. Handles standard prediction and single-token imputation for generation.
         Uses the appropriate refinement style defined during init.
         """
+        self._pc_stash_token_ids(input_ids)   # hier_pc_l0_ce; this override bypasses the base forward
         # Determine batch size and sequence length early
         #print(f"Input IDs shape: {input_ids.shape}")
         if input_ids.ndim == 3:

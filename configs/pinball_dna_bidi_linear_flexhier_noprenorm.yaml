@@ -1,4 +1,62 @@
 # ============================================================================
+# UNIFIED + NO REFRESH PRE-NORM. Derived from pinball_dna_bidi_linear_flexhier.yaml
+# (itself 3kernel + local_pack_flex_union) by flipping ONE key:
+#
+#     hier_refresh_prenorm: true -> false
+#
+# THE HYPOTHESIS. The pre-norm bought stability and cost ceiling. Measured at matched
+# train fit (~0.885): legacy WITHOUT pre-norms scored 0.46333, the pre-norm arm 0.45403 --
+# so the pre-norm costs ~0.009 specificity, the largest single lever left. The bet is that
+# the unified softmax supplies the stability instead, because the additive path
+# double-counts any coarse row falling in BOTH the mixed window and the coarse lane
+# (+ln2 advantage) while the union mask dedups it exactly, removing one source of the
+# amplitude drift that fed legacy's bias channel.
+#
+# HOLD THAT LOOSELY. What was actually measured as legacy's failure is |mu|/sigma = 40.32
+# at the pinball/CNN mixing site by ep5 (two val collapses: borzoi 0.34842 at ep7, again at
+# ep13), driven by refresh writes accumulating a shared bias direction that survives
+# final_norm's per-row normalisation. The refresh writes are added AFTER the attention, so
+# deduping attention keys does not obviously touch that path. This config may well collapse.
+#
+# THE KILL CRITERION ABOVE WAS WRONG -- DO NOT REINSTATE IT. It said "cond_probe trending
+# into double digits = kill". This arm ran 1.62 (ep0) 27.8 (ep2) 133.1 (ep5) 38.9 (ep10)
+# 21.3 (ep11) 58.5 (ep15) and produced the BEST specificity of any arm tested. The ladder
+# is real movement, not probe noise (16-batch medians 42.2 @ep10 and 57.2 @ep15 land within
+# 2-8% of the single-batch draws), but it is DECOUPLED from quality: the ratio swings 6x
+# while specificity rises monotonically. Do not rank or kill arms on |mu|/sigma.
+#   Side finding: 1 of 16 val sequences drives sigma -> 0 (ratio 1e10-1e11) at BOTH epochs,
+#   while the median sequence sits at sigma 0.05-0.07. A persistent per-sequence degeneracy,
+#   probably an all-N region; same shape as the batchnorm-val-collapse site. Unidentified.
+#
+# MEASURED RESULT (specificity, eval_specificity, flex_union_failed == 0 on every row):
+#     epoch      0        5       10        11       15
+#     noprenorm  0.20600  0.39351  0.39905*  0.44926  0.45708   *cycle trough, see below
+#     legacy     0.22960  0.39174  0.44113   --       0.46333
+#     flexhier   0.21727  0.42971  0.44867   --       --
+#   noprenorm tracks LEGACY to within 0.002 at ep5 and 0.006 at ep15 -- the hypothesis holds.
+#   CAVEAT 2026-09-14: that 0.006 is a RUNNING-STATS number and it is inflated by stale
+#   BatchNorm buffers. Re-evaluated with BN on batch statistics (scratchpad/bn_test2.py),
+#   noprenorm ep15 drops 0.45708 -> 0.44821 while legacy barely moves (0.46333 -> 0.46252),
+#   so the BN-fair gap is 0.0143, not 0.006. The ep10 "trough" is likewise 60% artifact
+#   (0.39905 -> 0.42870 on batch stats). Pre-norm arms are unaffected (delta ~1e-4), so a
+#   running-stats cross-arm table is not comparable across norm stacks. Staleness is
+#   checkpoint-specific, not arm-specific -- measure it per checkpoint.
+#   flexhier (pre-norm) leads by 0.036 at ep5, then plateaus: its best val picks ep5/0.42971.
+#   THE ARMS INVERT between ep5 and ep15, so never rank this family on early epochs.
+#   The arm CYCLES: ep10 0.39905 and ep11 0.44926 are adjacent epochs, +0.050 apart. A single
+#   checkpoint is worthless here; compare best-so-far envelopes, not points.
+#   Val-loss checkpoint selection is also lossy -- it picks flexhier's ep5 over its ep10
+#   (0.42971 vs 0.44867, -0.019). Select on specificity.
+#
+# ENV: flex_attention needs pinball-cs on the Blackwell (sm_120), or ChromScape-bw on the
+# 4090 (sm_89) for scoring. ChromScape-bw on sm_120 falls back to additive on all 15 layers
+# and silently becomes the 3kernel arm -- confirm flex_union_failed == 0 before trusting it.
+#
+# CHECKPOINTS: no refresh-norm parameters at all, so _legacy_norm_stack_fallback correctly
+# does NOT fire (it returns early when the build allocates no norms). Fresh-run only.
+# ============================================================================
+
+# ============================================================================
 # 3-KERNEL EQUIVALENCE ARM (unified softmax). GENERATED FROM
 # pinball_dna_bidi_linear_3kernel.yaml on 2026-09-13 by flipping exactly ONE key:
 #
@@ -298,7 +356,7 @@ hier_clean_norm_stack: false   # post-norm ON, as legacy had it
 # Decouples the other half of the flag: give each refresh projection its OWN pre-norm
 # (per level up / per pair down, applied to the pooled rows) WHILE keeping the stream
 # post-norm. Not expressible before 2026-09-11. This is the whole point of the arm.
-hier_refresh_prenorm: true
+hier_refresh_prenorm: false     # THE TEST (was true) -- see header
 # 2026-09-12: drop the pre-norms' learnable gain/bias. The Linear immediately after can
 # represent both exactly (Linear(w*xhat+b) = (W.*w)xhat + (Wb+b_lin)), so the affine is
 # redundant by construction -- 24,576 params, and a third multiplicative scale in series
@@ -308,7 +366,7 @@ hier_refresh_prenorm: true
 # recorded at ep5 and still growing). Zeroing 0:6's affine on the trained checkpoint costs
 # only 0.0031 specificity, so little is lost; with this false the route cannot form.
 # FRESH-RUN ONLY: removes parameters, so old checkpoints will not load against it.
-hier_refresh_prenorm_affine: false
+hier_refresh_prenorm_affine: false   # MOOT here: prenorm false allocates no norms at all
 
 # ONE-KNOB LEVEL COUNT. Truncates/filters every level-indexed list at once
 # (compression_ratios, overlap_ratios, num_layers, hier_node_dropout_per_level,

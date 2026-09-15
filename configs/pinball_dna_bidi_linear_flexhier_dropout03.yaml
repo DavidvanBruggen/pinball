@@ -1,4 +1,103 @@
 # ============================================================================
+# PRE-NORM + DROPOUT 0.3. Derived from pinball_dna_bidi_linear_flexhier.yaml by
+# flipping exactly ONE key:
+#
+#     dropout: 0.1 -> 0.3
+#
+# THE QUESTION. hier_refresh_prenorm: false reproduces legacy's late climb (0.39351 @ep5,
+# 0.45708 @ep15, tracking legacy to within 0.002/0.006) but does it through a violent
+# cycling dynamic -- adjacent epochs ep10/ep11 differ by 0.050 specificity. The pre-norm
+# arm is stable and plateaus at ep5 (best val ep5, specificity 0.42971, flat 0.779-0.786
+# val Pearson from ep10 to ep16). This arm asks whether dropout can drive the same
+# escape-and-re-descend on the STABLE base, i.e. buy legacy's curve without giving up the
+# pre-norm's conditioning.
+#
+# CORRECTION 2026-09-14: an earlier version of this header printed a train-up/val-down
+# table and called the base arm "genuinely overfitting". THAT TABLE IS THE NOPRENORM RUN,
+# NOT THIS BASE, and it does not show val falling. The notebook file is reused for every
+# arm, so its saved outputs belong to whichever run last wrote it -- it was saved
+# 2026-09-14 00:00, between noprenorm's last checkpoint (09-13 23:11) and dropout03's
+# first (09-14 00:41). Check mtimes against the run dir before attributing a curve.
+#   What that table actually shows (noprenorm, Borzoi split-wide per track):
+#     epoch    10       11       12       13       14       15       16
+#     train    0.85623  0.86740  0.87352  0.87880  0.87208  0.87981  0.88279   rising
+#     valid    0.75562  0.77978  0.37877  0.75118  0.71977  0.78161  0.08453   CYCLING
+#   with val-loss blowouts at ep7 (0.9014), ep12 (2.6982) and ep16 (0.4998) against a
+#   0.376-0.391 baseline. Val PEAKS at ep15, it does not decay -- this is the cycling
+#   phenotype, the same thing the specificity trough at ep10 (0.39905) and the recovery at
+#   ep11 (0.44926) measure. It is not evidence about dropout's target.
+#
+# WHAT IS ACTUALLY KNOWN ABOUT THE BASE ARM comes from the checkpoint dir, not a notebook:
+# flexhier wrote best_model.pt at 09-13 05:16 (= ep5) and then ran on to ep15 (11:49)
+# without ever beating it. So its val best is genuinely ep5 while it kept training for ten
+# more epochs -- a plateau on the val-loss axis. Its per-epoch curve was overwritten and
+# is NOT recoverable; only ep0/5/10/15 checkpoints survive, and ep15 was left unscored
+# until now (see MEASURED RESULT below).
+#
+# WHY IT STILL MIGHT NOT WORK, stated up front so the result is honest either way:
+#   - dropout measured ~0.001 in this family, two orders below the 0.009-0.028 at stake;
+#   - dropout is CONTINUOUS noise, whereas what legacy does is a discrete escape followed
+#     by a re-descent. Cosine warm restarts are the mechanism-matched intervention;
+#     this arm is the cheap one-key test that has to be run first.
+#
+# LOWERING LR IS THE OTHER OBVIOUS KNOB AND POINTS THE WRONG WAY IN THEORY: the SGD noise
+# scale goes as lr/batch, so a LOWER lr means LESS exploration and FASTER settling into a
+# sharp, memorising minimum -- the standard result is that high lr regularises. Muon
+# weakens that intuition (orthogonalised updates, muon_lr_mult 3.0). Against the theory,
+# the repo's own 4Mb pair peaked LATER and LOWER at reduced lr (identityfix best ep2
+# val 0.382390 vs identityfix_lowerlr best ep3 val 0.378242, difference NOT verified to be
+# lr alone). Untested at 500kb. What lr CANNOT be is the cap on this arm: flexhier and
+# noprenorm share an identical lr and schedule and produce completely different curves.
+#
+# MEASURED RESULT 2026-09-14 (eval_specificity, flex_union_failed_modules == 0 every row):
+#     epoch      0        5        10       11       13       15
+#     dropout03  --       0.41762  0.42928  --       0.45120  0.44537
+#     flexhier   0.21727  0.42971  0.44867  --       --       0.43876
+#     noprenorm  0.20600  0.39351  0.39905* 0.44926  --       0.45708   *cycle trough
+#     legacy     0.22960  0.39174  0.44113  --       --       0.46333
+#
+# SELECT ON BEST, NOT ON A FIXED EPOCH -- these checkpoints fluctuate 0.05 between adjacent
+# epochs, so a fixed-epoch row is a lottery ticket. best_model.pt is the val-loss pick; its
+# EPOCH is readable from its mtime vs the influence_full_epoch_N.pt written seconds before:
+#     arm        best_model.pt   spec      best spec over scored ckpts
+#     flexhier   ep5             0.42971   ep10  0.44867   <- val froze at ep5, 10 ep stale
+#     dropout03  ep13            0.45120   ep13  0.45120
+#     noprenorm  ep15            0.45708   ep15  0.45708   <- still rising when run stopped
+#     legacy     ep15            0.46333   ep15  0.46333   <- still rising when run stopped
+#   dropout03 beats its base on EITHER selector: +0.022 on val-selected best, +0.0025 on the
+#   specificity envelope. QUOTE THE +0.0025 -- the +0.022 is inflated by flexhier's stale
+#   val pick, and val loss is not a reliable selector anywhere in this family.
+#   Beware run-dir names: the legacy row is ..._properinit_perlayerprojgate (ep0/5/10/15,
+#   best ep15). ..._legacy_match_run is a DIFFERENT 40-epoch run whose best is ep8.
+#
+# THE ARM WORKS ON THE AXIS IT WAS BUILT FOR, AND UNDERPERFORMS ON LEVEL.
+#   The base arm TURNS OVER: flexhier peaks at ep10 (0.44867) and is DOWN at ep15
+#   (0.43876, -0.010). That is the peak-at-ep5-8 failure this whole family is chasing,
+#   now measured on the specificity axis rather than inferred from val loss.
+#   dropout 0.3 DELAYS the turnover: it starts 0.012-0.019 BELOW the base at ep5/ep10,
+#   crosses it, and is still climbing at ep13 (0.45120, its envelope) -- i.e. it buys the
+#   "keeps improving longer" property. At ep15 it leads the base by +0.0066, envelope
+#   +0.0025. It does NOT reach the legacy-stack level: 0.45120 vs noprenorm 0.45708 and
+#   legacy 0.46333, and both of those were still rising at ep15 too.
+#   dropout03 also CYCLES (ep13 0.45120 > ep15 0.44537), like the legacy-stack arms and
+#   unlike the base -- so dropout reintroduced the escape behaviour, not just noise.
+#   VERDICT: pre-norm + dropout 0.3 reproduces the SHAPE but not the LEVEL. Run it past
+#   ep20 before concluding; it had not peaked when this table was taken.
+#
+# HOW TO READ IT -- THE ARMS IN THIS FAMILY INVERT:
+#   flexhier LEADS by 0.036 at ep5 and loses by ep15. DO NOT rank this arm before ep15,
+#   and compare best-so-far envelopes, not single checkpoints. Select on specificity, not
+#   val loss -- val loss picks flexhier's ep5 over its ep10 and costs 0.019. (On this arm
+#   val selection happened to HELP: it picked ep13, the envelope.)
+#
+# PARAMETER-IDENTICAL to the flexhier arm (dropout allocates nothing): 218,505,081.
+# Checkpoints are interchangeable with pinball_dna_bidi_linear_flexhier.yaml.
+#
+# RUN NAME: give the notebook a NEW checkpoint dir. Reusing the flexhier or noprenorm run
+# name overwrites their best_model.pt, and the noprenorm run is still live.
+# ============================================================================
+
+# ============================================================================
 # 3-KERNEL EQUIVALENCE ARM (unified softmax). GENERATED FROM
 # pinball_dna_bidi_linear_3kernel.yaml on 2026-09-13 by flipping exactly ONE key:
 #
@@ -158,7 +257,10 @@ unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0
-dropout: 0.1
+dropout: 0.3                    # THE ONE INTENDED DIFFERENCE from the flexhier arm
+                                # (was 0.1). Pinball backbone only -- the CNN host's
+                                # dropout_rate/attn_dropout live in the ChromScape config
+                                # module and are NOT touched by this file.
 # Per-level DropNode. Index i = level i; L0 is pinned to 0.0 whatever this says. Level sizes
 # at 4096 are L1 512, L2 256, L3 128, L4 32, L5 8, L6 2 -- dropping 10% of a 2-row level is a
 # 50%-of-the-level event, so the top levels get none.

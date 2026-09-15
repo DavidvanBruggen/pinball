@@ -3980,7 +3980,27 @@ class HierarchicalMessagePassing(MessagePassing):
                    int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0),
                    int(getattr(self, "local_pack_global_block", 0) or 0),
                    int(getattr(self, "_flex_tile_level", 0)),
-                   spec.get("flex_ring_key", ()))
+                   spec.get("flex_ring_key", ()),
+                   # The lane radius and the tier both change the mask. Neither was in the
+                   # key, so a cached BlockMask would have survived a change to either --
+                   # latent while both were fixed per config, live now that the tier clause
+                   # below is optional.
+                   int(spec.get("lane_window", 0) or 0),
+                   int(spec["top_global"]["rows"].numel()) if spec.get("top_global") else 0)
+        # TIER AS A K/V PREFIX. As a plain mask clause the tier is correct but slow: its
+        # rows are scattered through close-time order, so tier_fx[qi] & tier_fx[ki] lights
+        # isolated cells across many 64x64 blocks and the kernel pays 4096 pairs for each
+        # block holding even one. Measured at N=32768 on sm_120: 503.0 ms with the clause
+        # vs 388.5 ms without it -- 114.5 ms for what the additive path computes as a
+        # 400x400 all-to-all. Prepending the tier rows to K/V makes them CONTIGUOUS, so
+        # the tier occupies one dense strip of blocks instead of a scatter. Same device
+        # the global block already uses (flex_kv_prefix); mutually exclusive with it,
+        # since that branch owns the prefix slot and subsumes the tier's role anyway.
+        _tg_spec = spec.get("top_global", None)
+        _tier_rows = None
+        if _tg_spec is not None and spec.get("flex_kv_prefix", None) is None:
+            _tier_rows = _tg_spec["rows"]
+        _bm_key = _bm_key + (bool(_tier_rows is not None),)
         bm = spec.get("flex_block_mask") if spec.get("flex_block_mask_key") == _bm_key else None
         if bm is None:
             r = spec["flex_r_mixed"]
@@ -4006,6 +4026,31 @@ class HierarchicalMessagePassing(MessagePassing):
             # appear here or every ring key is counted twice.
             if str(spec.get("flex_ring_merge", "union")) != "union":
                 ring_wt = None
+
+            # GLOBAL TOP LEVEL as a mask clause. The additive path runs the tier as its own
+            # all-to-all flash call over spec["top_global"]["rows"] (packed row numbers) and
+            # ADDS it; under flex_union the consumer returns before that call, so without
+            # this clause turning flex_union on silently DROPS the tier -- the mechanism
+            # that buys length-independent reach. OR semantics dedup exactly: a tier row
+            # already inside the mixed window stays ONE key, where the additive path counts
+            # it twice with a +ln2 advantage.
+            # Packed-row space and indexed through r[.], so it does not depend on how the
+            # flex_* arrays are permuted.
+            # Materialised in FLEX order (tier_pk[r]) so mask_mod does a SINGLE gather.
+            # The nested form tier_pk[r[qi]] is a double gather inside the compiled mask and
+            # produces an illegal memory access on this path (measured: crashes at
+            # hidden 1024 / head_dim 64 / N=8192, clean with the clause off). Every working
+            # clause here indexes a flex-order array directly; keep it that way.
+            tier_fx = None
+            _tg = spec.get("top_global", None)
+            if _tg is not None:
+                tier_fx = spec.get("flex_tier_fx", None)
+                if tier_fx is None:
+                    _tp = torch.zeros(int(spec["num_nodes"]), dtype=torch.bool,
+                                      device=perm.device)
+                    _tp[_tg["rows"]] = True
+                    tier_fx = _tp[r].contiguous()
+                    spec["flex_tier_fx"] = tier_fx
 
             kv_pre = spec.get("flex_kv_prefix", None)
             if kv_pre is not None and in_glob is not None:
@@ -4081,22 +4126,56 @@ class HierarchicalMessagePassing(MessagePassing):
                         coarse = isc[ki] & (dc.abs() <= w_l0c)
                     return band | coarse
             else:
-                def mask_mod(b, h, qi, ki):
-                    dr = r[qi] - r[ki]
-                    band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
-                    dl = lane[qi] - lane[ki]
-                    if causal_mask:
-                        coarse = isc[qi] & isc[ki] & (dl >= 0) & (dl <= w_lane) & (dr >= 0)
-                    else:
-                        coarse = isc[qi] & isc[ki] & (dl.abs() <= w_lane)
-                    if ring_wt is not None:
-                        rk = r[ki]
-                        wt = ring_wt[ring_lvl[rk]]
-                        ring = (wt > 0) & ((ring_pos[r[qi]] - ring_pos[rk]).abs() <= wt)
+                if _tier_rows is not None:
+                    _T = int(_tier_rows.numel())
+                    _nq = int(perm.numel())
+
+                    def mask_mod(b, h, qi, ki):
+                        is_pre = ki < _T
+                        kk = (ki - _T).clamp(0, _nq - 1)      # main keys sit after the strip
+                        dr = r[qi] - r[kk]
+                        band = ((dr >= 0) & (dr <= w_mix)) if causal_mask else (dr.abs() <= w_mix)
+                        dl = lane[qi] - lane[kk]
                         if causal_mask:
-                            ring = ring & (dr >= 0)
-                        coarse = coarse | ring
-                    return band | coarse
+                            coarse = isc[qi] & isc[kk] & (dl >= 0) & (dl <= w_lane) & (dr >= 0)
+                        else:
+                            coarse = isc[qi] & isc[kk] & (dl.abs() <= w_lane)
+                        if ring_wt is not None:
+                            rk = r[kk]
+                            wt = ring_wt[ring_lvl[rk]]
+                            ring = (wt > 0) & ((ring_pos[r[qi]] - ring_pos[rk]).abs() <= wt)
+                            if causal_mask:
+                                ring = ring & (dr >= 0)
+                            coarse = coarse | ring
+                        body = band | coarse
+                        # DEDUP. A tier row is duplicated into the strip, so for a TIER query
+                        # it must arrive through the strip only or it becomes two keys with a
+                        # +ln2 advantage. Non-tier queries never see the strip, so they keep
+                        # reaching tier rows through the window/lane exactly as before --
+                        # hence the exclusion is conditioned on the query, unlike the global
+                        # block's unconditional `& ~in_glob[p]`.
+                        body = body & ~(tier_fx[qi] & tier_fx[kk])
+                        tq = tier_fx[qi]
+                        if causal_mask:
+                            tq = tq & (r[qi] >= _tier_rows[ki.clamp(0, _T - 1)])
+                        return torch.where(is_pre, tq, body)
+                else:
+                    def mask_mod(b, h, qi, ki):
+                        dr = r[qi] - r[ki]
+                        band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
+                        dl = lane[qi] - lane[ki]
+                        if causal_mask:
+                            coarse = isc[qi] & isc[ki] & (dl >= 0) & (dl <= w_lane) & (dr >= 0)
+                        else:
+                            coarse = isc[qi] & isc[ki] & (dl.abs() <= w_lane)
+                        if ring_wt is not None:
+                            rk = r[ki]
+                            wt = ring_wt[ring_lvl[rk]]
+                            ring = (wt > 0) & ((ring_pos[r[qi]] - ring_pos[rk]).abs() <= wt)
+                            if causal_mask:
+                                ring = ring & (dr >= 0)
+                            coarse = coarse | ring
+                        return band | coarse
 
             n = int(perm.numel())
             # _compile=True builds the block mask with a compiled sweep instead of
@@ -4129,7 +4208,8 @@ class HierarchicalMessagePassing(MessagePassing):
             if not (perm.is_cuda and n >= 512):
                 _bs = None
             _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
-            _nkv = n + (int(kv_pre.numel()) if kv_pre is not None else 0)
+            _nkv = n + (int(kv_pre.numel()) if kv_pre is not None else 0) \
+                     + (int(_tier_rows.numel()) if _tier_rows is not None else 0)
             try:
                 bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=_nkv,
                                        device=str(perm.device), _compile=True, **_kw)
@@ -4145,6 +4225,16 @@ class HierarchicalMessagePassing(MessagePassing):
             q_s = qp.transpose(1, 2)                                   # [B, H, N, D]
             k_s = torch.cat([kp.index_select(1, _pre), kp], 1).transpose(1, 2)
             v_s = torch.cat([vp.index_select(1, _pre), vp], 1).transpose(1, 2)
+        elif _tier_rows is not None:
+            # Permuted layout PLUS a contiguous tier strip in front of K/V. Queries are
+            # untouched (so flex_query_nodes still maps outputs), and the strip indexes the
+            # PACKED tensors -- kp/vp already carry RoPE, the level tag and node_keep, the
+            # same vectors the additive tier call gathers.
+            q_s = qp.index_select(1, perm).transpose(1, 2)
+            k_s = torch.cat([kp.index_select(1, _tier_rows),
+                             kp.index_select(1, perm)], 1).transpose(1, 2)
+            v_s = torch.cat([vp.index_select(1, _tier_rows),
+                             vp.index_select(1, perm)], 1).transpose(1, 2)
         else:
             q_s = qp.index_select(1, perm).transpose(1, 2)  # [B, H, N, D]
             k_s = kp.index_select(1, perm).transpose(1, 2)

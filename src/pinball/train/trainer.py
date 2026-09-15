@@ -1139,6 +1139,19 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
             if predaux is not None:
                 loss = loss + model.lambda_hier_predaux * predaux.mean()
 
+            # SIGReg: a latent-distribution constraint on the hierarchy. It was computed on every
+            # forward and DISCARDED -- no trainer read `_last_sigreg_loss` -- so sigreg_enable:
+            # true cost compute and changed nothing. Wired 2026-09-14 because predictive coding
+            # collapses the COARSE levels to rank-1 at ANY lambda: measured L1 participation
+            # 38.6 -> 1.0 with PC on, at both lambda 0.25 and 0.05, the latter being a weight at
+            # which PC learns nothing (its 0:1 loss sits exactly at the mean predictor). L0 is
+            # anchored by CE and survives at low lambda; L1 has only a transitive anchor and does
+            # not, so an anti-collapse term is part of the method here, not a patch for an
+            # over-strong lambda. sigreg_include_l0 defaults false, i.e. coarse levels only.
+            sigreg = getattr(model, "_last_sigreg_loss", None)
+            if sigreg is not None:
+                loss = loss + model.lambda_sigreg * sigreg.mean()
+
             # torch.cuda.reset_peak_memory_stats(device)
             # torch.cuda.synchronize(device)
             # torch.cuda.empty_cache()
@@ -3786,6 +3799,17 @@ class EnhancedHierarchicalTrainer:
         if aux is not None and lambda_hier_aux is not None:
             loss = loss + float(lambda_hier_aux) * aux.mean()
 
+        # SIGReg, same fallback pattern (rationale at the first consumption site). These image
+        # paths do not consume predaux either -- pre-existing, left as is.
+        sigreg = getattr(model_ref, "_last_sigreg_loss", None)
+        if sigreg is None and model_mod is not None:
+            sigreg = getattr(model_mod, "_last_sigreg_loss", None)
+        lambda_sigreg = getattr(model_ref, "lambda_sigreg", None)
+        if lambda_sigreg is None and model_mod is not None:
+            lambda_sigreg = getattr(model_mod, "lambda_sigreg", None)
+        if sigreg is not None and lambda_sigreg is not None:
+            loss = loss + float(lambda_sigreg) * sigreg.mean()
+
         self._set_image_loss_stats(float(loss.detach().item()))
         scaled_loss = loss / max(1, int(self.gradient_accumulation_steps))
         if self.mixed_precision and self.scaler is not None:
@@ -3897,6 +3921,17 @@ class EnhancedHierarchicalTrainer:
             lambda_hier_aux = getattr(model_mod, "lambda_hier_aux", None)
         if aux is not None and lambda_hier_aux is not None:
             loss = loss + float(lambda_hier_aux) * aux.mean()
+
+        # SIGReg, same fallback pattern (rationale at the first consumption site). These image
+        # paths do not consume predaux either -- pre-existing, left as is.
+        sigreg = getattr(model_ref, "_last_sigreg_loss", None)
+        if sigreg is None and model_mod is not None:
+            sigreg = getattr(model_mod, "_last_sigreg_loss", None)
+        lambda_sigreg = getattr(model_ref, "lambda_sigreg", None)
+        if lambda_sigreg is None and model_mod is not None:
+            lambda_sigreg = getattr(model_mod, "lambda_sigreg", None)
+        if sigreg is not None and lambda_sigreg is not None:
+            loss = loss + float(lambda_sigreg) * sigreg.mean()
 
         self._set_image_loss_stats(float(loss.detach().item()))
         scaled_loss = loss / max(1, int(self.gradient_accumulation_steps))
@@ -4056,6 +4091,17 @@ class EnhancedHierarchicalTrainer:
             lambda_hier_aux = getattr(model_mod, "lambda_hier_aux", None)
         if aux is not None and lambda_hier_aux is not None:
             loss = loss + float(lambda_hier_aux) * aux.mean()
+
+        # SIGReg, same fallback pattern (rationale at the first consumption site). These image
+        # paths do not consume predaux either -- pre-existing, left as is.
+        sigreg = getattr(model_ref, "_last_sigreg_loss", None)
+        if sigreg is None and model_mod is not None:
+            sigreg = getattr(model_mod, "_last_sigreg_loss", None)
+        lambda_sigreg = getattr(model_ref, "lambda_sigreg", None)
+        if lambda_sigreg is None and model_mod is not None:
+            lambda_sigreg = getattr(model_mod, "lambda_sigreg", None)
+        if sigreg is not None and lambda_sigreg is not None:
+            loss = loss + float(lambda_sigreg) * sigreg.mean()
 
         self._set_image_loss_stats(float(loss.detach().item()))
         scaled_loss = loss / max(1, int(self.gradient_accumulation_steps))
