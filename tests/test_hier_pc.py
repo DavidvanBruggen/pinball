@@ -406,6 +406,42 @@ def test_own_window_pairing_uses_every_offset_and_honours_the_attach_flag():
           f"(flag clamps them), loss {float(pc):.5f}")
 
 
+def test_center_pred_makes_the_score_offset_invariant():
+    """hier_pc_center_pred: a shared mean offset must stop inflating the loss.
+
+    The default centres only the denominator, so predicting the exact per-batch mean scores
+    1.000 while the SAME prediction shifted by 1 sd scores ~2.0 and by 2 sd ~5.0. A level whose
+    per-batch mean drifts is then pinned above 1.0 -- worse than a predictor the bias term could
+    reach for free -- and no lambda can lift that. With the flag on, the constant cancels.
+    """
+    import torch as _t
+    _t.manual_seed(0)
+    tgt = _t.randn(256, 64) * 0.8 + 3.0
+
+    class _M:
+        hier_pc_loss_mode = "mse_norm"
+        hier_pc_center_target = True
+        hier_pc_center_pred = False
+    from pinball.model.hierarchical_flow_gat_cached_batch import HierarchicalFlowGAT
+    red = HierarchicalFlowGAT._compute_pc_pair_reduction
+
+    mean_pred = tgt.mean(dim=0, keepdim=True).expand_as(tgt)
+    base = float(red(_M, mean_pred, tgt))
+    assert abs(base - 1.0) < 0.02, f"mean predictor should score 1.0, got {base}"
+
+    drift = mean_pred + 2.0 * tgt.std()
+    off_default = float(red(_M, drift, tgt))
+    assert off_default > 4.0, f"default form must be offset-SENSITIVE, got {off_default}"
+
+    _M.hier_pc_center_pred = True
+    off_inv = float(red(_M, drift, tgt))
+    same = float(red(_M, mean_pred, tgt))
+    assert abs(off_inv - same) < 1e-4, (
+        f"with center_pred the offset must cancel: {off_inv} vs {same}")
+    print(f"  center_pred: mean {base:.3f} | +2sd default {off_default:.3f} -> invariant "
+          f"{off_inv:.3f} (== {same:.3f})")
+
+
 def test_centred_mse_norm_puts_the_mean_predictor_at_one():
     """Centring must make 1.0 mean exactly "no better than predicting the mean".
 
@@ -472,6 +508,7 @@ if __name__ == "__main__":
     test_per_offset_decoder_distinguishes_children()
     test_per_offset_is_the_default_and_trains()
     test_causal_horizon_shifts_and_stays_causal()
+    test_center_pred_makes_the_score_offset_invariant()
     test_horizon_accepts_a_list_and_averages_both_terms()
     test_own_window_pairing_uses_every_offset_and_honours_the_attach_flag()
     test_shifted_pairing_covers_all_offsets_and_precedes()

@@ -98,7 +98,13 @@ def _build_optimizer(model, cfg):
         if isinstance(mod, torch.nn.Embedding):
             for p in mod.parameters(recurse=False):
                 embed_param_ids.add(id(p))
-    head_name_markers = ("output_projection", "lm_head")
+    # hier_pc_decoder: same exclusion, different reason. `.up` is 3-D [comp, hidden, rank] and
+    # Muon flattens >2-D updates to [comp, hidden*rank] before Newton-Schulz, semi-orthogonalising
+    # the per-offset decoders against each other -- but adjacent offsets are neighbouring
+    # positions in one window and should be SIMILAR, not orthogonal. `.bias` is a 2-D [comp,
+    # hidden] table and orthogonalising a bias is meaningless. Loss-only tensors, never in the
+    # forward, so this cannot affect inference.
+    head_name_markers = ("output_projection", "lm_head", "hier_pc_decoder")
     for name, p in model.named_parameters():
         if any(marker in name for marker in head_name_markers):
             embed_param_ids.add(id(p))

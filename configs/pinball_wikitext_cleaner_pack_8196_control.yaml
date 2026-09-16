@@ -1,3 +1,37 @@
+# ===== 8196 LONG-CONTEXT TEXT ARM -- CONTROL (PC OFF) =====
+# Byte-identical to pinball_wikitext_cleaner_pack_8196_pc.yaml except hier_pc_enable and
+# checkpoint_dir. Run it to matched epochs; without it no PC claim is attributable.
+# Derived 2026-09-15 from pinball_wikitext_cleaner_pack_pc.yaml (the validated 1024 PC arm).
+# NOT derived from pinball_wikitext_cleaner_pack_8196_recovered.yaml -- that file exists only to
+# EVALUATE the 2026-07-13 checkpoint and carries retired machinery (288.9M params, including the
+# never-trained cross_level_qkv allocation). A fresh run should not inherit it.
+#
+# WHY 8196: aggregate PPL on wikitext is dominated by short-range prediction, so it is close to
+# blind to the hierarchy. Measured 2026-09-15 at block 1024 on the in-domain val tail: pinball+PC
+# 19.389 vs a matched transformer 19.846 -- a 2.3% total gap -- while rare-and-far recall differed
+# up to 3x between pinball variants with only a 1.3% spread in val loss. The stratified buckets are
+# where the hierarchy is visible, and a longer context is where they should widen.
+#
+# THREE CHANGES FROM THE 1024 ARM, and why:
+#  1. compression_ratios [16,4,4] -> [16,4,4,8,8,8] (7 levels). FORCED by geometry: at 8196 a
+#     3-coarse-level stack leaves a 257-node top level and the model itself warns that an
+#     all-to-all top level is SUPERLINEAR at that size (it asks for >= 5 coarse levels). Caution
+#     from the other direction: pooled_proj_3kernel_6lvl ran 6 coarse levels at block 1024, where
+#     the top levels degenerate to near-singletons, and it was the WORST far-recall arm measured
+#     (freq1-2 far 829 vs this family's 279). Six levels is right at 8196 and wrong at 1024.
+#  2. batch_size 16 -> 4. 4 x 8196 = 32,784 tokens per optimizer step, which is exactly the
+#     token budget the manuscript's matched 8196 pair used (see data/quality_text.csv), so this
+#     is comparable to that pair as well as to its own control.
+#  3. lambda_hier_pc 0.25 -> 0.12. SIX pairs now instead of three, so the summed PC roughly
+#     doubles at equal per-pair quality. At 1024 the converged sum was 1.52 at lambda 0.25,
+#     ~13% of CE. Halving lambda holds that share. RE-DERIVE at epoch 2-3 from the logged haux,
+#     never at epoch 1 -- on the 1024 arm the sum was 29.687 at ep1 and 2.622 at ep3, and tuning
+#     off that transient cost a cycle.
+#
+# THE CONTROL is pinball_wikitext_cleaner_pack_8196_control.yaml: this file with hier_pc_enable
+# false and its own checkpoint_dir, identical in every other respect. Run it. Every PC claim so
+# far has been unattributable because the 1024 control stopped at epoch 6 while the arm reached 84.
+#
 # =============================================================================
 # TEXT PREDICTIVE-CODING ARM -- the cheap first test of hier_pc, before spending a GPU-day on
 # the DNA arm. Same objective and the same code path, with no modality-specific plumbing: for
@@ -138,8 +172,8 @@ tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
-block_size: 1024 #131072 #196704 #8196 #16384 #32768 #65536 #131072 #262144 #196704 #1024
-batch_size: 16
+block_size: 8196   # was 1024; see header
+batch_size: 4      # 4 x 8196 = 32,784 tokens/step, the manuscript's 8196 budget
 val_split: 0.01
 
 # Training
@@ -199,16 +233,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_pc_win156_ctrpred/checkpoints   # own dir
-# NEW DIR: this file now carries hier_pc_center_pred, so it no longer describes the
-# win156 run still training. That run's checkpoints stay untouched in its own dir.
-# NEW DIR 2026-09-15 so the DENSE arm survives. pooled_proj_cleaner_pc_ownwin_detach holds
-# 84 epochs at local_pack_window 1248, i.e. full attention over all 1248 mixed rows -- the
-# checkpoint behind 19.389 ppl vs the matched transformer's 19.846. Do not overwrite it:
-# the numbers are written down but the weights are what a re-bench or ablation needs.
-# EXPECT THIS ARM TO SCORE WORSE than 19.389. That is not a regression -- the old number
-# came from a model that could see everything. What this one buys is a result about the
-# WINDOWED configuration the scaling claim rests on, plus a control at matched epochs.
+checkpoint_dir: ./pinball/pooled_proj_cleaner_pc_8196_control/checkpoints   # own dir
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -263,15 +288,15 @@ num_heads: 12 #3 #12
 attn_sparse_qk_mult: 1.0    # try 2.0 to lift cross-level routing rank 64 -> 128
 attn_sparse_v_mult: 1.0     # try 2.0 / 4.0 for fat-V (both sparse paths)
 num_refinement_layers: 12 #12
-num_layers: [0, 0, 0, 0]
+num_layers: [0, 0, 0, 0, 0, 0, 0]   # length = level count (L0 + 6 coarse)
 internal_cycles: [0, 0, 0, 0]
 refinement_style: unified
 unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0 # set so graph windows are made dense (k=window_size*2+1) for local connectivity. 0 = sparse only.
-compression_ratios: [16, 4, 4]
-overlap_ratios: [0.5, 0.5, 0.5]
+compression_ratios: [16, 4, 4, 8, 8, 8]   # 7 levels; forced by geometry at 8196
+overlap_ratios: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 # Coarse-node seeding (the ORIGINAL design, restored). mask = coarse nodes start as mask
 # embeddings and content must climb the hierarchy through the refinement layers (measured:
 # L3 only fills at layer 11 of 12 — the summary forms too late to be read back). pooled =
@@ -393,25 +418,23 @@ xq_nominate_read_sink: true
 # the open question is whether the coarse-lateral repositioning hurts or helps quality.
 # Fall back to query_levels [0] to keep coarse laterals untouched (+2% cost instead).
 local_pack_cross_level: true
-local_pack_window: 156          # 156, NOT 1248. This is a genuine window: at block 1024 the
-                                # level sizes are [1024,128,64,32] = 1248 mixed rows EXACTLY, so
-                                # 1248 made the packed attention DENSE -- it was not a window at
-                                # all. That value came from commit 7559e68 (2026-07-15,
-                                # checkpoint_dir `pooled_proj_cleaner_ultracontext`), set for a
-                                # deliberate full-context test and never reverted; it then
-                                # propagated into every later pack config. Restored 2026-09-15.
-                                # WHAT THIS INVALIDATES: every number from the dense 1024 arms,
-                                # including 19.389 ppl vs the matched transformer's 19.846. That
-                                # was full-attention pinball vs a full-attention transformer --
-                                # a fair architecture comparison, but silent on windowed/linear
-                                # scaling. It also broke the PC-vs-no-PC far-recall comparison,
-                                # since pooled_proj_3kernel_6lvl ran 156 (12.5%) against the PC
-                                # arm's 100%: "full context beats 1/8 context" explains that 3x
-                                # far better than predictive coding does.
-                                # THE CONTROL CARRIES THE SAME VALUE. If the arm and the control
-                                # ever differ here, the comparison is dense-vs-windowed again and
-                                # nothing is attributable to PC. Check both before running.
-local_pack_query_levels: [0, 1, 2, 3]
+local_pack_window: 156          # RESTORED 2026-09-15 to the intended windowed value.
+                                # It had been 1248 since commit 7559e68 (2026-07-15), whose
+                                # checkpoint_dir was `pooled_proj_cleaner_ultracontext` -- set for
+                                # a deliberate FULL-context experiment and never reverted. At
+                                # block 1024 the level sizes are [1024,128,64,32] = 1248 mixed
+                                # rows exactly, so 1248 is not a window at all: every PC arm
+                                # measured at 1024 ran DENSE attention over the whole mixed
+                                # sequence. At 8196 there are 10078 mixed rows, so 1248 would be
+                                # a 12.4% window and 156 is 1.5%.
+                                # CONSEQUENCE: this run is the first PC arm in a genuinely
+                                # windowed regime, so its absolute numbers are NOT comparable to
+                                # the 1024 arm's (19.389 ppl etc). It IS comparable to its own
+                                # control, which is the only comparison that matters here.
+local_pack_query_levels: [0, 1, 2, 3, 4, 5, 6]   # MUST cover every level:
+                                # omitted levels are pooled but NEVER attend, so the packed
+                                # attention never updates them -- and PC would then be scoring
+                                # pairs (3:4, 4:5, 5:6) whose targets are frozen pooled means.
 # Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
 # bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
 # query-dependent level bias) and to V (output carries its source level). Zero init =
@@ -842,8 +865,10 @@ hier_pc_l0_ce: false           # DEMOTED: predicting tokens from L1 removes L0's
                                # It fixed capacity by deleting the link. Kept as an experiment.
 hier_pc_l0_ce_chunk: 512       # rows per logits chunk; bounds the [rows, 50257] tensor
 
-hier_pc_enable: true
-lambda_hier_pc: 0.25           # KEPT at 0.25. It was briefly dropped to 0.02 on 2026-09-15 and
+hier_pc_enable: false   # THE CONTROL. Only difference from the PC arm.
+lambda_hier_pc: 0.12           # HALVED from the 1024 arm's 0.25: six pairs now, not three.
+#                              # Original note follows, still valid on the transient lesson.
+#                              # KEPT at 0.25. It was briefly dropped to 0.02 on 2026-09-15 and
                                # put back the same day: the drop was sized on an EPOCH-1
                                # TRANSIENT and the objective self-regulates.
                                #   summed PC   ep1 29.687  ->  ep3 2.622
@@ -863,18 +888,6 @@ lambda_hier_pc: 0.25           # KEPT at 0.25. It was briefly dropped to 0.02 on
                                # If a coarse pair stalls at 1.0 for several epochs, rebalance with
                                # hier_pc_level_weights rather than by moving lambda.
 hier_pc_pairs: null            # null = adjacent chain; here 0:1 1:2 2:3
-hier_pc_center_pred: true       # OFFSET-INVARIANT SCORE (added 2026-09-15). The default centres
-                                # the denominator but not the numerator, so a shared mean offset
-                                # between prediction and target inflates the loss -- exactly what
-                                # centring exists to prevent. Measured: the exact per-batch mean
-                                # scores 1.000, the same predictor offset by 1 sd scores 2.00 and
-                                # by 2 sd 5.02. DNA showed every pair pinned at 3-4, i.e. WORSE
-                                # than the mean predictor, which the bias term reaches for free --
-                                # so that is a moving target, not insufficient pressure, and no
-                                # lambda lifts it. Likely source here: genomic windows differ in
-                                # coverage statistics and the host's BatchNorm makes the latents
-                                # batch-dependent, so the level's per-batch mean drifts.
-                                # NOTE values are NOT comparable across this flag.
 hier_pc_loss_mode: mse_norm
 hier_pc_detach_target: false   # TRUE PC is joint
 hier_pc_causal_horizon: 0      # 0 = reconstruct the window you pooled (see OWN-WINDOW header).

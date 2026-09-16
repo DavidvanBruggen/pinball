@@ -168,7 +168,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pooled_proj_cleaner_pc_control/checkpoints   # OWN dir -- must never
+checkpoint_dir: ./pinball/pooled_proj_cleaner_pc_win156_control/checkpoints   # OWN dir -- must never
                                # write into the arm's, which is live while this runs
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
@@ -354,7 +354,24 @@ xq_nominate_read_sink: true
 # the open question is whether the coarse-lateral repositioning hurts or helps quality.
 # Fall back to query_levels [0] to keep coarse laterals untouched (+2% cost instead).
 local_pack_cross_level: true
-local_pack_window: 1248             # mixed slots; ~128 tokens + ~28 coarse rows (token-reach const) # 156 624 1248
+local_pack_window: 156          # 156, NOT 1248. This is a genuine window: at block 1024 the
+                                # level sizes are [1024,128,64,32] = 1248 mixed rows EXACTLY, so
+                                # 1248 made the packed attention DENSE -- it was not a window at
+                                # all. That value came from commit 7559e68 (2026-07-15,
+                                # checkpoint_dir `pooled_proj_cleaner_ultracontext`), set for a
+                                # deliberate full-context test and never reverted; it then
+                                # propagated into every later pack config. Restored 2026-09-15.
+                                # WHAT THIS INVALIDATES: every number from the dense 1024 arms,
+                                # including 19.389 ppl vs the matched transformer's 19.846. That
+                                # was full-attention pinball vs a full-attention transformer --
+                                # a fair architecture comparison, but silent on windowed/linear
+                                # scaling. It also broke the PC-vs-no-PC far-recall comparison,
+                                # since pooled_proj_3kernel_6lvl ran 156 (12.5%) against the PC
+                                # arm's 100%: "full context beats 1/8 context" explains that 3x
+                                # far better than predictive coding does.
+                                # THE CONTROL CARRIES THE SAME VALUE. If the arm and the control
+                                # ever differ here, the comparison is dense-vs-windowed again and
+                                # nothing is attributable to PC. Check both before running.
 local_pack_query_levels: [0, 1, 2, 3]
 # Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
 # bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =

@@ -2870,6 +2870,12 @@ class HierarchicalFlowGAT(nn.Module):
         # also removes the "child pushed toward a value derived from its own future" pressure,
         # which is a mild smoothing force, not a causal leak (the forward's masking is separate).
         hier_pc_own_window_detach: bool = False,
+        # Centre the NUMERATOR too, not just the denominator (mse_norm only). Default False:
+        # it changes what the number means, so existing values are not comparable across it.
+        # Turn on when a level's per-batch mean drifts -- the symptom is every pair pinned
+        # ABOVE 1.0, i.e. worse than the mean predictor, which the bias term could reach for
+        # free. See the note in _compute_pc_pair_reduction.
+        hier_pc_center_pred: bool = False,
         # CENTRE THE mse_norm DENOMINATOR. mse_norm divides by the target's raw second moment,
         # which includes the constant every node of a level shares -- so INFLATING that constant
         # lowers the loss for free. Measured drift: bias/content at L0 went 1.48 -> 3.58 over
@@ -4707,6 +4713,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.hier_pc_predictor = str(hier_pc_predictor).lower()
         self.hier_pc_center_target = bool(hier_pc_center_target)
         self.hier_pc_own_window_detach = bool(hier_pc_own_window_detach)
+        self.hier_pc_center_pred = bool(hier_pc_center_pred)
         self.hier_pc_l0_target = str(hier_pc_l0_target).lower()
         if self.hier_pc_l0_target not in ("features", "input"):
             logger.warning("Unknown hier_pc_l0_target=%r; using 'features'", hier_pc_l0_target)
@@ -9189,11 +9196,22 @@ class HierarchicalFlowGAT(nn.Module):
         """Reduction for the PC error, reading hier_pc_loss_mode (NOT hier_aux_loss_mode)."""
         mode = str(getattr(self, "hier_pc_loss_mode", "mse_norm")).lower()
         if mode in {"mse_norm", "nmse"}:
-            sq_err = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
-            ref = target
-            if bool(getattr(self, "hier_pc_center_target", True)) and target.shape[0] > 1:
-                # divide by CONTENT variance, not raw magnitude -- see hier_pc_center_target
-                ref = target - target.mean(dim=0, keepdim=True)
+            centred = bool(getattr(self, "hier_pc_center_target", True)) and target.shape[0] > 1
+            ref = target - target.mean(dim=0, keepdim=True) if centred else target
+            if centred and bool(getattr(self, "hier_pc_center_pred", False)):
+                # OFFSET-INVARIANT FORM. The default centres the DENOMINATOR but not the
+                # NUMERATOR, so a shared mean offset between pred and target inflates the loss
+                # even though centring exists precisely to stop the shared constant mattering.
+                # That is not hypothetical: scoring the exact per-batch mean gives 1.000, but the
+                # SAME predictor offset by 1 sd gives 2.00 and by 2 sd gives 5.02 -- and a level
+                # whose per-batch mean moves (different genomic regions, and BatchNorm upstream
+                # making the latents batch-dependent) puts a floor there that no lambda can lift,
+                # because 1.0 is already reachable by the bias term alone.
+                # Centring BOTH sides by their own mean removes any constant offset, so the score
+                # measures the per-child STRUCTURE that PC is actually about.
+                sq_err = ((pred - pred.mean(dim=0, keepdim=True)) - ref).pow(2).mean(dim=-1)
+            else:
+                sq_err = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
             denom = ref.pow(2).mean(dim=-1).clamp_min(1e-8)
             return (sq_err / denom).mean()
         if mode == "cosine":
@@ -9419,6 +9437,14 @@ class HierarchicalFlowGAT(nn.Module):
         total = None
         per_offset = str(getattr(self, "hier_pc_predictor", "per_offset")).lower() == "per_offset"
         live = []
+        # Per-pair values, kept as DETACHED SCALAR TENSORS -- converting to float here would force
+        # a host sync every step. The consumer converts, once, wherever it logs.
+        # Why this exists: the summed loss hides which pair is stuck, and the two diagnoses call
+        # for opposite fixes. Measured on text at ep84 the three pairs were 0.858 / 0.396 / 0.312
+        # -- 0:1 alone was 55% of the sum and the only one near its floor. A sum of 19.4 over six
+        # DNA pairs is equally consistent with "all six at 3.2" (a lambda problem) and with
+        # "three near 0.9, three coarse ones near 5.5" (a hier_pc_level_weights problem).
+        pair_vals = {}
         for key in keys:
             low, high = (int(v) for v in key.split(":"))
             if per_offset:
@@ -9426,6 +9452,7 @@ class HierarchicalFlowGAT(nn.Module):
                 if loss is None:
                     continue
                 live.append(key)
+                pair_vals[key] = loss.detach()
                 w = float(weights.get(key, 1.0))
                 total = (w * loss) if total is None else (total + w * loss)
                 continue
@@ -9437,6 +9464,7 @@ class HierarchicalFlowGAT(nn.Module):
             )
             w = float(weights.get(key, 1.0))
             live.append(key)
+            pair_vals[key] = loss.detach()
             total = (w * loss) if total is None else (total + w * loss)
         if per_offset and len(live) != len(keys) and not getattr(self, "_hier_pc_warned_empty", False):
             self._hier_pc_warned_empty = True
@@ -9447,7 +9475,26 @@ class HierarchicalFlowGAT(nn.Module):
                 "Use a longer block_size or a smaller hier_pc_causal_horizon.",
                 live, keys, [k for k in keys if k not in live])
         self._hier_pc_live_pairs = list(live)
+        self._hier_pc_pair_values = pair_vals
         return total
+
+    def hier_pc_pair_report(self, max_pairs: int = 12) -> Optional[str]:
+        """One SHORT line of per-pair PC values, or None when PC is off.
+
+        Deliberately one line: the gate monitor prints a wall of text and gets left off, so this
+        follows the [LONGCTX] pattern instead -- a single compact string per validation.
+
+        The floats are read here and nowhere else: the values are stashed as detached scalar
+        tensors precisely so the hot path never syncs, and this is the one place that pays for it.
+        NOTE the values come from the last TRAINING step -- PC does not run in eval mode.
+        """
+        vals = getattr(self, "_hier_pc_pair_values", None)
+        if not vals:
+            return None
+        items = list(vals.items())[:max_pairs]
+        body = " ".join(f"{k}={float(v):.3f}" for k, v in items)
+        more = "" if len(vals) <= max_pairs else f" (+{len(vals) - max_pairs} more)"
+        return f"{body}{more} | sum={sum(float(v) for v in vals.values()):.3f}"
 
     def _compute_true_batch_pc_loss(
         self,
@@ -15490,6 +15537,7 @@ class HierarchicalFlowGAT(nn.Module):
                 # so the disabled path is unchanged down to the call graph (tests/test_hier_pc.py
                 # booby-traps every PC entry point and runs a forward to hold this).
                 self._last_hier_pc_loss = None
+                self._hier_pc_pair_values = {}
                 if getattr(self, "hier_pc_enable", False):
                     self._last_hier_pc_loss = self._compute_true_batch_pc_loss(
                         x_bnh=self._latent_exit_norm_apply(x_tb, "pc"),
@@ -15944,6 +15992,7 @@ class HierarchicalFlowGAT(nn.Module):
                 logger.warning("hier_pc_enable is on but this forward took the non-fast path; "
                                "the PC term is INERT for this step.")
             self._last_hier_pc_loss = None       # predictive coding likewise
+            self._hier_pc_pair_values = {}
 
             # 7. Reshape and Restore
             unified_graph.x = g_work.x.view(B, N, H)# if B > 1 else g_work.x.view(N, H)

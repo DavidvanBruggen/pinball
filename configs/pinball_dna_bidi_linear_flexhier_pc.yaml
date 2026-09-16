@@ -606,7 +606,52 @@ pinball_multirate_enable: false
 
 # ----- predictive coding (THE ONE INTENDED DIFFERENCE from the flexhier arm) -----
 hier_pc_enable: true
-lambda_hier_pc: 0.005           # NOT the text arm's 0.25 -- see the LAMBDA note in the header.
+lambda_hier_pc: 0.01            # 0.01 on 2026-09-15 to DISENTANGLE TWO CHANGES that
+                                # landed together. The PC sum finally plummeted (22.5 -> 8.5 in
+                                # 914 steps, after sitting at 24-27 for 10,000), but in that same
+                                # run lambda went 0.01 -> 0.1 AND the Muon routing fix took
+                                # effect, so either could be the cause.
+                                # THE MUON FIX: hier_pc_decoder params were being routed to Muon
+                                # by the ndim>=2 rule. `up` is 3-D [comp, hidden, rank] and Muon
+                                # flattens >2-D updates to [comp, hidden*rank] before
+                                # Newton-Schulz, semi-orthogonalising the per-offset decoders
+                                # against each other -- while the objective wants adjacent
+                                # offsets SIMILAR. Now routed to AdamW in both
+                                # ChromScape/bin/optimizer_utils.py and src/pinball/cli.py.
+                                # WHY 0.01 AND NOT 0.1: 0.01 is the value that ALREADY FAILED to
+                                # move the sum (flat at 24-27 over 10,000 steps) -- but that was
+                                # with the decoder on Muon. Rerunning the same lambda with the
+                                # routing fixed is the tightest available A/B: one variable, and
+                                # a known prior result to compare against.
+                                # THE TEST: if PC still plummets at 0.01 with the fix active,
+                                # the fix was the cause -- a real finding. If it stalls back at
+                                # 24-27 as it did before, the plummet was pressure and the
+                                # routing was a minor
+                                # handicap. Read train/pc/* to confirm the fix is actually loaded:
+                                # those series only appear when the reloaded model module runs.
+                                # Previous note: RAISED to 0.1 because at 0.01 the sum would not
+                                # fall, so this deliberately applies heavy pressure.
+                                # READ WITH hier_aux_cap_frac IN THE NOTEBOOK. 0.1 x ~19 = 1.9
+                                # against a supervised loss of ~0.39 is ~490% of the objective --
+                                # five times the coverage task, and the observed PC spike of 79.6
+                                # (step 1451) would be ~2000% for that step. So any cap below
+                                # ~4.9 binds constantly and the CAP, not lambda, sets the true
+                                # weight. That is intentional here: cap_frac 1.0 pins PC at 1x the
+                                # supervised loss -- well above the ~60% at which text's PC fell
+                                # 11x -- while clipping spikes that lambda alone cannot bound.
+                                # ABORT SIGNAL: val_loss / val_PearsonR materially worse than the
+                                # 0.39098 / 0.664 baseline at epoch 1-2. PC falling while the task
+                                # degrades is not a win.
+                                # Previous note: RAISED from 0.005 after one epoch at full weight
+                                # weight (cap off) moved the PC sum only 24.46 -> 19.01 on
+                                # 100-row means over 5800 steps. Text fell ~11x in ~3000 steps,
+                                # so this is far slower than the reference, and the reason looks
+                                # like pressure: 0.005 x ~19 = 0.095 against a supervised loss of
+                                # ~0.39 is ~24% of the objective, where text's fast drop happened
+                                # at ~60%. 0.01 puts it near 49%. Headroom confirmed by epoch 0
+                                # val: 0.39098 / PearsonR 0.664, against the throttled run's
+                                # 0.39004 / 0.66148 -- PC is costing the task nothing so far.
+                                # NOT the text arm's 0.25 -- see the LAMBDA note in the header.
                                 # The DNA coverage loss is ~0.33 against text CE ~4.2, so the
                                 # same weight is ~13x more dominant here, and this arm has 6
                                 # pairs to text's 3. 0.005 x an expected ~5.2 steady-state PC
@@ -615,6 +660,18 @@ lambda_hier_pc: 0.005           # NOT the text arm's 0.25 -- see the LAMBDA note
                                 # is the single source of truth; the notebook's hier_aux_weight
                                 # no longer decides. Re-derive from train/hier_aux_loss once it
                                 # has run a few hundred steps -- but NOT from epoch 1.
+hier_pc_center_pred: true       # OFFSET-INVARIANT SCORE (added 2026-09-15). The default centres
+                                # the denominator but not the numerator, so a shared mean offset
+                                # between prediction and target inflates the loss -- exactly what
+                                # centring exists to prevent. Measured: the exact per-batch mean
+                                # scores 1.000, the same predictor offset by 1 sd scores 2.00 and
+                                # by 2 sd 5.02. DNA showed every pair pinned at 3-4, i.e. WORSE
+                                # than the mean predictor, which the bias term reaches for free --
+                                # so that is a moving target, not insufficient pressure, and no
+                                # lambda lifts it. Likely source here: genomic windows differ in
+                                # coverage statistics and the host's BatchNorm makes the latents
+                                # batch-dependent, so the level's per-batch mean drifts.
+                                # NOTE values are NOT comparable across this flag.
 hier_pc_center_target: true     # explicit: 1.0 = no better than predicting the level mean.
                                 # Uncentred, the denominator carries the level's shared constant,
                                 # so inflating that constant lowers the loss for free.

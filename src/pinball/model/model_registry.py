@@ -474,6 +474,7 @@ def build_pinball_model(
         hier_pc_rank=int(getattr(args, "hier_pc_rank", 64)),
         hier_pc_causal_horizon=getattr(args, "hier_pc_causal_horizon", "auto"),
         hier_pc_own_window_detach=bool(getattr(args, "hier_pc_own_window_detach", False)),
+        hier_pc_center_pred=bool(getattr(args, "hier_pc_center_pred", False)),
         hier_pc_center_target=bool(getattr(args, "hier_pc_center_target", True)),
         hier_pc_l0_target=str(getattr(args, "hier_pc_l0_target", "features")),
         hier_pc_l0_ce=bool(getattr(args, "hier_pc_l0_ce", False)),

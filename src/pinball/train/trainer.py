@@ -7135,6 +7135,16 @@ class EnhancedHierarchicalTrainer:
             logger.info("[LONGCTX] next-token PPL by in-context recurrence distance (%d seqs): %s",
                         _lcd_seqs, "  ".join(parts))
 
+        # One compact line, same shape as [LONGCTX] above. The summed PC hides which pair is
+        # stuck, and that distinction picks the fix: a uniformly high sum is a lambda problem,
+        # a few bad coarse pairs is a hier_pc_level_weights problem.
+        _pc_src = getattr(self.model, "pinball", self.model)
+        _pc_report = (_pc_src.hier_pc_pair_report()
+                      if hasattr(_pc_src, "hier_pc_pair_report") else None)
+        if _pc_report:
+            logger.info("[HIER_PC] per-pair, 1.0 = no better than the level mean "
+                        "(last TRAIN step; PC does not run in eval): %s", _pc_report)
+
         copy_token_acc = (copy_token_correct / copy_token_total) if copy_token_total > 0 else 0.0
         copy_span_exact = (copy_span_correct / copy_span_total) if copy_span_total > 0 else 0.0
         copy_first_token_acc = (copy_first_correct / copy_first_total) if copy_first_total > 0 else 0.0
