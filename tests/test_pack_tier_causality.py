@@ -131,6 +131,52 @@ def test_global_block_is_causal_at_tier_sized_budgets():
                                                       local_pack_global_block=budget))
 
 
+def test_sqrt_budget_multiplier_parses():
+    """``sqrt*k`` is accepted and normalized; junk raises instead of silently meaning 0."""
+    from pinball.model.hierarchical_flow_gat_cached_batch import _parse_sqrt_budget
+
+    assert _parse_sqrt_budget("sqrt") == 1.0
+    assert _parse_sqrt_budget("sqrt*2") == 2.0
+    assert _parse_sqrt_budget("  SQRT * 2.5 ") == 2.5
+    for bad in ("sqrt*0", "sqrt*-2", "sqrt*", "sqrt2", "cbrt", "", "sqrt*nan"):
+        try:
+            _parse_sqrt_budget(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad!r} should not parse as a sqrt budget")
+    print("  [OK] sqrt*k parsing")
+
+
+def test_sqrt_multiplier_widens_the_tier():
+    """k=2 must take strictly more levels than k=1 where a level boundary falls between.
+
+    Guards the property the multiplier exists for: at ``block_size`` 1024 with this
+    config's ratios, isqrt(1024) = 32 buys the top level alone while 2x it reaches one
+    level further down. A regression that ignored the multiplier would tie the two.
+    """
+    counts = {}
+    for budget in ("sqrt", "sqrt*2"):
+        model, _, _ = _build(dict(local_pack_top_global=True,
+                                  local_pack_top_global_budget=budget))
+        bb = model.pinball if hasattr(model, "pinball") else model
+        sizes = list(bb._predict_level_sizes(int(bb.max_seq_len)))
+        top = len(sizes) - 1
+        rows = [torch.zeros(int(n), dtype=torch.long) for n in sizes]
+        tier = bb._resolve_global_tier(rows, top)
+        counts[budget] = sum(int(r.numel()) for r in tier)
+    print(f"  level sizes drive tier rows: sqrt={counts['sqrt']}, sqrt*2={counts['sqrt*2']}")
+    assert counts["sqrt*2"] >= counts["sqrt"], counts
+    assert counts["sqrt*2"] > counts["sqrt"], (
+        "sqrt*2 did not widen the tier; the multiplier is being ignored")
+    print("  [OK] sqrt*2 widens the tier")
+
+
+def test_multiplied_sqrt_tier_is_causal():
+    """Widening the budget must not buy reach by admitting future rows."""
+    _report("tier ON, sqrt*2", dict(local_pack_top_global=True,
+                                    local_pack_top_global_budget="sqrt*2"))
+
+
 def test_auto_lane_window_is_causal():
     """auto sizes the lane from tier spacing; a wrong radius must not become a leak."""
     _report("tier ON + coarse_window auto", dict(local_pack_top_global=True,

@@ -1,4 +1,209 @@
 # ============================================================================
+# WINDOW-ONLY NEGATIVE CONTROL  (2026-09-17)
+#
+# Purpose: measure how much the hierarchy is actually worth. This is
+# pinball_dna_bidi_linear_flexhier_pc.yaml with every coarse -> L0 route cut, so L0
+# sees ONLY its local window. Everything else -- widths, depth, optimizer, norms,
+# dropout, data -- is byte-identical, so the comparison is single-variable.
+#
+# The seven flips (and nothing else):
+#   local_pack_cross_level  true -> false   route 1: the packed window mixed levels
+#   hier_downward_refresh   true -> false   route 3: coarse -> L0 gather (the dominant one)
+#   hier_upward_refresh     true -> false   no L0 -> coarse write either
+#   hier_pc_enable          true -> false   PC trains the downward projections, now gone
+#   local_pack_coarse_lane  true -> false   } inert once cross_level is false,
+#   local_pack_top_global   true -> false   } set explicitly so the config reads honestly
+#   local_pack_flex_union   true -> false   }
+# hier_copredict_l0 was ALREADY false in the parent (route 2), so it needs no flip.
+#
+# WHY NOT ablate_levels: that knob is a measured NO-OP on packed-attention configs.
+# The working recipe is local_pack_cross_level:false + hier_copredict_l0:false, plus
+# hier_downward_refresh:false. See the ablate-levels-inert note.
+#
+# TOKEN REACH IS MATCHED -- the point that makes this fair. With cross_level ON, L0's
+# window is local_pack_window: 156 rows of the MIXED packed sequence (32,768 tokens +
+# 7,504 coarse = 40,272 rows, so tokens are 81.37% of it) = ~126.9 tokens of span.
+# With cross_level OFF the packed path is not taken at all and L0 falls back to
+# l0_local_window: 128. 126.9 vs 128 -- within 1%. Do NOT "fix" either number; they
+# are what makes the control a test of the hierarchy rather than of window size.
+#
+# NOT PARAMETER-MATCHED, and that is deliberate -- but disclose it. Measured by
+# building both: PC arm 224,173,945 params, this one 207,990,469, a difference of
+# 16,183,476 (-7.2%). That is the upward/downward refresh projections, which are the
+# hierarchy machinery itself, so an ablation SHOULD remove them. But it means a win
+# for the hierarchy arm is a win for "hierarchy + 16.2M params", not for wiring alone.
+# If that distinction ever matters, the follow-up is a width-matched control, not a
+# tweak to this one. The coarse levels themselves are still built and pooled; nothing
+# reads them, so they are dead compute.
+#
+# Expect near-zero node_spec and a flat PC-free loss; those are not bugs here.
+# Judge on specificity at ep15+, envelopes not points, and score BOTH BN ways.
+#
+# Run at 500 kb first (notebook DATA_DIR -> the 500kb tree, crop_batches False).
+# block_size stays 32768 either way; only bp-per-token changes (16 at 500 kb).
+# ============================================================================
+
+# ===== READ FIRST (2026-09-15) =====
+# THIS is the DNA predictive-coding arm to run: it is pinball_dna_bidi_linear_flexhier.yaml plus
+# the hier_pc block and nothing else (verified by diff -- the ONLY non-comment additions are the
+# hier_pc_* keys), so against the running flexhier arm it is a one-variable comparison.
+# Do NOT use pinball_dna_bidi_linear_3kernel_pc.yaml for that purpose: it was branched off the
+# 3kernel base, which differs from flexhier in local_pack_flex_union (false vs true).
+#
+# GEOMETRY: compression_ratios [16, 4, 4, 8, 8, 8] = 7 levels, chain 0:1 1:2 2:3 3:4 4:5 5:6 --
+# six pairs, twice the text arm's three. Per-offset decoders add +3,588,096 params at
+# hidden_dim 1024 / rank 64. Bidirectional, so hier_pc_causal_horizon: auto resolves to 0:
+# each parent predicts the children it pooled.
+#
+# WHAT THE TEXT ARM SETTLED, AND WHY IT CARRIES OVER:
+#   * HORIZON 0, not a forecast. At horizon 2 the 0:1 pair sat at 1.004 -- the mean predictor --
+#     for nine epochs; at horizon 0 it reached 0.862 by epoch 3. A claim about the objective,
+#     so it transfers.
+#   * DETACHED targets (hier_pc_own_window_detach: true). Attached, the text hierarchy collapsed
+#     to rank one by epoch 2 (participation L1 1.04 L2 1.03 L3 1.12, against 28.8/26.6/18.2 at
+#     random init and 28.2/50.3/27.0 on the PC-off control). True PC wants attachment, but its
+#     anti-collapse guarantee assumes a HARD clamp at the sensory level and a task loss is a soft
+#     one. Both arms have a soft task-loss clamp, so both are exposed.
+#
+# WHAT THE TEXT ARM CANNOT VALIDATE HERE:
+#   hier_pc_l0_target. Text is autoregressive, so input and target are one stream shifted by one
+#   and the choice is invisible there. Here DNA goes in and coverage comes out. `features`
+#   (task-anchored: the clamp is the COVERAGE loss on L0) is deliberate; `input` would capture the
+#   host CNN/UNet features and build a multiscale generative model of the GENOME -- real causes,
+#   but causes of the sequence, with nothing asking them to be causes of the coverage.
+#
+# HOST WIRING (configure_hier_aux_loss in the notebook was patched 2026-09-15):
+#   * use_aux_loss is held False whenever hier_pc_enable is true, so the ORIGINAL JEPA aux can
+#     never be summed into _last_hier_aux_loss behind the same logged number.
+#   * activation is `enabled or hier_pc_enable`, so this config turns the channel on by itself.
+#     enable_hier_aux_loss stays False in the notebook, which leaves the non-PC baseline alone.
+#   * weight follows lambda_hier_pc below.
+#
+# READ THE DIAGNOSTIC IN THIS ORDER (getting it backwards cost a day on text):
+#   a. per-level VARIANCE and participation TOGETHER. Participation alone cannot see a
+#      near-constant level with isotropic noise -- it weights by variance, so a tiny residual
+#      spread thinly reads as healthy.
+#   b. a pair's PC value means nothing until its target level is healthy: a collapsed target is
+#      trivially predictable and reads as a near-zero loss.
+#   c. 1.0 = no better than predicting the level mean.
+#
+# =============================================================================
+# PREDICTIVE CODING ARM -- one block flipped on relative to
+# pinball_dna_bidi_linear_flexhier.yaml. Everything else is byte-identical, so this is a
+# clean single-variable test against that arm (and against flexhier_wdfix, which carries the
+# same Muon decay fix).
+#
+# THE HYPOTHESIS. The hierarchy ASCENDS but does not DESCEND: upward refresh gates grew
+# 0.1 -> 0.62 while downward gates decayed 0.1 -> 0.004. The downward projections are the
+# only route by which a coarse node can say anything about its children, and they are inert.
+# Two reasons that is worth attacking now:
+#   1. THE MEASUREMENT WAS TAKEN UNDER A BUG. Those gates are 1-D, so they sat in Muon's
+#      adamw_fallback group, which received muon_weight_decay (0.1) instead of the configured
+#      adamw_weight_decay (1e-4) -- 1000x too strong. Fixed 2026-09-14 in
+#      ChromScape/bin/optimizer_utils.py. The same pull dragged every BatchNorm gamma in the
+#      host from init 1.0 to 0.855, so it was demonstrably biting. Whether the descent path
+#      can learn AT ALL is therefore open, not settled.
+#   2. PC gives that path an objective of its own instead of hoping the task recruits it.
+#
+# THE FORMULATION -- true top-down PC, L0 anchored by the EXISTING supervised loss:
+#     coverage loss --anchors--> L0
+#                                 ^
+#                       L0 <-- f(W0 x1)      NEW: hier_pc
+#                                 ^
+#                       L1 <-- f(W1 x2)      NEW
+#                                 ^
+#                       L2 <-- f(W2 x3)      NEW
+# No new observable head: the Poisson-multinomial loss on the CNN head already pins L0.
+#
+# LOSS TOPOLOGY vs FORWARD WIRING -- two separate questions, and this arm changes only one.
+# The PC ERROR is measured on the ADJACENT CHAIN (0:1 1:2 2:3 3:4 4:5 5:6): each level is
+# trained to be reconstructible from the one directly above it. The FORWARD's downward refresh
+# is left exactly as the baseline has it -- the 0:m star (0:1..0:6), which is what this 7-level
+# model builds by default because coarse<-coarse was measured dead (1:2 = +0.0005,
+# 2:3 = -0.0001). Rewiring the forward to a chain is a DIFFERENT experiment; run it separately.
+#
+# DESIGN INTENT (David, 2026-09-14): the END STATE for the forward is L:L-1 downward
+# projections, because the hierarchy is meant to be a MULTISCALE LATENT REPRESENTATION -- a
+# level should hand information to the scale directly below it, not jump straight to L0. 0:m
+# is the interim because it is what the current model actually builds and what the gate audit
+# measured. So the ordering is deliberate: chain the PC ERROR now (this arm), move the forward
+# down-projections to L:L-1 later, as its own arm.
+#
+# Because the star provides no 1:2..5:6 projection, hier_pc_predictor: auto reuses the live
+# 0:1 projection and allocates a dedicated 2-layer head for each of the other five pairs.
+# CONSEQUENCES, stated so the result is read correctly:
+#   - PARAMS: 229,115,769 vs the baseline's 218,619,769 -- +10,496,000 (+4.80%), five 2-layer
+#     heads at hidden 1024. This arm is NOT parameter-matched, so a win of a few thousandths
+#     in specificity is not cleanly attributable to the objective. The 0:m variant below is
+#     the parameter-matched one.
+#   - Only the 0:1 pair trains a wire the forward actually uses. The other five shape
+#     REPRESENTATIONS (each level reconstructible from its parent) without touching the
+#     forward's generative path. If reviving the measured-dead downward wires is the goal
+#     instead, set hier_pc_pairs: ["0:1","0:2","0:3","0:4","0:5","0:6"] -- that trains all six
+#     live projections and adds no parameters.
+# Confirm both in the run log: "Predictive coding enabled: pairs [...]" and
+# "hier_pc predictor=auto: reusing downward_refresh_proj for [...]".
+#
+# WHY THIS NEEDS NO SIGREG. The task forces L0 to vary with position; to predict a varying
+# L0, L1 must vary; to predict a varying L1, L2 must vary. The constraint propagates upward
+# transitively, so no level can go constant. That is why PC anchors ONE end only. Contrast
+# hier_aux/hier_predaux, which predict the model's own DETACHED pooled summaries -- a free
+# learned target both sides can drift to a constant (BYOL/JEPA geometry), which is why
+# SIGReg was ported in the first place. SIGReg stays off here and is not needed.
+#   Expect an irreducible floor: all children of a parent share one prediction, so
+#   within-window variance can never be explained. That is the coarse level correctly
+#   predicting the window mean, not a failure to converge.
+#
+# LAMBDA -- AND WHY THE TEXT ARM'S VALUE MUST NOT BE COPIED HERE.
+# The two modalities have supervised losses an order of magnitude apart: text CE is ~4.2, the
+# DNA coverage loss is ~0.32-0.35. The SAME weighted PC term is therefore ~13x more dominant
+# here. Text runs lambda 0.25; copying it would put PC at several times the whole objective.
+#   text   lambda 0.25 x PC 2.62 (3 pairs, ep3) = 0.66 against CE 4.2      ~15%
+#   DNA    lambda 0.25 x PC ~5.2 (6 pairs)      = 1.30 against 0.33        ~390%  <-- no
+# Expected steady-state PC here: 6 pairs at the text arm's converged ~0.87/pair = ~5.2.
+# For the <= 10% target (0.033 weighted) that gives lambda ~= 0.006, so 0.005 is the start.
+# This agrees with the earlier init-based derivation (PC 3.05 at init vs supervised 0.33 put
+# lambda 0.01 near 10%), which is reassuring since the two estimates are independent.
+#
+# SET IT FROM DATA, NOT FROM THIS ESTIMATE. The notebook logs train/hier_aux_loss (RAW,
+# unweighted) separately from train/hier_aux_weighted. After a few hundred steps read the raw
+# value and set lambda = 0.1 * 0.33 / raw. lambda is read at construction, so it needs a
+# restart to change -- which is cheap at that point.
+# BUT NOT AT EPOCH 1. On text the summed PC was 29.687 at ep1 and 2.622 at ep3, an 11x
+# transient from the centred denominator dividing by a transiently near-constant coarse level.
+# Tuning lambda off epoch 1 was a wasted cycle there. If the same 11x appears here, epoch 1
+# will show PC near or above the supervised loss even at lambda 0.005; that is expected and it
+# recovered on text. Only drop lambda if the SUPERVISED loss is still degraded at ep2-3.
+#
+# HOW IT IS WIRED (updated 2026-09-15 -- the notebook WAS changed; the old note here was wrong).
+# The PC term is added into _last_hier_aux_loss, the channel train/trainer.py and the notebook
+# both consume. configure_hier_aux_loss in the flexhier notebook has been patched to:
+#   * hold use_aux_loss FALSE whenever hier_pc_enable is true. The old note claimed the
+#     constructor RAISES on that combination -- it does, but only for a yaml, and the notebook
+#     set the flag AFTER construction, where the guard cannot see it. Unpatched, the original
+#     JEPA aux would have been summed into the same tensor behind one logged number.
+#   * activate on `enabled or hier_pc_enable`, so enable_hier_aux_loss STAYS FALSE in the
+#     notebook (leaving the non-PC baseline alone) and this config still runs.
+#   * take its weight from lambda_hier_pc below, not from the notebook's hier_aux_weight.
+#
+# JUDGE IT LIKE THE OTHER ARMS: at ep15+ (this family inverts between ep5 and ep15), on
+# SPECIFICITY not val loss, comparing best-so-far envelopes not single checkpoints, and take
+# every number twice -- running stats AND scratchpad/bn_test2.py batch stats, since ~60% of
+# the apparent cycling is stale-BatchNorm artifact and the arms are not equally affected.
+#
+# Baselines to beat (specificity; running stats / batch stats at ep15):
+#     legacy     0.46333 / 0.46252      noprenorm  0.45708 / 0.44821
+#     dropout03  0.45120 / 0.45127 (ep13)   flexhier  0.43876 / 0.43871
+#
+# THE PRIMARY READOUT IS MECHANISTIC, NOT THE SCORE. Run scripts/refresh_write_gain.py at
+# ep5 and compare the DOWNWARD gate trajectory against flexhier_wdfix. If the gates still
+# pin at ~0.004 with clean decay and an explicit objective pulling on them, the architecture
+# routes around the descent path -- and that finding is worth more than this arm's number.
+#
+# RUN NAME: give the notebook a NEW checkpoint dir. Reusing an existing run's directory
+# overwrites the baseline checkpoints that the table above was measured on.
+# =============================================================================
+# ============================================================================
 # 3-KERNEL EQUIVALENCE ARM (unified softmax). GENERATED FROM
 # pinball_dna_bidi_linear_3kernel.yaml on 2026-09-13 by flipping exactly ONE key:
 #
@@ -185,10 +390,10 @@ local_pack_rope_axial: false
 
 upper_init: pooled
 upper_seed_gate_init: 1.0
-hier_upward_refresh: true      # LEGACY MATCH (was false)
+hier_upward_refresh: false      # WINDOW-ONLY: no L0 -> coarse write either
 hier_upward_refresh_every: 1
 hier_upward_refresh_gate_init: 0.1
-hier_downward_refresh: true    # LEGACY MATCH (was false)
+hier_downward_refresh: false   # WINDOW-ONLY route 3: the dominant coarse -> L0 gather
 hier_downward_refresh_every: 1
 hier_downward_refresh_gate_init: 0.1
 hier_refresh_compile: true
@@ -355,7 +560,8 @@ sigreg_train_only: true
 # SIGReg was chosen over VICReg (VICReg centres and is therefore blind to a constant-bias
 # degeneracy). Normalising first hands the statistic half its value for free and reintroduces
 # that blindness. Set to "all" only to test that claim.
-hier_latent_exit_norm: [aux, predaux]
+hier_latent_exit_norm: [aux, predaux, pc]   # pc ADDED 2026-09-15: PC scores the
+                                           # same representation the head reads, as on text
 qk_norm: true
 qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
 
@@ -364,10 +570,10 @@ qk_norm_type: rms               # rms (nn.RMSNorm) | layer (nn.LayerNorm)
 local_attn_windows: [128, 128, 128, 128, 128, 128, 128]
 l0_local_window: 128
 
-local_pack_cross_level: true
+local_pack_cross_level: false   # WINDOW-ONLY route 1: packed window no longer mixes levels
 local_pack_query_levels: [0, 1, 2, 3, 4, 5, 6]   # MUST cover every level
 local_pack_level_bias: true
-local_pack_coarse_lane: true
+local_pack_coarse_lane: false   # inert once cross_level is false; explicit for clarity
 # Lane radius in COARSE bank slots -- this is the knob that buys within-level lateral
 # reach, and unlike the band it is denominated in the bank rather than the mixed stream.
 # Own-level nodes seen at 32768: 900 -> 982/491/245 at L1/L2/L3, 469 -> 512/256/128,
@@ -379,29 +585,8 @@ local_pack_coarse_window: 128 #900
 # one softmax over the union: a coarse row inside BOTH the band and the lane is attended
 # twice (~57 of ~900 lane keys at 32768). That is inherent to the path, not a defect, and
 # the trained A/B on 2026-07-14 favoured additive over flex_union late-run anyway.
-local_pack_flex_union: true     # THE ONE INTENDED DIFFERENCE from the 3kernel arm
-local_pack_global_block: 64
-# ^ ENABLED 2026-09-17. Measured this session: the GLOBAL TIER is queries = keys = tier rows
-# (hierarchical_message_passing.py ~4597), so L0 NEVER reads it -- global context reached a token
-# only through hier_downward_refresh, the path the gate audit measured decaying 0.1 -> 0.004.
-# That is the likely reason block-shuffle influence at 240-256 kb is ~100x the window-only
-# control (the distal signal EXISTS) while the hierarchy bought only ~0.002 specificity over
-# window-only at ep5 (it was NOT DELIVERED). This block prepends a fixed top-down coarse budget
-# to the K/V of EVERY query, so tokens read a global summary directly.
-#   64 -> L4+L5+L6 = 42 rows at 500 kb (4,096 tokens); use 128 at 4 Mb for L5+L6 = 80.
-#   FIXED budget keeps it O(N): cost <= budget*N. A sqrt-sized budget would be N^1.5.
-# MEASURED FASTER, not slower: 4096 tok fwd+bwd, both orderings, 152.8/151.5 ms off vs
-# 141.3/139.5 ms on (-7.8%), memory-neutral -- the flag switches the flex layout to the more
-# block-coherent PREFIX form (KV blocks 3768 -> 3138).
-# NOTE the flag was a SILENT NO-OP before 2026-09-17: the shared gate was allocated under
-# local_pack_coarse_global and the flag was never threaded to the layer. Fixed in
-# hierarchical_message_passing.py + hierarchical_flow_gat_cached_batch.py, verified
-# bit-identical when off. An older checkout will ignore this key.
-# BASELINES PREDATE THIS. Any specificity in the headers below (incl. wdfix 0.44000 ep5 /
-# 0.44349 ep10 / 0.44230 ep15) was produced with the block OFF. Use git history to reproduce.
-local_pack_coarse_global_gate_init: 0.1   # inert while flex_union is true (the block joins the
-                                          # unified softmax ungated); matters only on the
-                                          # additive path, where 0.0 would be silent.
+local_pack_flex_union: false    # inert once cross_level is false; explicit for clarity
+local_pack_global_block: 0      # the tier replaces it: n_tier^2 instead of n_block*N
 local_pack_l0_coarse_rank_window: 0     # OFF: that clause is the quadratic one (its key
                                         # set is a fixed fraction of N).
 local_pack_lane_merge: false    # causal-only; inert in a bidi run
@@ -411,7 +596,7 @@ local_pack_lane_merge: false    # causal-only; inert in a bidi run
 # held, for n^2 instead of n*N.
 #   budget 0      topmost level alone: 16 nodes at 32768, and only 2 at 4096.
 #   budget sqrt   floor(sqrt(N)); at 32768 that is 80 nodes and strands L4, hence 400 here.
-local_pack_top_global: true
+local_pack_top_global: false    # inert once cross_level is false; explicit for clarity
 local_pack_top_global_budget: 400     # 0 | <row budget> | sqrt
 # local_pack_coarse_window also accepts "auto": the radius that puts a tier node inside EVERY
 # coarse row's window, so the ascent to the tier is one hop. It is sized from the true
@@ -463,6 +648,108 @@ pinball_multirate_enable: false
 # it now TEACHES attention what the refresh was hard-wiring, at zero parameters.
 # It is still minimised by COLLAPSE (identical features -> cosine 0), so keep sigreg on as the
 # anti-collapse partner; the two are complementary and sigreg is free (it saturates by ep1).
+
+# ----- predictive coding (THE ONE INTENDED DIFFERENCE from the flexhier arm) -----
+hier_pc_enable: false          # WINDOW-ONLY: PC trains the downward projections, which are gone
+lambda_hier_pc: 0.01            # 0.01 on 2026-09-15 to DISENTANGLE TWO CHANGES that
+                                # landed together. The PC sum finally plummeted (22.5 -> 8.5 in
+                                # 914 steps, after sitting at 24-27 for 10,000), but in that same
+                                # run lambda went 0.01 -> 0.1 AND the Muon routing fix took
+                                # effect, so either could be the cause.
+                                # THE MUON FIX: hier_pc_decoder params were being routed to Muon
+                                # by the ndim>=2 rule. `up` is 3-D [comp, hidden, rank] and Muon
+                                # flattens >2-D updates to [comp, hidden*rank] before
+                                # Newton-Schulz, semi-orthogonalising the per-offset decoders
+                                # against each other -- while the objective wants adjacent
+                                # offsets SIMILAR. Now routed to AdamW in both
+                                # ChromScape/bin/optimizer_utils.py and src/pinball/cli.py.
+                                # WHY 0.01 AND NOT 0.1: 0.01 is the value that ALREADY FAILED to
+                                # move the sum (flat at 24-27 over 10,000 steps) -- but that was
+                                # with the decoder on Muon. Rerunning the same lambda with the
+                                # routing fixed is the tightest available A/B: one variable, and
+                                # a known prior result to compare against.
+                                # THE TEST: if PC still plummets at 0.01 with the fix active,
+                                # the fix was the cause -- a real finding. If it stalls back at
+                                # 24-27 as it did before, the plummet was pressure and the
+                                # routing was a minor
+                                # handicap. Read train/pc/* to confirm the fix is actually loaded:
+                                # those series only appear when the reloaded model module runs.
+                                # Previous note: RAISED to 0.1 because at 0.01 the sum would not
+                                # fall, so this deliberately applies heavy pressure.
+                                # READ WITH hier_aux_cap_frac IN THE NOTEBOOK. 0.1 x ~19 = 1.9
+                                # against a supervised loss of ~0.39 is ~490% of the objective --
+                                # five times the coverage task, and the observed PC spike of 79.6
+                                # (step 1451) would be ~2000% for that step. So any cap below
+                                # ~4.9 binds constantly and the CAP, not lambda, sets the true
+                                # weight. That is intentional here: cap_frac 1.0 pins PC at 1x the
+                                # supervised loss -- well above the ~60% at which text's PC fell
+                                # 11x -- while clipping spikes that lambda alone cannot bound.
+                                # ABORT SIGNAL: val_loss / val_PearsonR materially worse than the
+                                # 0.39098 / 0.664 baseline at epoch 1-2. PC falling while the task
+                                # degrades is not a win.
+                                # Previous note: RAISED from 0.005 after one epoch at full weight
+                                # weight (cap off) moved the PC sum only 24.46 -> 19.01 on
+                                # 100-row means over 5800 steps. Text fell ~11x in ~3000 steps,
+                                # so this is far slower than the reference, and the reason looks
+                                # like pressure: 0.005 x ~19 = 0.095 against a supervised loss of
+                                # ~0.39 is ~24% of the objective, where text's fast drop happened
+                                # at ~60%. 0.01 puts it near 49%. Headroom confirmed by epoch 0
+                                # val: 0.39098 / PearsonR 0.664, against the throttled run's
+                                # 0.39004 / 0.66148 -- PC is costing the task nothing so far.
+                                # NOT the text arm's 0.25 -- see the LAMBDA note in the header.
+                                # The DNA coverage loss is ~0.33 against text CE ~4.2, so the
+                                # same weight is ~13x more dominant here, and this arm has 6
+                                # pairs to text's 3. 0.005 x an expected ~5.2 steady-state PC
+                                # gives ~0.026, about 8% of the supervised loss.
+                                # The patched configure_hier_aux_loss reads THIS key, so the yaml
+                                # is the single source of truth; the notebook's hier_aux_weight
+                                # no longer decides. Re-derive from train/hier_aux_loss once it
+                                # has run a few hundred steps -- but NOT from epoch 1.
+hier_pc_center_pred: true       # OFFSET-INVARIANT SCORE (added 2026-09-15). The default centres
+                                # the denominator but not the numerator, so a shared mean offset
+                                # between prediction and target inflates the loss -- exactly what
+                                # centring exists to prevent. Measured: the exact per-batch mean
+                                # scores 1.000, the same predictor offset by 1 sd scores 2.00 and
+                                # by 2 sd 5.02. DNA showed every pair pinned at 3-4, i.e. WORSE
+                                # than the mean predictor, which the bias term reaches for free --
+                                # so that is a moving target, not insufficient pressure, and no
+                                # lambda lifts it. Likely source here: genomic windows differ in
+                                # coverage statistics and the host's BatchNorm makes the latents
+                                # batch-dependent, so the level's per-batch mean drifts.
+                                # NOTE values are NOT comparable across this flag.
+hier_pc_center_target: true     # explicit: 1.0 = no better than predicting the level mean.
+                                # Uncentred, the denominator carries the level's shared constant,
+                                # so inflating that constant lowers the loss for free.
+hier_pc_pairs: null             # null = every adjacent (l, l+1): 0:1, 1:2, 2:3
+hier_pc_loss_mode: mse_norm     # PC needs magnitude sensitivity, so NOT cosine; mse_norm
+                                # bounds the scale that made the original mse aux blow up
+hier_pc_l0_target: features     # TASK-ANCHORED -- the clamp is the COVERAGE loss on L0.
+                                # NOT `input`: that would capture the host's CNN/UNet features and
+                                # make the hierarchy a multiscale generative model of the GENOME
+                                # (isochores, repeat density, GC) -- real causes, but causes of
+                                # the sequence, with nothing in the objective asking them to be
+                                # causes of the coverage. Here input and target are different
+                                # modalities, so the choice matters; in the text arm they are the
+                                # same stream shifted by one, which is why the TEXT RUN CANNOT
+                                # VALIDATE THIS KEY for DNA. With `features` the hierarchy
+                                # inherits the task's semantics through L0 without ever naming
+                                # the DNA.
+hier_pc_l0_ce: false            # no vocabulary here; the L0 term is MSE on those features
+hier_pc_detach_target: false    # TRUE PC is joint. true gives the JEPA variant if it destabilises
+hier_pc_causal_horizon: auto    # bidirectional -> resolves to 0 (own window). Nothing is
+                                # filtered here, so all 16 offsets already participate
+                                # (8176 -> 8176 edges, ~32 children per parent) -- the causal
+                                # text arm needs the same pairing built geometrically.
+hier_pc_own_window_detach: true # WAS false. Flipped after the text arm collapsed with
+                                # attached targets (see that config's header). Text cannot
+                                # validate the ANCHOR for DNA, but it can validate this flag:
+                                # both arms have a soft task-loss clamp, so both are exposed.
+# SUPERSEDED by configs/pinball_dna_bidi_linear_3kernel_pc.yaml, which branches off the arm
+# actually running (3kernel) rather than flexhier. Kept only if a flexhier PC arm is wanted.
+hier_pc_predictor: per_offset   # parent predicts each child INDIVIDUALLY (see header)
+hier_pc_rank: 64                # low-rank bottleneck: +3.54M instead of +50.3M full
+hier_pc_level_weights: null
+
 use_aux_loss: false
 hier_aux_mode: mean_mse         # jepa_mlp would allocate 16.8M predictor params, dead unless aux is on
 # MUST be cosine, not the `mse` default: raw mse is scale-dependent and was measured climbing

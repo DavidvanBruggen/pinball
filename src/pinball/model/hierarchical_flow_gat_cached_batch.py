@@ -173,6 +173,42 @@ def _build_node_pos_local_from_offsets(
     return node_pos_local
 
 
+def _parse_sqrt_budget(raw: Any) -> float:
+    """Multiplier k in a ``"sqrt"`` / ``"sqrt*k"`` global-tier budget.
+
+    The tier attends all-to-all over itself, so a budget of ``k * sqrt(N)`` rows costs
+    ``k**2 * N`` -- linear in N for ANY fixed k. Plain ``"sqrt"`` (k=1) is therefore not the
+    boundary of linear scaling, only the point where the tier costs exactly 1x N, and it is
+    far too tight in practice: the tier takes WHOLE levels, so k=1 buys one fewer level than
+    the explicit budgets these configs actually run. Measured with
+    ``compression_ratios [16,4,4,8,8,8]`` at overlap 0.5, against the ``400`` these DNA
+    configs use:
+
+        N        budget 400     sqrt (k=1)     sqrt*2
+        32768    L4..L6 = 336   L5..L6 = 80    L4..L6 = 336
+        65536    L5..L6 = 160   L5..L6 = 160   L5..L6 = 160
+        131072   L5..L6 = 320   L5..L6 = 320   L5..L6 = 320
+        262144   L6     = 128   L6     = 128   L5..L6 = 640
+
+    So k=2 reproduces the explicit budget everywhere it was tuned and, unlike both a fixed
+    400 and k=1, does not collapse the tier to a single level at long context -- at 262144 it
+    costs 1.56x N, LESS relative to N than the 3.4x N the 32768 arm already runs.
+    """
+    text = str(raw).strip().lower().replace(" ", "")
+    if text == "sqrt":
+        return 1.0
+    if text.startswith("sqrt*"):
+        try:
+            k = float(text[len("sqrt*"):])
+        except ValueError:
+            k = float("nan")
+        if math.isfinite(k) and k > 0.0:
+            return k
+    raise ValueError(
+        "local_pack_top_global_budget must be an int, 'sqrt', or 'sqrt*<k>' with k > 0, "
+        "got %r." % (raw,))
+
+
 class _PCPerOffsetDecoder(nn.Module):
     """Parent -> its OWN children, one distinct prediction per child offset.
 
@@ -3375,10 +3411,9 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_top_global = bool(local_pack_top_global)
         _tgb = local_pack_top_global_budget
         if isinstance(_tgb, str):
-            if _tgb.strip().lower() != "sqrt":
-                raise ValueError(
-                    "local_pack_top_global_budget must be an int or 'sqrt', got %r." % (_tgb,))
-            self.local_pack_top_global_budget: Union[int, str] = "sqrt"
+            _k = _parse_sqrt_budget(_tgb)          # raises on anything else
+            self.local_pack_top_global_budget: Union[int, str] = (
+                "sqrt" if _k == 1.0 else "sqrt*%g" % (_k,))
         else:
             self.local_pack_top_global_budget = max(0, int(_tgb or 0))
         _ctn = int(local_pack_coarse_window_tier_nodes or 2)
@@ -4222,6 +4257,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_l0_coarse_rank_window=int(getattr(self, "local_pack_l0_coarse_rank_window", 0)),
                         hqd_keep_stage_survivors=bool(getattr(self, "hqd_keep_stage_survivors", False)),
                         local_pack_coarse_global_gate_init=float(getattr(self, "local_pack_coarse_global_gate_init", 0.0)),
+                        local_pack_global_block=int(getattr(self, "local_pack_global_block", 0) or 0),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
@@ -4321,6 +4357,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_l0_coarse_rank_window=int(getattr(self, "local_pack_l0_coarse_rank_window", 0)),
                         hqd_keep_stage_survivors=bool(getattr(self, "hqd_keep_stage_survivors", False)),
                         local_pack_coarse_global_gate_init=float(getattr(self, "local_pack_coarse_global_gate_init", 0.0)),
+                        local_pack_global_block=int(getattr(self, "local_pack_global_block", 0) or 0),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
@@ -6967,7 +7004,8 @@ class HierarchicalFlowGAT(nn.Module):
 
     def _resolve_global_tier(self, level_rows: List[torch.Tensor], top_level: int):
         """Levels forming the all-to-all global tier: whole levels top-down while they fit
-        local_pack_top_global_budget ("sqrt" -> floor(sqrt(max_seq_len))). Membership is
+        local_pack_top_global_budget ("sqrt" -> floor(sqrt(max_seq_len)), "sqrt*k" -> k times
+        that; see _parse_sqrt_budget for why k=1 is too tight). Membership is
         derived from the configured training length, not the current prefix length. Otherwise
         frontier generation can activate a lower level that was never in the training tier.
         Budget 0 returns the top level alone. Returns current row tensors, top level first."""
@@ -6975,7 +7013,7 @@ class HierarchicalFlowGAT(nn.Module):
         reference_sizes = list(self._predict_level_sizes(int(self.max_seq_len)))
         if isinstance(raw, str):
             n0 = int(reference_sizes[0]) if reference_sizes else 0
-            budget = math.isqrt(max(0, n0)) if raw.strip().lower() == "sqrt" else 0
+            budget = int(_parse_sqrt_budget(raw) * math.isqrt(max(0, n0)))
         else:
             budget = max(0, int(raw or 0))
         top_level = int(top_level)

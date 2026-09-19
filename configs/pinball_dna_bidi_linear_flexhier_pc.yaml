@@ -541,7 +541,28 @@ local_pack_coarse_window: 128 #900
 # twice (~57 of ~900 lane keys at 32768). That is inherent to the path, not a defect, and
 # the trained A/B on 2026-07-14 favoured additive over flex_union late-run anyway.
 local_pack_flex_union: true     # THE ONE INTENDED DIFFERENCE from the 3kernel arm
-local_pack_global_block: 0      # the tier replaces it: n_tier^2 instead of n_block*N
+local_pack_global_block: 64
+# ^ ENABLED 2026-09-17. Measured this session: the GLOBAL TIER is queries = keys = tier rows
+# (hierarchical_message_passing.py ~4597), so L0 NEVER reads it -- global context reached a token
+# only through hier_downward_refresh, the path the gate audit measured decaying 0.1 -> 0.004.
+# That is the likely reason block-shuffle influence at 240-256 kb is ~100x the window-only
+# control (the distal signal EXISTS) while the hierarchy bought only ~0.002 specificity over
+# window-only at ep5 (it was NOT DELIVERED). This block prepends a fixed top-down coarse budget
+# to the K/V of EVERY query, so tokens read a global summary directly.
+#   64 -> L4+L5+L6 = 42 rows at 500 kb (4,096 tokens); use 128 at 4 Mb for L5+L6 = 80.
+#   FIXED budget keeps it O(N): cost <= budget*N. A sqrt-sized budget would be N^1.5.
+# MEASURED FASTER, not slower: 4096 tok fwd+bwd, both orderings, 152.8/151.5 ms off vs
+# 141.3/139.5 ms on (-7.8%), memory-neutral -- the flag switches the flex layout to the more
+# block-coherent PREFIX form (KV blocks 3768 -> 3138).
+# NOTE the flag was a SILENT NO-OP before 2026-09-17: the shared gate was allocated under
+# local_pack_coarse_global and the flag was never threaded to the layer. Fixed in
+# hierarchical_message_passing.py + hierarchical_flow_gat_cached_batch.py, verified
+# bit-identical when off. An older checkout will ignore this key.
+# BASELINES PREDATE THIS. Any specificity in the headers below (incl. wdfix 0.44000 ep5 /
+# 0.44349 ep10 / 0.44230 ep15) was produced with the block OFF. Use git history to reproduce.
+local_pack_coarse_global_gate_init: 0.1   # inert while flex_union is true (the block joins the
+                                          # unified softmax ungated); matters only on the
+                                          # additive path, where 0.0 would be silent.
 local_pack_l0_coarse_rank_window: 0     # OFF: that clause is the quadratic one (its key
                                         # set is a fixed fraction of N).
 local_pack_lane_merge: false    # causal-only; inert in a bidi run

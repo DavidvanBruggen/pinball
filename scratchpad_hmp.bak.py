@@ -538,11 +538,6 @@ class HierarchicalMessagePassing(MessagePassing):
         local_pack_l0_coarse_rank_window: int = 0,
         hqd_keep_stage_survivors: bool = False,
         local_pack_coarse_global_gate_init: float = 0.0,
-        # Fixed top-down coarse budget prepended to the K/V of EVERY query (see the model spec
-        # builder). Needed here only so the shared coarse_global_gate gets allocated: without
-        # it the block path's `hasattr(self, "coarse_global_gate")` guard is False and the
-        # whole mechanism is a SILENT no-op.
-        local_pack_global_block: int = 0,
         # ONE flex_attention call with the block-sparse union mask (see model spec builder).
         local_pack_flex_union: bool = False,
         # DropNode on the hierarchy: per (batch, coarse row) each step, zero that row's
@@ -678,8 +673,7 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_l0_coarse_windows = (
             [int(x) for x in local_pack_l0_coarse_windows]
             if local_pack_l0_coarse_windows else [])
-        self.local_pack_global_block = max(0, int(local_pack_global_block or 0))
-        if self.local_pack_coarse_global or self.local_pack_global_block > 0:
+        if self.local_pack_coarse_global:
             # Raw scalar, NOT a sigmoid: init 0.0 must be EXACT identity so a warm start
             # is bit-identical to the flag being off. Grafting this term ungated onto
             # trained weights collapsed |near| by 1128x (bench_erf, 2026-08-12) -- the
@@ -5482,7 +5476,6 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_l0_coarse_rank_window: int = 0,  # flex union: L0 coarse radius, coarse-rank units
         hqd_keep_stage_survivors: bool = False,  # HQD fetch is mixed-level -> tag k/v by level
         local_pack_coarse_global_gate_init: float = 0.0,  # 0.0 = exact identity (warm-start safe)
-        local_pack_global_block: int = 0,  # fixed coarse budget in EVERY query's K/V; allocates the gate
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
         hier_node_dropout: float = 0.0,  # DropNode on coarse rows (value-side, L0 exempt)
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,  # overrides the scalar
@@ -5581,7 +5574,6 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_l0_coarse_rank_window=local_pack_l0_coarse_rank_window,
             hqd_keep_stage_survivors=hqd_keep_stage_survivors,
             local_pack_coarse_global_gate_init=local_pack_coarse_global_gate_init,
-            local_pack_global_block=local_pack_global_block,
             local_pack_flex_union=local_pack_flex_union,
             hier_node_dropout=hier_node_dropout,
             hier_node_dropout_per_level=hier_node_dropout_per_level,
