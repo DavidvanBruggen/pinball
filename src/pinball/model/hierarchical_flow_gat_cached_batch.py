@@ -2560,6 +2560,13 @@ class HierarchicalFlowGAT(nn.Module):
         # small vector instead of a rescaled average.
         hier_pool_gate: bool = False,
         hier_pool_gate_bias_init: float = 2.0,
+        # Pooling REDUCTION (see _pooled_child_window_means / _pool_window_reduce). The mean
+        # is a good CARRIER and a bad ROUTER: one relevant child in a comp-wide window is
+        # diluted comp-fold before any parent, refresh or nominator ever sees it. "max" and
+        # "attn" keep the mean term and add a learnable blend toward a peak-preserving
+        # reduction. "mean" is a separate code path and stays bit-identical.
+        hier_pool_mode: str = "mean",
+        hier_pool_blend_init: float = 1.0,
         # Per-layer downward refresh — the linear-cost DENSE replacement for the bridges/
         # staggered scatter edges: each fine node gathers the MOST-RECENT CLOSED node of each
         # strictly-coarser level (the same node a bridge edge points at), projected per pair
@@ -2816,6 +2823,14 @@ class HierarchicalFlowGAT(nn.Module):
         # on any failure. NOTE: flex has no attention-prob dropout (residual/FFN dropout
         # unaffected).
         local_pack_flex_union: bool = False,
+        local_pack_flex_strict: bool = False,
+        local_pack_global_select: str = "levels",
+        local_pack_global_l0_budget: int = 0,
+        local_pack_global_score_bias: bool = True,
+        local_pack_global_select_every: int = 32,
+        local_pack_global_dedup: bool = True,
+        local_pack_global_logit: bool = False,
+        local_pack_global_chunk: int = 0,
         # DropNode on the hierarchy: zero a coarse row's VALUE in the packed K/V set per
         # (batch, row, step). L0 never dropped; residual stream and refresh paths untouched.
         hier_node_dropout: float = 0.0,
@@ -3435,6 +3450,14 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_l0_coarse_windows = list(local_pack_l0_coarse_windows or [])
         self.local_pack_coarse_global_gate_init = float(local_pack_coarse_global_gate_init)
         self.local_pack_flex_union = bool(local_pack_flex_union)
+        self.local_pack_flex_strict = bool(local_pack_flex_strict)
+        self.local_pack_global_select = str(local_pack_global_select).lower()
+        self.local_pack_global_l0_budget = max(0, int(local_pack_global_l0_budget or 0))
+        self.local_pack_global_score_bias = bool(local_pack_global_score_bias)
+        self.local_pack_global_select_every = max(1, int(local_pack_global_select_every or 1))
+        self.local_pack_global_dedup = bool(local_pack_global_dedup)
+        self.local_pack_global_logit = bool(local_pack_global_logit)
+        self.local_pack_global_chunk = max(0, int(local_pack_global_chunk or 0))
         self.hier_node_dropout = float(hier_node_dropout)
         self.local_window_dropout = float(local_window_dropout)
         if self.local_window_dropout > 0.0:
@@ -4259,6 +4282,14 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_coarse_global_gate_init=float(getattr(self, "local_pack_coarse_global_gate_init", 0.0)),
                         local_pack_global_block=int(getattr(self, "local_pack_global_block", 0) or 0),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
+                        local_pack_flex_strict=bool(getattr(self, "local_pack_flex_strict", False)),
+                        local_pack_global_select=str(getattr(self, "local_pack_global_select", "levels")),
+                        local_pack_global_l0_budget=int(getattr(self, "local_pack_global_l0_budget", 0) or 0),
+                        local_pack_global_score_bias=bool(getattr(self, "local_pack_global_score_bias", True)),
+                        local_pack_global_select_every=int(getattr(self, "local_pack_global_select_every", 32) or 32),
+                        local_pack_global_dedup=bool(getattr(self, "local_pack_global_dedup", True)),
+                        local_pack_global_logit=bool(getattr(self, "local_pack_global_logit", False)),
+                        local_pack_global_chunk=int(getattr(self, "local_pack_global_chunk", 0) or 0),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
                         local_window_dropout=float(getattr(self, "local_window_dropout", 0.0)),
@@ -4359,6 +4390,14 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_coarse_global_gate_init=float(getattr(self, "local_pack_coarse_global_gate_init", 0.0)),
                         local_pack_global_block=int(getattr(self, "local_pack_global_block", 0) or 0),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
+                        local_pack_flex_strict=bool(getattr(self, "local_pack_flex_strict", False)),
+                        local_pack_global_select=str(getattr(self, "local_pack_global_select", "levels")),
+                        local_pack_global_l0_budget=int(getattr(self, "local_pack_global_l0_budget", 0) or 0),
+                        local_pack_global_score_bias=bool(getattr(self, "local_pack_global_score_bias", True)),
+                        local_pack_global_select_every=int(getattr(self, "local_pack_global_select_every", 32) or 32),
+                        local_pack_global_dedup=bool(getattr(self, "local_pack_global_dedup", True)),
+                        local_pack_global_logit=bool(getattr(self, "local_pack_global_logit", False)),
+                        local_pack_global_chunk=int(getattr(self, "local_pack_global_chunk", 0) or 0),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
                         local_window_dropout=float(getattr(self, "local_window_dropout", 0.0)),
@@ -4687,6 +4726,26 @@ class HierarchicalFlowGAT(nn.Module):
             logger.info("Relevance-gated pooling enabled (%d levels, bias init %.3g -> gate %.5f).",
                         _nl, float(hier_pool_gate_bias_init),
                         float(torch.sigmoid(torch.tensor(float(hier_pool_gate_bias_init)))))
+
+        # --- Pooling reduction mode (see _pool_window_reduce) ---
+        self.hier_pool_mode = str(hier_pool_mode).lower()
+        if self.hier_pool_mode not in {"mean", "max", "attn"}:
+            raise ValueError("hier_pool_mode must be 'mean', 'max' or 'attn', got "
+                             f"{hier_pool_mode!r}")
+        if self.hier_pool_mode != "mean":
+            _npl = len(compression_ratios)
+            self.pool_blend = nn.Parameter(
+                torch.full((_npl,), float(hier_pool_blend_init)))
+            if self.hier_pool_mode == "attn":
+                # ZERO init is deliberate: the softmax is then uniform, so attention pooling
+                # equals the mean EXACTLY at step 0 while still passing gradient into the
+                # query (blend multiplies the difference, and d(attn)/dq is nonzero there).
+                # The router can therefore only depart from the carrier by learning to.
+                self.pool_attn_query = nn.Parameter(
+                    torch.zeros(_npl, self.hidden_dim))
+            logger.info("Hierarchy pooling mode '%s' (%d levels, blend init %.3g, +%d params).",
+                        self.hier_pool_mode, _npl, float(hier_pool_blend_init),
+                        _npl * (1 + (self.hidden_dim if self.hier_pool_mode == "attn" else 0)))
 
         # --- Per-layer downward refresh (see _apply_downward_refresh) ---
         self.hier_downward_refresh = bool(hier_downward_refresh)
@@ -6248,6 +6307,9 @@ class HierarchicalFlowGAT(nn.Module):
         comp/stride override the per-level rule; direct-L0 pooling passes the cumulative
         window from _cumulative_window so `lower` can be L0 for any lvl.
 
+        hier_pool_mode selects the reduction itself (mean | max | attn); see
+        _pool_window_reduce. 'mean' keeps this function's original code path verbatim.
+
         With hier_pool_gate the children are scaled by a per-child sigmoid relevance gate
         BEFORE the window reduction. Scaling the input rather than the window keeps the gate
         parent-independent, so nothing beyond a [B, n_lower] vector is materialised and every
@@ -6265,13 +6327,62 @@ class HierarchicalFlowGAT(nn.Module):
             lower = lower * torch.sigmoid(lower @ u + b).unsqueeze(-1)
         n_bulk = min(n_parent, (n_lower - comp) // stride + 1) if n_lower >= comp else 0
         parts = []
-        if n_bulk > 0:
-            parts.append(lower.unfold(1, comp, stride)[:, :n_bulk].mean(dim=-1))
-        for i in range(n_bulk, n_parent):
-            start = min(i * stride, n_lower - 1)
-            end = max(min(start + comp, n_lower), start + 1)
-            parts.append(lower[:, start:end].mean(dim=1, keepdim=True))
+        if str(getattr(self, "hier_pool_mode", "mean")) == "mean":
+            # Untouched original path: kept verbatim so the default stays bit-identical AND
+            # keeps the zero-copy unfold reduction over the LAST axis (a transpose would
+            # make it a strided reduce).
+            if n_bulk > 0:
+                parts.append(lower.unfold(1, comp, stride)[:, :n_bulk].mean(dim=-1))
+            for i in range(n_bulk, n_parent):
+                start = min(i * stride, n_lower - 1)
+                end = max(min(start + comp, n_lower), start + 1)
+                parts.append(lower[:, start:end].mean(dim=1, keepdim=True))
+        else:
+            # Both layouts normalised to [.., comp, H] so one reducer serves the bulk
+            # unfold and the clamped tails. transpose on the unfold view is free.
+            if n_bulk > 0:
+                win = lower.unfold(1, comp, stride)[:, :n_bulk].transpose(-1, -2)
+                parts.append(self._pool_window_reduce(win, lvl))
+            for i in range(n_bulk, n_parent):
+                start = min(i * stride, n_lower - 1)
+                end = max(min(start + comp, n_lower), start + 1)
+                parts.append(self._pool_window_reduce(
+                    lower[:, start:end].unsqueeze(1), lvl))
         return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+
+    def _pool_window_reduce(self, win: torch.Tensor, lvl: int) -> torch.Tensor:
+        """Reduce child windows [.., comp, H] -> [.., H] under hier_pool_mode.
+
+        `mean` never reaches here (the caller keeps its original zero-copy path). The other
+        two both keep the mean term explicitly and add a learnable blend toward a
+        peak-preserving reduction, so `blend` can retreat to the carrier if the peak hurts:
+
+          max  -> mean + blend * (amax - mean);  blend 1 is exactly max pooling.
+          attn -> mean + blend * (softmax(win @ q_l / sqrt(H)) . win - mean).
+
+        Why attention pooling rather than the existing hier_pool_gate: that gate scores a
+        child by its OWN content through one learned direction and then divides by the
+        window COUNT (deliberately -- an all-low-gate window is meant to produce a small
+        vector, not a rescaled average). That is a saliency filter. A router needs a
+        normalised competition among the children of one parent, which is what the softmax
+        over `comp` gives. The two compose: the gate still scales children upstream.
+
+        q_l is zero-initialised so the softmax starts uniform and the reduction equals the
+        mean EXACTLY at step 0, yet d(attn)/dq is nonzero, so the router trains from the
+        first step instead of sitting dead behind a zero blend.
+
+        Scores go through fp32: comp is small, the cost is nil, and a bf16 softmax over a
+        learned dot product is the kind of thing that silently flattens early in training.
+        """
+        mean = win.mean(dim=-2)
+        blend = self.pool_blend[lvl - 1].to(dtype=win.dtype)
+        if self.hier_pool_mode == "max":
+            return mean + blend * (win.amax(dim=-2) - mean)
+        q = self.pool_attn_query[lvl - 1].to(dtype=win.dtype)
+        scores = (win * q).sum(dim=-1).float() * (float(win.size(-1)) ** -0.5)
+        weights = torch.softmax(scores, dim=-1).to(dtype=win.dtype)
+        attn = (win * weights.unsqueeze(-1)).sum(dim=-2)
+        return mean + blend * (attn - mean)
 
     def _level_offsets_list(self, level_offsets: torch.Tensor) -> List[int]:
         """level_offsets as python ints without a per-call GPU sync: the skeleton cache keeps
@@ -8051,6 +8162,31 @@ class HierarchicalFlowGAT(nn.Module):
             proj = self.copredict_proj[str(lvl)](gathered)
             out = out + self.copredict_gate[str(lvl)] * proj
         return out
+
+    def flex_union_status(self) -> Dict[str, Any]:
+        """Is the flex-union path actually live? The ONLY trustworthy proof an arm is real.
+
+        `failed_modules` must be 0 on a flexhier run; anything else means those modules are
+        running the additive path and the arm is a duplicate of the one it is being compared
+        against. Cheap enough to assert on every eval row.
+        """
+        enabled, failed, reasons = 0, 0, []
+        for m in self.modules():
+            if not bool(getattr(m, "local_pack_flex_union", False)):
+                continue
+            enabled += 1
+            if bool(getattr(m, "_flex_union_failed", False)):
+                failed += 1
+                r = getattr(m, "_flex_union_failed_reason", "unknown")
+                if r not in reasons:
+                    reasons.append(r)
+        return {
+            "enabled_modules": enabled,
+            "failed_modules": failed,
+            "live": bool(enabled > 0 and failed == 0),
+            "strict": bool(getattr(self, "local_pack_flex_strict", False)),
+            "reasons": reasons,
+        }
 
     @torch.no_grad()
     def _measure_hier_node_specificity(self, x_bnh: torch.Tensor,

@@ -545,6 +545,58 @@ class HierarchicalMessagePassing(MessagePassing):
         local_pack_global_block: int = 0,
         # ONE flex_attention call with the block-sparse union mask (see model spec builder).
         local_pack_flex_union: bool = False,
+        # RAISE instead of falling back when flex cannot compile. A flexhier arm that
+        # silently drops to the additive path is a DUPLICATE of the arm it exists to be
+        # compared against, and nothing downstream looks wrong -- measured 2026-09-19:
+        # in ChromScape-bw (torch 2.7, sm_120) EVERY rung of _FLEX_TILE_LADDER fails.
+        local_pack_flex_strict: bool = False,
+        # CONTENT-SELECTED GLOBAL BLOCK. "levels" is the original rule -- whole coarse levels
+        # top-down while they fit the budget, i.e. selection purely by POSITION in the
+        # hierarchy. "content" scores every packed row with a learned per-level direction and
+        # takes the top-`budget`. Query-INDEPENDENT by construction (one set per sequence,
+        # O(N) to score, read by every query), which is what keeps the block linear; a
+        # query-specific set needs a descent and is a different mechanism.
+        local_pack_global_select: str = "levels",
+        # How many of the budget may be L0 rows. The level rule can never pick L0 (its loop
+        # stops at level 1), so distant token->token reads have only ever been possible
+        # through a pooled summary. Content selection makes them addressable directly.
+        local_pack_global_l0_budget: int = 0,
+        # Add the nomination score to the block's attention logits. Top-k is not
+        # differentiable, so WITHOUT this the nominating vectors get no gradient and never
+        # train -- the same dead-parameter trap as a zero-initialised blend.
+        local_pack_global_score_bias: bool = True,
+        # HOW OFTEN THE ROWS ARE RE-PICKED. Changing the row set invalidates the flex
+        # BlockMask, and create_block_mask costs ~30 ms here -- 12 layers of that is 355
+        # ms/step, measured 2026-09-19 (513 ms vs 159 ms with a stable set). The SCORE is
+        # still recomputed every call, so the gate keeps training every step; only the
+        # membership is held. Features move slowly enough that a stale pick for k steps is
+        # not a meaningful approximation. 1 = re-pick every call (correct, slow).
+        local_pack_global_select_every: int = 32,
+        # EXACT DEDUP vs SPEED. A nominated row is duplicated into the K/V prefix, so the
+        # band clause subtracts it (`band & ~in_glob[p]`) to keep it ONE key. That clause is
+        # what makes the mask depend on WHICH rows were picked. With dedup off the row is
+        # counted twice (+ln2 on that one key) -- exactly the bias the additive path carries
+        # for every mechanism in this repo, and what NSA's separately-normalised branches do.
+        local_pack_global_dedup: bool = True,
+        # STE-STYLE LOGIT. Adds the nomination score to the block's attention logits as a
+        # DETACHED bias, on top of the value gate. Measured 2026-09-19: a differentiable
+        # score_mod input costs 5x (flex's backward must materialise per-element score
+        # gradients), but a DETACHED one is free -- 159.0 ms vs 159.0 ms for identity. So
+        # forward gets what a gate cannot give (a nominated row COMPETES in the softmax
+        # against the local band), while backward still flows through the gate. The gate is
+        # therefore the gradient path and the logit is the shaping path; straight-through
+        # in spirit. Also blunts gate saturation: sigma -> 1 stops teaching, the logit does not.
+        local_pack_global_logit: bool = False,
+        # PER-CHUNK CAUSAL SELECTION. 0 = one shared set (bidi only -- see the guard below).
+        # >0 partitions queries into chunks of this many packed rows; chunk c selects only
+        # from rows that closed before `c*chunk - window`. Two consequences, both load-bearing:
+        # (a) CAUSAL -- every selected row is strictly in the past of every query in the chunk,
+        #     so the selected SET no longer depends on the future, which is the leak that
+        #     killed the shared-set arm on AR text;
+        # (b) COLLISION-FREE -- subtracting `window` guarantees no selected row can also fall
+        #     inside a query's local band, so dedup is exact BY CONSTRUCTION and the mask
+        #     needs no membership test at all (it stays cacheable across re-selections).
+        local_pack_global_chunk: int = 0,
         # DropNode on the hierarchy: per (batch, coarse row) each step, zero that row's
         # VALUE in the packed key/value set so nothing reads its content this step. L0 is
         # never dropped and the residual stream is untouched, so the upward/downward refresh
@@ -679,6 +731,47 @@ class HierarchicalMessagePassing(MessagePassing):
             [int(x) for x in local_pack_l0_coarse_windows]
             if local_pack_l0_coarse_windows else [])
         self.local_pack_global_block = max(0, int(local_pack_global_block or 0))
+        self.local_pack_flex_strict = bool(local_pack_flex_strict)
+        self.local_pack_global_select = str(local_pack_global_select).lower()
+        if self.local_pack_global_select not in {"levels", "content"}:
+            raise ValueError("local_pack_global_select must be 'levels' or 'content', got "
+                             f"{local_pack_global_select!r}")
+        self.local_pack_global_l0_budget = max(0, int(local_pack_global_l0_budget or 0))
+        self.local_pack_global_score_bias = bool(local_pack_global_score_bias)
+        self.local_pack_global_select_every = max(1, int(local_pack_global_select_every or 1))
+        self.local_pack_global_dedup = bool(local_pack_global_dedup)
+        self.local_pack_global_logit = bool(local_pack_global_logit)
+        self.local_pack_global_chunk = max(0, int(local_pack_global_chunk or 0))
+        if (self.local_pack_global_select == "content"
+                and self.local_pack_global_block > 0
+                and self.local_pack_global_chunk <= 0
+                and not bool(local_pack_bidirectional)):
+            # CAUSALITY. The nomination score is computed over ALL packed rows and the top-k
+            # is a GLOBAL function of the whole sequence, so the IDENTITY of the selected set
+            # depends on the future even though the causal clause correctly masks future
+            # KEYS. Measured 2026-09-19 on the text arm: perturbing token 1023 changed the
+            # logits at position 100 by 1.46, and val ppl fell to 12.3 by epoch 7 against a
+            # clean arm's 43.5 -- the leak looks like a spectacular win. Legal on the
+            # bidirectional (DNA) pack, where there is no causality requirement. For AR the
+            # fix is per-query-CHUNK selection (each chunk picks only from rows closed before
+            # it starts), which is also the query-conditioned upgrade; until that exists this
+            # is an error, not a warning.
+            raise ValueError(
+                "local_pack_global_select='content' leaks future information on a CAUSAL "
+                "pack: top-k over all rows makes the selected set a function of the whole "
+                "sequence. Use it only with local_pack_bidirectional=true, or select "
+                "per-chunk from already-closed rows (local_pack_global_chunk > 0).")
+        if self.local_pack_global_select == "content" and self.local_pack_global_block > 0:
+            # One direction per level: "interesting" means different things at 128 bp and at
+            # 32 kb, and a single shared direction is the weakness that makes hier_pool_gate
+            # a saliency filter rather than a router. Small random init, NOT zero: an
+            # all-zero score makes top-k return the first K rows in packed order, which is a
+            # silent positional selection wearing a content selector's name.
+            # num_local_levels, not self.level_embedding: that module is built ~200 lines
+            # below this point and the attribute does not exist yet.
+            _nlv = max(1, int(num_local_levels))
+            self.global_nominate_vec = nn.Parameter(
+                torch.randn(_nlv, int(self.num_heads) * int(self.head_dim)) * 0.02)
         if self.local_pack_coarse_global or self.local_pack_global_block > 0:
             # Raw scalar, NOT a sigmoid: init 0.0 must be EXACT identity so a warm start
             # is bit-identical to the flag being off. Grafting this term ungated onto
@@ -3953,6 +4046,184 @@ class HierarchicalMessagePassing(MessagePassing):
                   len(self._FLEX_TILE_LADDER) - 1)
         return self._FLEX_TILE_LADDER[lvl]
 
+    @torch._dynamo.disable
+    def _nominate_global_rows(self, kp: torch.Tensor, spec: Dict,
+                              lvl_packed: Optional[torch.Tensor], budget: int):
+        """Content-selected global block -> (packed rows [K], per-row score [N] or None).
+
+        Scores come off the packed KEYS rather than raw features: they are what the block
+        actually attends over, they are already projected and RoPE'd, and nothing else is in
+        scope here. Reduced over the batch because `rows` indexes a single shared key set for
+        every batch element -- the block is one set per sequence, not per sample.
+
+        DYNAMO-DISABLED, and that is the whole ballgame. Measured 2026-09-19 on the 4090 at
+        batch 8: with hier_layer_compile ON this arm ran 2242 ms/step against the same arm's
+        155 ms without nomination -- 14x. With compile OFF the two are 251.9 vs 248.2 ms, a
+        1.5% gap. So the mechanism is nearly free and the cost was entirely torch.compile
+        being defeated inside the layer (top-k, data-dependent gathers and the per-call
+        module-attribute cadence are all guard/graph-break bait). Making this an opaque
+        callable keeps the surrounding layer graph intact.
+
+        The score is returned so the caller can add it to the block's attention logits. That
+        is the only gradient path to these vectors (top-k is not differentiable), and it also
+        makes a bad pick degrade gracefully: the model can down-weight a row it was given
+        rather than being forced to attend it.
+        """
+        rows_default = spec["global_block"]["rows"]
+        if not hasattr(self, "global_nominate_vec") or lvl_packed is None:
+            return rows_default, None, None
+        vec = self.global_nominate_vec
+        B, N = int(kp.size(0)), int(kp.size(1))
+        flat = kp.reshape(B, N, -1)
+        if int(flat.size(-1)) != int(vec.size(-1)):
+            raise RuntimeError(
+                "local_pack_global_select='content' expects packed keys of width "
+                f"num_heads*head_dim={int(vec.size(-1))}, got {int(flat.size(-1))}. "
+                "Wide QK (attn_sparse_qk_mult) is not supported on this path yet.")
+        lvl = lvl_packed.clamp(0, int(vec.size(0)) - 1)
+        u = vec.index_select(0, lvl).to(flat.dtype)                     # [N, D]
+        score = (flat * u.unsqueeze(0)).sum(-1).float()                 # [B, N]
+        score = score * (float(flat.size(-1)) ** -0.5)
+        s_shared = score.mean(dim=0)                                    # [N]
+
+        # Level-0 row count is geometry, so it is a host int already -- no sync, and no
+        # data-dependent shape for the top-k (its k is a python int).
+        lr = spec.get("level_rows", None)
+        n_l0_avail = int(lr[0].numel()) if lr else 0
+        n_co_avail = max(0, N - n_l0_avail)
+        k_l0 = min(int(getattr(self, "local_pack_global_l0_budget", 0)), budget, n_l0_avail)
+        k_co = min(max(0, budget - k_l0), n_co_avail)
+        is_co = lvl_packed > 0
+        neg = torch.finfo(s_shared.dtype).min
+        picks = []
+        if k_co > 0:
+            picks.append(torch.topk(s_shared.masked_fill(~is_co, neg), k_co).indices)
+        if k_l0 > 0:
+            picks.append(torch.topk(s_shared.masked_fill(is_co, neg), k_l0).indices)
+        if not picks:
+            return rows_default, None, None
+        _chunk = int(getattr(self, "local_pack_global_chunk", 0) or 0)
+        if _chunk > 0:
+            # Cadence on the chunked path too: re-picking rows invalidates this layer's
+            # BlockMask, and rebuilding 12 of those per step costs ~940 ms. Holding the rows
+            # cannot break causality here the way it could for a shared set -- the chunk
+            # limit is GEOMETRIC (rank < c*chunk - window), so a row that was legal for a
+            # chunk stays legal no matter which step chose it. The score is still recomputed
+            # every call, so the gate keeps training.
+            _ev = max(1, int(getattr(self, "local_pack_global_select_every", 1)))
+            _cl = int(getattr(self, "_gsel_chunk_calls", 0))
+            self._gsel_chunk_calls = _cl + 1
+            _cc = getattr(self, "_gsel_chunk_cache", None)
+            if _cc is not None and (_cl % _ev) != 0:
+                _rows_c, _meta_c = _cc
+                return _rows_c, s_shared.index_select(0, _rows_c), _meta_c
+            _r, _sc, _mt = self._nominate_chunked(spec, lvl_packed, s_shared, budget,
+                                                  _chunk, k_co, k_l0)
+            self._gsel_chunk_cache = (_r, _mt)
+            return _r, _sc, _mt
+
+        # CADENCE. The score above is recomputed on EVERY call -- it gates the values and
+        # is the scorer's gradient path, so it must stay live. Only the membership is held,
+        # because changing it invalidates the flex BlockMask (see local_pack_global_select_every).
+        _every = max(1, int(getattr(self, "local_pack_global_select_every", 1)))
+        _calls = int(getattr(self, "_gsel_calls", 0))
+        self._gsel_calls = _calls + 1
+        _cached = getattr(self, "_gsel_rows", None)
+        if _cached is not None and (_calls % _every) != 0:
+            return _cached, s_shared, None
+
+        rows = torch.cat(picks)
+        # Ascending packed order = close-time order, which is what the causal clause
+        # (k_rows <= q_rows) and every downstream consumer assume of this row list.
+        rows = torch.sort(rows).values.contiguous()
+        self._gsel_rows = rows
+        # Monotone counter, not a comparison of `rows`: the flex BlockMask caches on
+        # _bm_key and a tensor compare there would be a host sync every layer.
+        self._gsel_version = int(getattr(self, "_gsel_version", 0)) + 1
+        if not bool(getattr(self, "local_pack_global_score_bias", True)):
+            return rows, None, None
+        # s_shared, not the [B, N] score: the block is one key set for the whole batch, and
+        # the flex score_mod must index it with a SINGLE gather (a nested/2-D gather inside a
+        # compiled mask is what produced the illegal memory access documented on tier_pk).
+        return rows, s_shared, None
+
+    def _nominate_chunked(self, spec: Dict, lvl_packed: torch.Tensor,
+                          s_shared: torch.Tensor, budget: int, chunk: int,
+                          k_co: int, k_l0: int):
+        """Per-chunk CAUSAL selection -> (rows [nch*G], score [nch*G], meta).
+
+        Chunk c may only pick rows that closed before `c*chunk - window`. The `- window` is
+        not conservatism: it is what guarantees a selected row can never also sit inside a
+        query's local band, so the band needs no dedup clause and the mask never depends on
+        which rows were picked.
+
+        Slot layout is fixed at [k_co coarse | k_l0 L0] per chunk so the prefix length is a
+        compile-time constant. Early chunks may not have enough closed rows to fill their
+        slots; `ok` marks the live ones and is pure geometry + level counts, so it is
+        computed on device without a host sync and the mask can gather it directly.
+        """
+        dev = s_shared.device
+        n = int(s_shared.numel())
+        W = int(spec.get("window", 0) or 0)
+        nch = (n + chunk - 1) // chunk
+        G = int(k_co + k_l0)
+        idx = torch.arange(n, device=dev)
+        limit = (torch.arange(nch, device=dev) * chunk - W).clamp(min=0)      # [nch]
+        allowed = idx.view(1, -1) < limit.view(-1, 1)                          # [nch, n]
+        neg = torch.finfo(s_shared.dtype).min
+        is_co = (lvl_packed > 0).view(1, -1)
+        base = s_shared.view(1, -1).expand(nch, -1)
+
+        parts, oks = [], []
+        # how many coarse / L0 rows have closed before each chunk's limit -- cumulative
+        # counts indexed by `limit`, so no sync and no python loop over chunks.
+        cum_co = (lvl_packed > 0).to(torch.long).cumsum(0)
+        cum_l0 = (lvl_packed == 0).to(torch.long).cumsum(0)
+        gat = (limit - 1).clamp(min=0)
+        navail_co = torch.where(limit > 0, cum_co.index_select(0, gat), torch.zeros_like(limit))
+        navail_l0 = torch.where(limit > 0, cum_l0.index_select(0, gat), torch.zeros_like(limit))
+        slot = torch.arange(max(k_co, k_l0), device=dev)
+        if k_co > 0:
+            sc = base.masked_fill(~(allowed & is_co), neg)
+            parts.append(torch.topk(sc, k_co, dim=1).indices)                  # [nch, k_co]
+            oks.append(slot[:k_co].view(1, -1) < navail_co.view(-1, 1))
+        if k_l0 > 0:
+            sc = base.masked_fill(~(allowed & ~is_co), neg)
+            parts.append(torch.topk(sc, k_l0, dim=1).indices)
+            oks.append(slot[:k_l0].view(1, -1) < navail_l0.view(-1, 1))
+        rows = torch.cat(parts, dim=1).reshape(-1).contiguous()                # [nch*G]
+        ok = torch.cat(oks, dim=1).reshape(-1).contiguous()                    # [nch*G]
+        score = s_shared.index_select(0, rows)
+        # dead slots contribute nothing through the gate as well as being masked out
+        score = torch.where(ok, score, torch.full_like(score, neg))
+        self._gsel_version = int(getattr(self, "_gsel_version", 0)) + 1
+        return rows, score, {"chunk": int(chunk), "G": G, "nch": int(nch), "ok": ok}
+
+    def _flex_failure_banner(self, exc: Exception) -> str:
+        """Everything needed to diagnose a flex opt-out, in one block a scrollback grep
+        will find. Device and torch version are in here because the answer is almost always
+        environmental and differs BETWEEN the envs on this machine (measured 2026-09-19:
+        torch 2.7/sm_120 fails every rung, torch 2.11/sm_120 passes, torch 2.7/sm_89 passes
+        at tile >= 128 only)."""
+        try:
+            dev = torch.cuda.get_device_name(0)
+            cap = "sm_%d%d" % torch.cuda.get_device_capability(0)
+        except Exception:
+            dev, cap = "unknown", "unknown"
+        return (
+            "\n" + "=" * 78 + "\n"
+            "FLEX UNION DISABLED -- THIS ARM IS NOW RUNNING THE ADDITIVE PATH.\n"
+            f"  device       : {dev} ({cap})\n"
+            f"  torch        : {torch.__version__}\n"
+            f"  tiles tried  : {list(self._FLEX_TILE_LADDER)}\n"
+            f"  last error   : {type(exc).__name__}: "
+            f"{str(exc).splitlines()[0][:160]}\n"
+            "  A flexhier config that falls back is a DUPLICATE of the windowed/additive\n"
+            "  arm it was built to be compared against, and every downstream metric will\n"
+            "  look healthy. Fix the environment, or set local_pack_flex_strict: true to\n"
+            "  make this raise instead of degrading quietly.\n"
+            + "=" * 78)
+
     def _flex_advance_tile(self, spec: Dict) -> bool:
         """Step to the next-coarser tile after a flex failure. False when exhausted."""
         lvl = int(getattr(self, "_flex_tile_level", 0)) + 1
@@ -3971,6 +4242,7 @@ class HierarchicalMessagePassing(MessagePassing):
     def _flex_union_attn(
         self, qp: torch.Tensor, kp: torch.Tensor, vp: torch.Tensor, spec: Dict,
         causal: bool = True,
+        gsel: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
     ) -> torch.Tensor:
         """One flex_attention call over the [coarse | tokens] split layout with the
         block-sparse union mask. Inputs are the mixed-order RoPE'd/tagged q/k/v
@@ -4006,7 +4278,25 @@ class HierarchicalMessagePassing(MessagePassing):
         _tier_rows = None
         if _tg_spec is not None and spec.get("flex_kv_prefix", None) is None:
             _tier_rows = _tg_spec["rows"]
-        _bm_key = _bm_key + (bool(_tier_rows is not None),)
+        # MODULE IDENTITY, and it is not optional. The BlockMask is cached in `spec`, which
+        # is built once per skeleton and SHARED BY EVERY LAYER. With content selection each
+        # layer nominates its OWN rows, so a mask whose clauses reference those rows is
+        # layer-specific -- but _gsel_version is a per-module counter, so all 12 layers hit
+        # version 1 on the first forward, produced identical keys, and layers 1..11 silently
+        # reused the mask layer 0 built. The causal test then referenced layer 0's rows while
+        # the K/V prefix gathered the layer's own: a genuine future leak that survived
+        # restoring the causal clause, because the clause was right and the rows it was
+        # checking were not. Keyed by id(self) only in content mode, so the levels path keeps
+        # sharing one mask across layers as before.
+        _bm_key = _bm_key + (id(self) if (gsel is not None) else None,
+                             bool(_tier_rows is not None),
+                             # chunked: mask is geometry-only, so version is irrelevant
+                             ("chunk", int(gsel[2]["G"]), int(gsel[2]["chunk"]),
+                              int(gsel[0].numel()),
+                              int(getattr(self, "_gsel_version", 0)))
+                             if (gsel is not None and len(gsel) > 2 and gsel[2] is not None)
+                             else (int(getattr(self, "_gsel_version", 0))
+                                   if gsel is not None else None))
         bm = spec.get("flex_block_mask") if spec.get("flex_block_mask_key") == _bm_key else None
         if bm is None:
             r = spec["flex_r_mixed"]
@@ -4059,7 +4349,61 @@ class HierarchicalMessagePassing(MessagePassing):
                     spec["flex_tier_fx"] = tier_fx
 
             kv_pre = spec.get("flex_kv_prefix", None)
-            if kv_pre is not None and in_glob is not None:
+            if gsel is not None:
+                # Content selection reuses the ORIGINAL prefix clauses (exact dedup, exact
+                # causal visibility) rather than moving them into a score_mod -- see the
+                # measurement note at the flex call. That makes the mask depend on WHICH
+                # rows were picked, so the BlockMask is rebuilt whenever the selection
+                # changes; _gsel_version in _bm_key is what forces that, and the rebuild
+                # was measured cheap at this size (see header of the flexnom config).
+                kv_pre = gsel[0]
+                _ig = torch.zeros(int(spec["num_nodes"]), dtype=torch.bool,
+                                  device=perm.device)
+                if bool(getattr(self, "local_pack_global_dedup", True)):
+                    _ig[kv_pre] = True
+                # else: left all-False, so `~in_glob[p]` is a no-op and the band clause --
+                # and hence the mask's dependence on membership -- disappears.
+                in_glob = _ig.index_select(0, spec["flex_perm"]).contiguous()
+            _cm = gsel[2] if (gsel is not None and len(gsel) > 2) else None
+            if _cm is not None and kv_pre is not None:
+                # PER-CHUNK CAUSAL PREFIX. Query row qi belongs to chunk qi//chunk and may
+                # read only that chunk's G prefix slots. Every clause is pure geometry --
+                # chunk arithmetic plus a precomputed validity mask over slots -- so the
+                # BlockMask does not depend on WHICH rows were picked and survives every
+                # re-selection. No dedup clause is needed: the `- window` in the candidate
+                # limit already makes a selected row unreachable from any band.
+                _G2, _C2 = int(_cm["G"]), int(_cm["chunk"])
+                _P2 = int(kv_pre.numel())
+                _nq2 = int(perm.numel())
+                _ok2 = _cm["ok"]
+                _rows2 = kv_pre
+
+                def mask_mod(b, h, qi, ki):
+                    is_pre = ki < _P2
+                    kpre = ki.clamp(max=_P2 - 1)
+                    same = (kpre // _G2) == (qi // _C2)
+                    # THE CAUSAL TEST, in packed order -- the same one the non-chunked
+                    # prefix branch uses, and the same invariant the whole packed path rests
+                    # on ("packed order is close-time order", see the docstring on
+                    # _apply_local_pack_out). It was dropped here on the argument that the
+                    # chunk limit already implies it. That argument holds only if `ok` masks
+                    # EVERY under-filled slot, and an under-filled chunk gets its slots from
+                    # topk over an all-masked row -- which returns arbitrary indices that can
+                    # point at FUTURE rows. Do not rely on a derived invariant for causality
+                    # when the direct test is one comparison.
+                    pre = same & _ok2[kpre] & (qi >= _rows2[kpre])
+                    p = (ki - _P2).clamp(0, _nq2 - 1)
+                    dr = qi - p
+                    band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
+                    if ring_wt is not None:
+                        wt = ring_wt[ring_lvl[p]]
+                        ring = (wt > 0) & ((ring_pos[qi] - ring_pos[p]).abs() <= wt)
+                        if causal_mask:
+                            ring = ring & (dr >= 0)
+                        band = band | ring
+                    return torch.where(is_pre, pre, band)
+
+            elif kv_pre is not None and in_glob is not None:
                 # UNIFIED SOFTMAX, PERMUTATION-FREE. Queries stay in packed order (so r is
                 # the row index itself and no gather is needed); K/V get the G block rows
                 # prepended, so key j < G is block row j and key j >= G is packed row j-G.
@@ -4225,12 +4569,48 @@ class HierarchicalMessagePassing(MessagePassing):
             spec["flex_block_mask"] = bm
             spec["flex_block_mask_key"] = _bm_key
 
-        _pre = spec.get("flex_kv_prefix", None)
+        # NO score_mod HERE -- MEASURED. A score_mod that returns `sc` unchanged is free
+        # (157.5 vs 157.9 ms/step), but the FIRST data-dependent gather inside one costs
+        # 4.6x (720 ms), and a second and third cost nothing more: it is a codegen cliff,
+        # not a slope. So the nomination score cannot ride the logits here. It is applied
+        # as a sigmoid gate on the prefix VALUES below instead -- outside the kernel, free,
+        # and still the gradient path the scorer needs (top-k is not differentiable).
+        _smod = None
+        if (gsel is not None and gsel[1] is not None
+                and bool(getattr(self, "local_pack_global_logit", False))
+                and int(gsel[0].numel()) > 0):
+            _Gs = int(gsel[0].numel())
+            # DETACHED, and that is load-bearing -- see local_pack_global_logit. fp32 to
+            # match the score dtype flex hands to score_mod.
+            # Chunked selection already returns the score PER PREFIX SLOT (one entry per
+            # nch*G slot); the shared-set form returns it per ROW and must be gathered.
+            # Indexing the per-slot vector by row number is a real out-of-bounds -- it is
+            # what the device-side assert caught.
+            _sc_pre = ((gsel[1] if (len(gsel) > 2 and gsel[2] is not None)
+                        else gsel[1].index_select(0, gsel[0])).detach().float())
+
+            def _smod(sc, b, h, qi, ki):
+                return sc + torch.where(ki < _Gs, _sc_pre[ki.clamp(max=_Gs - 1)],
+                                        torch.zeros_like(sc))
+
+        _pre = gsel[0] if gsel is not None else spec.get("flex_kv_prefix", None)
         if _pre is not None:
             # Identity layout: no q gather, K/V carry the block rows as a prefix.
             q_s = qp.transpose(1, 2)                                   # [B, H, N, D]
+            _vpre = vp.index_select(1, _pre)
+            if gsel is not None and gsel[1] is not None:
+                # NOMINATION GATE. sigmoid(score) on the picked rows' VALUES, applied here
+                # rather than as a logit inside the kernel (see the measurement note above).
+                # This is the scorer's only gradient path: top-k is not differentiable, so
+                # without it global_nominate_vec never trains. A gate scales a row's
+                # contribution instead of competing in the softmax -- weaker than a logit
+                # bias, but free, and the same device coarse_global_gate/hier_pool_gate use.
+                _gsrc = (gsel[1] if (len(gsel) > 2 and gsel[2] is not None)
+                         else gsel[1].index_select(0, _pre))
+                _g = torch.sigmoid(_gsrc).to(_vpre.dtype)
+                _vpre = _vpre * _g.view(1, -1, 1, 1)
             k_s = torch.cat([kp.index_select(1, _pre), kp], 1).transpose(1, 2)
-            v_s = torch.cat([vp.index_select(1, _pre), vp], 1).transpose(1, 2)
+            v_s = torch.cat([_vpre, vp], 1).transpose(1, 2)
         elif _tier_rows is not None:
             # Permuted layout PLUS a contiguous tier strip in front of K/V. Queries are
             # untouched (so flex_query_nodes still maps outputs), and the strip indexes the
@@ -4281,9 +4661,11 @@ class HierarchicalMessagePassing(MessagePassing):
             # ladder keeps the KERNEL tile small even where the MASK has to be coarse.
             _, _km, _kn = self._flex_tile_choice()
             _ko = {} if _km is None else {"BLOCK_M": _km, "BLOCK_N": _kn}
-            out = fn(q_s, k_s, v_s, block_mask=bm, return_lse=_lse, kernel_options=_ko)
+            out = fn(q_s, k_s, v_s, block_mask=bm, return_lse=_lse, kernel_options=_ko,
+                     **({"score_mod": _smod} if _smod is not None else {}))
         else:
-            out = flex_attention(q_s, k_s, v_s, block_mask=bm, return_lse=_lse)
+            out = flex_attention(q_s, k_s, v_s, block_mask=bm, return_lse=_lse,
+                                 **({"score_mod": _smod} if _smod is not None else {}))
         out, lse_main = out if _lse else (out, None)
         out = out.transpose(1, 2)  # [B, N, H, D]
         if not _ring:
@@ -4492,13 +4874,24 @@ class HierarchicalMessagePassing(MessagePassing):
             and not getattr(self, "_flex_union_failed", False)
         ):
             if set(int(l) for l in spec.get("query_levels", ())) >= {0, 1, 2, 3}:
+                # Content selection for the flex prefix. Computed ONCE, outside the tile
+                # ladder, so a retry re-uses the same rows instead of re-nominating.
+                _gsel = None
+                if (str(getattr(self, "local_pack_global_select", "levels")) == "content"
+                        and spec.get("global_block", None) is not None):
+                    _gr, _gs, _gm = self._nominate_global_rows(
+                        kp, spec, lvl_packed,
+                        int(spec["global_block"].get(
+                            "budget", spec["global_block"]["rows"].numel())))
+                    _gsel = (_gr, _gs, _gm)
                 # Retry across the tile ladder before giving up: the common failure is a
                 # lowering guard on the mask granularity, not a broken environment, and a
                 # permanent opt-out here silently turns a flexhier config into the
                 # additive arm it was built to be compared against.
                 while True:
                     try:
-                        out_flex = self._flex_union_attn(qp, kp, vp, spec, pack_causal)
+                        out_flex = self._flex_union_attn(qp, kp, vp, spec, pack_causal,
+                                                         gsel=_gsel)
                         contrib = self.out_proj(out_flex.reshape(B, out_flex.size(1), -1))
                         if source_gates is not None:
                             contrib = source_gates["local"] * contrib
@@ -4508,12 +4901,23 @@ class HierarchicalMessagePassing(MessagePassing):
                         if (int(spec["flex_perm"].numel()) >= 512
                                 and self._flex_advance_tile(spec)):
                             continue
-                        self._local_pack_log_once(
-                            f"flex union failed ({exc}); merge/additive fallback")
                         # Permanent opt-out only for real-graph failures; a tiny-graph
                         # hiccup (generation prefixes) must not poison the training path.
                         if int(spec["flex_perm"].numel()) >= 512:
+                            if bool(getattr(self, "local_pack_flex_strict", False)):
+                                raise RuntimeError(
+                                    self._flex_failure_banner(exc)) from exc
                             self._flex_union_failed = True
+                            self._flex_union_failed_reason = (
+                                f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}")
+                            # ERROR, not warning: this silently changes which arm is being
+                            # trained, so it must not sit at the same level as routine
+                            # per-module chatter.
+                            logger.error("%s", self._flex_failure_banner(exc))
+                        else:
+                            self._local_pack_log_once(
+                                f"flex union failed on a tiny graph ({exc}); additive "
+                                "fallback for this call only, NOT a permanent opt-out")
                         break
             else:
                 self._local_pack_log_once("flex union needs all levels queried; merge/additive fallback")
@@ -4838,15 +5242,47 @@ class HierarchicalMessagePassing(MessagePassing):
         _gblk = spec.get("global_block", None)
         if _gblk is not None and hasattr(self, "coarse_global_gate"):
             k_rows = _gblk["rows"]
+            g_score = None
+            g_meta = None
+            if str(getattr(self, "local_pack_global_select", "levels")) == "content":
+                k_rows, g_score, g_meta = self._nominate_global_rows(
+                    kp, spec, lvl_packed, int(_gblk.get("budget", k_rows.numel())))
             q_rows = sel                                  # all packed query rows
             if int(k_rows.numel()) > 0 and int(q_rows.numel()) > 0:
                 q_g = qp.index_select(1, q_rows).permute(0, 2, 1, 3)
                 k_g = kp.index_select(1, k_rows).permute(0, 2, 1, 3)
                 v_g = vp.index_select(1, k_rows).permute(0, 2, 1, 3)
                 bias = None
-                if pack_causal:
+                if g_meta is not None:
+                    # Per-chunk prefix: a query reads only its own chunk's live slots. This
+                    # subsumes the causal test -- every slot in a chunk closed before that
+                    # chunk began -- so it replaces rather than augments it.
+                    _G3, _C3 = int(g_meta["G"]), int(g_meta["chunk"])
+                    _ks = torch.arange(int(k_rows.numel()), device=k_rows.device)
+                    bias = (((_ks // _G3).view(1, -1) == (q_rows // _C3).view(-1, 1))
+                            & g_meta["ok"].view(1, -1)).view(
+                        1, 1, int(q_rows.numel()), int(k_rows.numel()))
+                elif pack_causal:
                     bias = (k_rows.view(1, -1) <= q_rows.view(-1, 1)).view(
                         1, 1, int(q_rows.numel()), int(k_rows.numel()))
+                if g_score is not None:
+                    # Same nomination gate as the flex path (sigmoid on the picked rows'
+                    # values), so the two paths train the scorer through the same mechanism
+                    # and an additive-vs-flex comparison is not confounded by it.
+                    _sc_k = (g_score if g_meta is not None
+                             else g_score.index_select(0, k_rows))
+                    v_g = v_g * torch.sigmoid(_sc_k).to(v_g.dtype).view(1, 1, -1, 1)
+                    if bool(getattr(self, "local_pack_global_logit", False)):
+                        # Detached logit, matching the flex path. Free here (it is just an
+                        # SDPA attn_mask), but kept detached anyway so both paths have the
+                        # SAME gradient topology -- the gate teaches, the logit shapes.
+                        add = _sc_k.detach().to(q_g.dtype).view(1, 1, 1, -1)
+                        if bias is not None:
+                            add = add.expand(1, 1, int(q_rows.numel()),
+                                             int(k_rows.numel())).clone()
+                            bias = add.masked_fill(~bias, torch.finfo(add.dtype).min)
+                        else:
+                            bias = add
                 out_g = F.scaled_dot_product_attention(
                     q_g, k_g, v_g, attn_mask=bias,
                     dropout_p=float(self.dropout.p) if self.training else 0.0,
@@ -5484,6 +5920,14 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_coarse_global_gate_init: float = 0.0,  # 0.0 = exact identity (warm-start safe)
         local_pack_global_block: int = 0,  # fixed coarse budget in EVERY query's K/V; allocates the gate
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
+        local_pack_flex_strict: bool = False,  # raise instead of silently degrading to additive
+        local_pack_global_select: str = "levels",  # levels | content (learned top-K rows)
+        local_pack_global_l0_budget: int = 0,  # rows of the budget that may be L0 tokens
+        local_pack_global_score_bias: bool = True,  # score -> logit, trains the nominator
+        local_pack_global_select_every: int = 32,  # re-pick cadence (BlockMask rebuild)
+        local_pack_global_dedup: bool = True,  # False = +ln2 on collisions, mask stops depending on membership
+        local_pack_global_logit: bool = False,  # detached nomination logit on top of the gate
+        local_pack_global_chunk: int = 0,  # >0 = per-chunk CAUSAL selection (AR-safe)
         hier_node_dropout: float = 0.0,  # DropNode on coarse rows (value-side, L0 exempt)
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,  # overrides the scalar
         local_window_dropout: float = 0.0,  # DropNode on L0 rows -- forces use of the hierarchy
@@ -5583,6 +6027,14 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_coarse_global_gate_init=local_pack_coarse_global_gate_init,
             local_pack_global_block=local_pack_global_block,
             local_pack_flex_union=local_pack_flex_union,
+            local_pack_flex_strict=local_pack_flex_strict,
+            local_pack_global_select=local_pack_global_select,
+            local_pack_global_l0_budget=local_pack_global_l0_budget,
+            local_pack_global_score_bias=local_pack_global_score_bias,
+            local_pack_global_select_every=local_pack_global_select_every,
+            local_pack_global_dedup=local_pack_global_dedup,
+            local_pack_global_logit=local_pack_global_logit,
+            local_pack_global_chunk=local_pack_global_chunk,
             hier_node_dropout=hier_node_dropout,
             hier_node_dropout_per_level=hier_node_dropout_per_level,
             local_window_dropout=local_window_dropout,
