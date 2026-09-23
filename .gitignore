@@ -27,3 +27,7 @@ env/
 tests/test_hqd_causality.py
 data/pg19_test.txt
 data/pg19_train.txt
+
+# run logs (can exceed GitHub 100 MB limit)
+logs/
+*.log
