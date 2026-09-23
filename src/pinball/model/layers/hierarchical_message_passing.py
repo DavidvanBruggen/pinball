@@ -118,11 +118,178 @@ def _smoke_test_flash_attn(
         return False
 
 
+# ---- FA3 / FA4 front end ----------------------------------------------------------
+# Every flash call site in this file speaks the FA2 dialect: `dropout_p`, a (-1, -1)
+# unbounded window, and `return_attn_probs=True` -> (out, lse, S). FA3
+# (flash_attn_interface) and FA4 (flash_attn.cute, CuTe DSL) differ on all three:
+#   - NEITHER HAS ATTENTION DROPOUT. Both configs in use train with dropout 0.1 on
+#     these paths, so an unguarded FA3/FA4 either crashes on the first training step
+#     or -- worse -- trains a different regulariser than the fa2 arm it is compared to.
+#   - FA3 returns (out, lse) for return_attn_probs; FA4 always returns (out, lse), and
+#     only allocates lse when an input requires grad, i.e. lse is None under no_grad.
+#   - FA4 spells "unbounded" as None, not -1.
+# _flash_adapter wraps either one into the FA2 dialect so the call sites stay unchanged.
+#
+# flash_nodropout_mode decides what dropout_p > 0 means for a kernel without dropout:
+#   "error"   (default) raise, with the three ways out spelled in the message.
+#   "token_v" token-wise V dropout -- the SAME approximation the flex path already uses
+#             (one mask per batch/key-token/head, rescaled by 1/(1-p), so E[P V~] = P V).
+#             Coarser than fa2's per-edge dropout: an fa2 arm and a token_v arm are not
+#             the same regulariser, so do not compare them as if they were.
+_FLASH_IMPLS = ("auto", "fa2", "fa3", "fa4")
+_FLASH_NODROPOUT_MODES = ("error", "token_v")
+_FLASH_PREF = {"impl": None, "nodropout": None}   # None = read the env var / default
+FLASH_BACKENDS = frozenset({"fa2", "fa3", "fa4"})
+
+
+def set_flash_preference(impl: Optional[str] = None,
+                         nodropout_mode: Optional[str] = None) -> None:
+    """Choose the flash implementation for the L0 window paths (process-wide).
+
+    impl: "auto" (fa3 on Hopper, else fa2 -- the historical behaviour), "fa2", "fa3" or
+    "fa4". The env var PINBALL_FLASH_IMPL overrides this, so a cluster job can switch
+    without editing a config. Clears the resolved-backend cache, so call it before the
+    first forward (the model constructor does).
+    """
+    if impl is not None:
+        impl = str(impl).lower()
+        if impl not in _FLASH_IMPLS:
+            raise ValueError(f"flash_impl must be one of {_FLASH_IMPLS}, got {impl!r}")
+        _FLASH_PREF["impl"] = impl
+    if nodropout_mode is not None:
+        nodropout_mode = str(nodropout_mode).lower()
+        if nodropout_mode not in _FLASH_NODROPOUT_MODES:
+            raise ValueError(f"flash_nodropout_mode must be one of {_FLASH_NODROPOUT_MODES}, "
+                             f"got {nodropout_mode!r}")
+        _FLASH_PREF["nodropout"] = nodropout_mode
+    _BACKEND_RESOLVED.clear()
+    _pick_attention_backend_cached.cache_clear()
+
+
+def _flash_impl_pref() -> str:
+    env = os.environ.get("PINBALL_FLASH_IMPL", "").strip().lower()
+    if env:
+        if env not in _FLASH_IMPLS:
+            raise ValueError(f"PINBALL_FLASH_IMPL must be one of {_FLASH_IMPLS}, got {env!r}")
+        return env
+    return _FLASH_PREF["impl"] or "auto"
+
+
+def _flash_nodropout_pref() -> str:
+    env = os.environ.get("PINBALL_FLASH_NODROPOUT", "").strip().lower()
+    if env:
+        if env not in _FLASH_NODROPOUT_MODES:
+            raise ValueError(f"PINBALL_FLASH_NODROPOUT must be one of "
+                             f"{_FLASH_NODROPOUT_MODES}, got {env!r}")
+        return env
+    return _FLASH_PREF["nodropout"] or "error"
+
+
+def _flash_adapter(raw_fn: Callable[..., Any], impl: str, nodropout_mode: str) -> Callable[..., Any]:
+    """Wrap FA3 or FA4 in the FA2 call dialect used by every call site in this file."""
+    raw_keys = set(_flash_attn_signature_keys(raw_fn))
+    fa4_has_return_lse = "return_lse" in raw_keys   # newer FA4 builds
+
+    def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
+                        window_size=(-1, -1), return_attn_probs=False):
+        p = float(dropout_p)
+        if p > 0.0:
+            if nodropout_mode != "token_v":
+                raise RuntimeError(
+                    f"flash backend '{impl}' has no attention dropout, but dropout_p={p} "
+                    "was requested. Either set flash_impl: fa2 (per-edge dropout, as the "
+                    "existing arms trained), set dropout: 0.0, or opt in to the flex-style "
+                    "approximation with flash_nodropout_mode: token_v (not the same "
+                    "regulariser as fa2 -- do not compare the two arms as equivalent).")
+            keep = torch.rand(v.shape[0], v.shape[1], v.shape[2], 1,
+                              device=v.device, dtype=torch.float32) >= p
+            v = v * (keep.to(v.dtype) / (1.0 - p))
+        ws = window_size if window_size is not None else (-1, -1)
+        if impl == "fa4":
+            ws = tuple(None if (w is None or int(w) < 0) else int(w) for w in ws)
+            kw = {"softmax_scale": softmax_scale, "causal": bool(causal), "window_size": ws}
+            if return_attn_probs and fa4_has_return_lse:
+                kw["return_lse"] = True
+            res = raw_fn(q, k, v, **kw)
+            out, lse = (res[0], res[1]) if isinstance(res, tuple) else (res, None)
+            if return_attn_probs:
+                if lse is None:
+                    raise RuntimeError(
+                        "FA4 returned no LSE (this build only allocates it when an input "
+                        "requires grad, i.e. never under no_grad). The lse-merge paths need "
+                        "it at eval time too: upgrade flash_attn.cute to a build with "
+                        "return_lse, or use flash_impl: fa2/fa3.")
+                return out, lse, None
+            return out
+        # fa3
+        res = raw_fn(q, k, v, softmax_scale=softmax_scale, causal=bool(causal),
+                     window_size=tuple(int(w) for w in ws),
+                     return_attn_probs=bool(return_attn_probs))
+        if return_attn_probs:
+            out, lse = res[0], res[1]
+            return out, lse, None
+        return _unwrap_flash_result(res)
+
+    flash_attn_func.__name__ = f"flash_attn_func_{impl}_adapter"
+    flash_attn_func._pinball_impl = impl          # type: ignore[attr-defined]
+    flash_attn_func._pinball_raw = raw_fn         # type: ignore[attr-defined]
+    return flash_attn_func
+
+
+def _smoke_test_flash_lse_nograd(flash_attn_func: Callable[..., Any], device_index: int) -> bool:
+    """The lse-merge paths call flash under no_grad at eval; FA4 can return lse=None there."""
+    try:
+        device = torch.device("cuda", int(device_index))
+        dtype = torch.bfloat16 if bf16_supported() else torch.float16
+        with torch.no_grad():
+            q = torch.randn(1, 128, 4, 64, device=device, dtype=dtype)
+            out, lse, _ = flash_attn_func(q, q, q, causal=False, window_size=(8, 8),
+                                          dropout_p=0.0, return_attn_probs=True)
+        torch.cuda.synchronize(device)
+        return lse is not None and tuple(lse.shape) == (1, 4, 128) and bool(torch.isfinite(out).all())
+    except Exception as exc:
+        logger.warning("flash no_grad LSE check failed on cuda:%d: %r", int(device_index), exc)
+        return False
+
+
+def _try_fa4(device_index: int, cap: Tuple[int, int], nodropout: str):
+    """FA4 (flash_attn.cute). Hopper sm_90 and datacenter Blackwell sm_100 only."""
+    if cap[0] not in (9, 10):
+        return None, RuntimeError(f"skipped: FA4 supports sm_90/sm_100, device is sm_{cap[0]}{cap[1]}")
+    try:
+        from flash_attn.cute import flash_attn_func as fa4_raw
+    except Exception as exc:
+        return None, exc
+    fn = _flash_adapter(fa4_raw, "fa4", nodropout)
+    if not _smoke_test_flash_attn(fn, device_index):
+        return None, RuntimeError("FA4 forward/backward smoke test failed")
+    if not _smoke_test_flash_lse_nograd(fn, device_index):
+        return None, RuntimeError("FA4 returns no LSE under no_grad (needs a build with return_lse)")
+    return fn, None
+
+
 @lru_cache(maxsize=8)
-def _pick_attention_backend_cached(device_index: int, cap_major: int, cap_minor: int) -> Tuple[str, Optional[Callable[..., Any]]]:
-    """Pick the attention backend for one CUDA device capability."""
+def _pick_attention_backend_cached(device_index: int, cap_major: int, cap_minor: int,
+                                   impl: str = "auto",
+                                   nodropout: str = "error") -> Tuple[str, Optional[Callable[..., Any]]]:
+    """Pick the attention backend for one CUDA device capability.
+
+    impl "auto" is the historical order (fa3 on Hopper, then fa2) and returns exactly
+    what it always did apart from wrapping fa3 in the FA2-dialect adapter. An explicit
+    impl that cannot run logs an ERROR and falls back to fa2 -- same math, so this is a
+    speed loss, not a silently different arm.
+    """
     cap = (int(cap_major), int(cap_minor))
     device_name = torch.cuda.get_device_name(int(device_index))
+
+    if cap >= (8, 0) and impl == "fa4":
+        fn, fa4_exc = _try_fa4(int(device_index), cap, nodropout)
+        if fn is not None:
+            logger.info("Using FlashAttention-4 (CuTe DSL) backend on GPU %s capability %s "
+                        "(no-dropout mode: %s).", device_name, cap, nodropout)
+            return "fa4", fn
+        logger.error("flash_impl=fa4 requested but unavailable on GPU %s capability %s (%r); "
+                     "falling back to FlashAttention-2.", device_name, cap, fa4_exc)
 
     if cap >= (8, 0):
         fa3_exc = None
@@ -137,14 +304,18 @@ def _pick_attention_backend_cached(device_index: int, cap_major: int, cap_minor:
             fa3_exc = RuntimeError(
                 f"skipped: FlashAttention-3 is Hopper-only (sm_90), device is sm_{cap[0]}{cap[1]}")
         try:
+            if impl not in ("auto", "fa3"):
+                raise RuntimeError(f"skipped: flash_impl={impl}")
             if not _fa3_ok_arch:
                 raise fa3_exc
-            from flash_attn_interface import flash_attn_func
+            from flash_attn_interface import flash_attn_func as _fa3_raw
+            flash_attn_func = _flash_adapter(_fa3_raw, "fa3", nodropout)
         except Exception as exc:
             fa3_exc = exc
         else:
             if _smoke_test_flash_attn(flash_attn_func, int(device_index)):
-                logger.info("Using FlashAttention-3 backend on GPU %s capability %s.", device_name, cap)
+                logger.info("Using FlashAttention-3 backend on GPU %s capability %s "
+                            "(no-dropout mode: %s).", device_name, cap, nodropout)
                 return "fa3", flash_attn_func
             logger.warning(
                 "FlashAttention-3 smoke test failed on GPU %s capability %s; trying FlashAttention-2.",
@@ -206,7 +377,8 @@ def pick_attention_backend(device: Optional[torch.device] = None) -> Tuple[str, 
     if hit is not None:
         return hit
     cap_major, cap_minor = torch.cuda.get_device_capability(device_index)
-    out = _pick_attention_backend_cached(device_index, int(cap_major), int(cap_minor))
+    out = _pick_attention_backend_cached(device_index, int(cap_major), int(cap_minor),
+                                         _flash_impl_pref(), _flash_nodropout_pref())
     _BACKEND_RESOLVED[device_index] = out
     return out
 
@@ -301,7 +473,7 @@ def attention_forward(
     flash_dtype_cast: bool = False,
 ) -> torch.Tensor:
     """Unified attention wrapper for [B, S, H, D] tensors."""
-    if backend in {"fa2", "fa3"} and flash_func is not None:
+    if backend in FLASH_BACKENDS and flash_func is not None:
         orig_dtype = q.dtype
         if flash_dtype_cast and orig_dtype not in (torch.float16, torch.bfloat16):
             work_dtype = torch.bfloat16 if bf16_supported() else torch.float16
@@ -347,6 +519,62 @@ def _flex_compiled_singleton():
         from torch.nn.attention.flex_attention import flex_attention
         _FLEX_COMPILED = torch.compile(flex_attention, dynamic=False)
     return _FLEX_COMPILED
+
+
+_FLEX_FLASH_PROBE: Dict[Tuple[int, int, str], Tuple[bool, str]] = {}
+_FLEX_FLASH_BANNERS: set = set()
+
+
+def flex_flash_supported(device: torch.device, head_dim: int,
+                         dtype: torch.dtype = torch.bfloat16) -> Tuple[bool, str]:
+    """Can flex_attention run with kernel_options BACKEND="FLASH" (FA4) here, correctly?
+
+    Run EAGERLY, before any layer is compiled. If the FA4 lowering is first attempted
+    inside a hier_layer_compile graph and fails, the failure surfaces at graph compile
+    time, where the layer's own try/except cannot see it, and the probation wrapper then
+    drops the WHOLE layer to eager permanently -- a ~1.9x step-time loss to save a kernel
+    choice. Probing up front keeps the layer compiled and simply routes it to Triton.
+
+    Checks, cheapest first: torch knows the FLASH backend, the GPU is sm_90/sm_100,
+    flash_attn.cute imports, and a small pinball-shaped block mask (band + prefix, mask
+    granularity 128) agrees with the Triton kernel forward and backward.
+    """
+    dev = torch.device(device)
+    key = (int(dev.index or 0), int(head_dim), str(dtype))
+    if key in _FLEX_FLASH_PROBE:
+        return _FLEX_FLASH_PROBE[key]
+    ok, why = False, ""
+    try:
+        import typing
+        import torch.nn.attention.flex_attention as _fa
+        backends = typing.get_args(getattr(_fa, "_Backend", None)) or ()
+        if "FLASH" not in backends:
+            why = f"torch {torch.__version__} has no flex BACKEND='FLASH'"
+        elif dev.type != "cuda" or torch.cuda.get_device_capability(dev)[0] not in (9, 10):
+            why = "FA4 needs sm_90 or sm_100"
+        else:
+            import flash_attn.cute  # noqa: F401
+            n, h = 512, 2
+            bm = _fa.create_block_mask(
+                lambda b, hh, qi, ki: ((qi - ki).abs() <= 128) | (ki < 128),
+                B=None, H=None, Q_LEN=n, KV_LEN=n, device=str(dev), BLOCK_SIZE=(128, 128))
+            g = torch.Generator(device=dev).manual_seed(0)
+            q, k, v = (torch.randn(1, h, n, int(head_dim), device=dev, dtype=dtype,
+                                   generator=g).requires_grad_(True) for _ in range(3))
+            fx = _flex_compiled_singleton()
+            res = {}
+            for be in ("TRITON", "FLASH"):
+                o = fx(q, k, v, block_mask=bm, kernel_options={"BACKEND": be})
+                res[be] = (o,) + torch.autograd.grad(o.float().square().sum(), (q, k, v))
+            errs = [((a.float() - b.float()).abs().max()
+                     / b.float().abs().max().clamp_min(1e-6)).item()
+                    for a, b in zip(res["FLASH"], res["TRITON"])]
+            ok = errs[0] < 2e-2 and max(errs[1:]) < 5e-2
+            why = "rel err out/dq/dk/dv = " + " ".join(f"{e:.1e}" for e in errs)
+    except Exception as exc:
+        ok, why = False, f"{type(exc).__name__}: {str(exc).splitlines()[0][:200] if str(exc) else ''}"
+    _FLEX_FLASH_PROBE[key] = (bool(ok), why)
+    return _FLEX_FLASH_PROBE[key]
 
 
 class EdgeConditioner(nn.Module):
@@ -550,6 +778,7 @@ class HierarchicalMessagePassing(MessagePassing):
         # compared against, and nothing downstream looks wrong -- measured 2026-09-19:
         # in ChromScape-bw (torch 2.7, sm_120) EVERY rung of _FLEX_TILE_LADDER fails.
         local_pack_flex_strict: bool = False,
+        local_pack_flex_backend: str = "triton",
         # CONTENT-SELECTED GLOBAL BLOCK. "levels" is the original rule -- whole coarse levels
         # top-down while they fit the budget, i.e. selection purely by POSITION in the
         # hierarchy. "content" scores every packed row with a learned per-level direction and
@@ -732,6 +961,7 @@ class HierarchicalMessagePassing(MessagePassing):
             if local_pack_l0_coarse_windows else [])
         self.local_pack_global_block = max(0, int(local_pack_global_block or 0))
         self.local_pack_flex_strict = bool(local_pack_flex_strict)
+        self.local_pack_flex_backend = str(local_pack_flex_backend or "triton").lower()
         self.local_pack_global_select = str(local_pack_global_select).lower()
         if self.local_pack_global_select not in {"levels", "content"}:
             raise ValueError("local_pack_global_select must be 'levels' or 'content', got "
@@ -3573,7 +3803,7 @@ class HierarchicalMessagePassing(MessagePassing):
             resolved_backend, flash_attn_func = pick_attention_backend(q_l0.device)
         flash_supports_dropout = bool(
             backend == "flash"
-            and resolved_backend in {"fa2", "fa3"}
+            and resolved_backend in FLASH_BACKENDS
             and flash_attn_func is not None
             and _flash_attn_supports_dropout(flash_attn_func)
         )
@@ -3582,7 +3812,7 @@ class HierarchicalMessagePassing(MessagePassing):
         if (
             attn_bias is None
             and backend == "flash"
-            and resolved_backend in {"fa2", "fa3"}
+            and resolved_backend in FLASH_BACKENDS
             and flash_attn_func is not None
             and (dropout_p <= 0.0 or flash_supports_dropout)
         ):
@@ -3727,7 +3957,7 @@ class HierarchicalMessagePassing(MessagePassing):
             resolved_backend, flash_attn_func = pick_attention_backend(q_lvl.device)
         flash_supports_dropout = bool(
             backend == "flash"
-            and resolved_backend in {"fa2", "fa3"}
+            and resolved_backend in FLASH_BACKENDS
             and flash_attn_func is not None
             and _flash_attn_supports_dropout(flash_attn_func)
         )
@@ -3736,7 +3966,7 @@ class HierarchicalMessagePassing(MessagePassing):
         if (
             (not force_sdpa)
             and backend == "flash"
-            and resolved_backend in {"fa2", "fa3"}
+            and resolved_backend in FLASH_BACKENDS
             and flash_attn_func is not None
             and (dropout_p <= 0.0 or flash_supports_dropout)
         ):
@@ -3846,7 +4076,7 @@ class HierarchicalMessagePassing(MessagePassing):
             q_L = self.rotary_pos_enc_attn.apply_rotary_pos_emb(q_L.reshape(B * n_L, h_L, Dh), pos_L).view(B, n_L, h_L, Dh)
             k_L = self.rotary_pos_enc_attn.apply_rotary_pos_emb(k_L.reshape(B * n_L, h_L, Dh), pos_L).view(B, n_L, h_L, Dh)
         resolved_backend, flash_func = pick_attention_backend(x_normed.device)
-        if str(backend) != "flash" or resolved_backend not in {"fa2", "fa3"} or flash_func is None:
+        if str(backend) != "flash" or resolved_backend not in FLASH_BACKENDS or flash_func is None:
             raise RuntimeError(
                 f"per-level attention dim requires the flash backend for level {L} "
                 f"(got backend={backend}, resolved={resolved_backend}). Use attn_backend: flash."
@@ -3986,7 +4216,7 @@ class HierarchicalMessagePassing(MessagePassing):
         pos_s, wt_s = spec["flex_ring_pos_s"], spec["flex_ring_wtok_s"]
         ing_s = spec["flex_ring_inglob_s"]
         w_mix, n = int(spec["window"]), int(rp.numel())
-        _key = (bool(causal), spec.get("flex_ring_key", ()), w_mix)
+        _key = (bool(causal), spec.get("flex_ring_key", ()), w_mix, self._flex_flash_active())
         bm = spec.get("flex_ring_bm") if spec.get("flex_ring_bm_key") == _key else None
         if bm is None:
             cm = bool(causal)
@@ -4005,7 +4235,8 @@ class HierarchicalMessagePassing(MessagePassing):
                 keep = rng & (~band) & (~ing_s[ki])
                 return (keep & (dm >= 0)) if cm else keep
 
-            _bs = 64 if (rp.is_cuda and n >= 512) else None
+            _bs = (self._FLEX_FLASH_BLOCK if self._flex_flash_active() else 64) \
+                if (rp.is_cuda and n >= 512) else None
             _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
             try:
                 bm = create_block_mask(ring_mask, B=None, H=None, Q_LEN=n, KV_LEN=n,
@@ -4027,7 +4258,8 @@ class HierarchicalMessagePassing(MessagePassing):
         if q_r.is_cuda and n >= 512:
             res = _flex_compiled_singleton()(
                 q_r, k_r, v_r, block_mask=bm, return_lse=want_lse,
-                kernel_options={"BLOCK_M": 64, "BLOCK_N": 64})
+                kernel_options=({"BACKEND": "FLASH"} if self._flex_flash_active()
+                                else {"BLOCK_M": 64, "BLOCK_N": 64}))
         else:
             res = flex_attention(q_r, k_r, v_r, block_mask=bm, return_lse=want_lse)
         o_r, l_r = res if want_lse else (res, None)
@@ -4040,6 +4272,57 @@ class HierarchicalMessagePassing(MessagePassing):
     # A coarser MASK costs wasted work in partial blocks; a coarser KERNEL tile costs
     # shared memory, so the kernel stays at 64 for as long as the guard allows.
     _FLEX_TILE_LADDER = ((64, 64, 64), (128, 64, 64), (128, 128, 64), (None, None, None))
+
+    # FA4 (flex BACKEND="FLASH") picks its own kernel tile -- 128 rows per CTA on sm_90 and
+    # sm_100 -- and consumes the BlockMask at the mask's own granularity, so the mask must
+    # be built at 128. The Triton ladder above does not apply to it.
+    _FLEX_FLASH_BLOCK = 128
+
+    def _flex_flash_active(self) -> bool:
+        if (str(getattr(self, "local_pack_flex_backend", "triton")) != "flash"
+                or getattr(self, "_flex_flash_failed", False)):
+            return False
+        if not getattr(self, "_flex_flash_probed", False):
+            # Normally already done eagerly by prepare_flex_flash() before compile. If we
+            # are inside a graph without a probe, take the safe kernel for this trace.
+            if torch.compiler.is_compiling():
+                return False
+            self.prepare_flex_flash(next(self.parameters()).device)
+            return not getattr(self, "_flex_flash_failed", False)
+        return True
+
+    def prepare_flex_flash(self, device) -> bool:
+        """Eager, once: probe FA4 flex for this layer's head dim. Idempotent."""
+        if (str(getattr(self, "local_pack_flex_backend", "triton")) != "flash"
+                or getattr(self, "_flex_flash_probed", False)):
+            return not getattr(self, "_flex_flash_failed", False)
+        self._flex_flash_probed = True
+        ok, why = flex_flash_supported(torch.device(device), int(self.head_dim))
+        if ok:
+            self._local_pack_log_once(f"flex FLASH (FA4) backend live ({why})")
+        else:
+            self._flex_flash_disable({}, RuntimeError(f"probe failed: {why}"))
+        return ok
+
+    def _flex_flash_disable(self, spec: Dict, exc: Exception) -> None:
+        """FA4 flex failed: drop to the Triton flex backend, loudly. Same attention
+        function, so this is a speed loss, not a silently different arm -- which is why it
+        falls back rather than raising."""
+        self._flex_flash_failed = True
+        self._flex_flash_failed_reason = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
+        for k in ("flex_block_mask", "flex_block_mask_key", "flex_ring_bm", "flex_ring_bm_key"):
+            spec.pop(k, None)
+        # One banner per distinct reason per process: every layer hits the same env limit.
+        if self._flex_flash_failed_reason in _FLEX_FLASH_BANNERS:
+            return
+        _FLEX_FLASH_BANNERS.add(self._flex_flash_failed_reason)
+        logger.error(
+            "\n" + "=" * 78 + "\n"
+            "FLEX FLASH (FA4) BACKEND DISABLED -- falling back to the Triton flex kernel.\n"
+            f"  torch      : {torch.__version__}\n"
+            f"  last error : {self._flex_flash_failed_reason}\n"
+            "  Same attention function, so only speed is lost; local_pack_flex_strict does\n"
+            "  not apply (it guards the additive fallback, which changes the arm).\n" + "=" * 78)
 
     def _flex_tile_choice(self):
         lvl = min(int(getattr(self, "_flex_tile_level", 0)),
@@ -4254,7 +4537,7 @@ class HierarchicalMessagePassing(MessagePassing):
         perm = spec["flex_perm"]
         # Cache per (causal, coarse-rank radius): both change the mask, and the spec
         # itself is cached per skeleton so a stale BlockMask would silently survive.
-        _bm_key = (bool(causal),
+        _bm_key = (bool(causal), self._flex_flash_active(),
                    int(getattr(self, "local_pack_l0_coarse_rank_window", 0) or 0),
                    int(getattr(self, "local_pack_global_block", 0) or 0),
                    int(getattr(self, "_flex_tile_level", 0)),
@@ -4555,6 +4838,8 @@ class HierarchicalMessagePassing(MessagePassing):
             # So walk a ladder of progressively coarser masks instead of losing the path;
             # _flex_advance_tile bumps the level on failure and the consumer retries.
             _bs, _bm_m, _bm_n = self._flex_tile_choice()
+            if self._flex_flash_active():
+                _bs = self._FLEX_FLASH_BLOCK
             if not (perm.is_cuda and n >= 512):
                 _bs = None
             _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
@@ -4661,6 +4946,8 @@ class HierarchicalMessagePassing(MessagePassing):
             # ladder keeps the KERNEL tile small even where the MASK has to be coarse.
             _, _km, _kn = self._flex_tile_choice()
             _ko = {} if _km is None else {"BLOCK_M": _km, "BLOCK_N": _kn}
+            if self._flex_flash_active():
+                _ko = {"BACKEND": "FLASH"}
             out = fn(q_s, k_s, v_s, block_mask=bm, return_lse=_lse, kernel_options=_ko,
                      **({"score_mod": _smod} if _smod is not None else {}))
         else:
@@ -4898,6 +5185,12 @@ class HierarchicalMessagePassing(MessagePassing):
                         out.index_add_(1, spec["flex_query_nodes"], contrib.to(dtype=out.dtype))
                         return query_levels
                     except Exception as exc:  # pragma: no cover - env-dependent (triton etc.)
+                        if (self._flex_flash_active()
+                                and int(spec["flex_perm"].numel()) >= 512):
+                            # Never strict: FA4 -> Triton is the SAME attention function,
+                            # so this is a speed loss, not a different arm.
+                            self._flex_flash_disable(spec, exc)
+                            continue
                         if (int(spec["flex_perm"].numel()) >= 512
                                 and self._flex_advance_tile(spec)):
                             continue
@@ -5193,7 +5486,7 @@ class HierarchicalMessagePassing(MessagePassing):
             _l0_rows = _lvl_rows[0] if _lvl_rows else None
             _bk, _flash_fn = pick_attention_backend(qp.device)
             _ok = (
-                _flash_fn is not None and _bk in {"fa2", "fa3"}
+                _flash_fn is not None and _bk in FLASH_BACKENDS
                 and qp.dtype in (torch.float16, torch.bfloat16)
                 and _l0_rows is not None and int(_l0_rows.numel()) > 1
                 and not getattr(self, "_l0_bands_failed", False)
@@ -5611,12 +5904,12 @@ class HierarchicalMessagePassing(MessagePassing):
                 dropout_p = float(self.dropout.p) if self.training else 0.0
                 resolved_backend, flash_attn_func = pick_attention_backend(q.device)
                 flash_supports_dropout = bool(
-                    resolved_backend in {"fa2", "fa3"}
+                    resolved_backend in FLASH_BACKENDS
                     and flash_attn_func is not None
                     and _flash_attn_supports_dropout(flash_attn_func)
                 )
                 if (
-                    resolved_backend in {"fa2", "fa3"}
+                    resolved_backend in FLASH_BACKENDS
                     and flash_attn_func is not None
                     and (dropout_p <= 0.0 or flash_supports_dropout)
                 ):
@@ -5921,6 +6214,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_block: int = 0,  # fixed coarse budget in EVERY query's K/V; allocates the gate
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
         local_pack_flex_strict: bool = False,  # raise instead of silently degrading to additive
+        local_pack_flex_backend: str = "triton",
         local_pack_global_select: str = "levels",  # levels | content (learned top-K rows)
         local_pack_global_l0_budget: int = 0,  # rows of the budget that may be L0 tokens
         local_pack_global_score_bias: bool = True,  # score -> logit, trains the nominator
@@ -6028,6 +6322,7 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_block=local_pack_global_block,
             local_pack_flex_union=local_pack_flex_union,
             local_pack_flex_strict=local_pack_flex_strict,
+            local_pack_flex_backend=local_pack_flex_backend,
             local_pack_global_select=local_pack_global_select,
             local_pack_global_l0_budget=local_pack_global_l0_budget,
             local_pack_global_score_bias=local_pack_global_score_bias,

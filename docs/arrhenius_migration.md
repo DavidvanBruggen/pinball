@@ -198,3 +198,35 @@ Consequences for this migration:
   directly rather than transferred.
 - `/home/david/Projects/.../Borsenji_CancerexpertActiRNA` is 377 GB of 198 checkpoints from
   January 2025, not data — the obvious reclaim if local headroom is ever wanted.
+
+---
+
+## Update 2026-09-23 — FA4 support, and a dropout blocker for FA3/FA4
+
+**FA3 and FA4 have no attention dropout; FA2 does.** Both glob400 configs set `dropout: 0.1`,
+which the L0 flash windows use. Before this update, on a GH200 the picker chose FA3
+(Hopper), its smoke test passed (it runs at dropout 0), and the **first training step
+failed**: `attention_forward` raised "does not support dropout" and `_flash_win_lse` hit a
+`TypeError`. Without FA2 installed, the picker instead fell to SDPA with only a warning.
+
+New keys (all default to the old behaviour; verified bit-identical, max|diff| 0.000e+00,
+DNA + text glob400, eval and train):
+
+| key | values | meaning |
+|---|---|---|
+| `flash_impl` | `auto` \| `fa2` \| `fa3` \| `fa4` | L0 window kernel. `auto` = fa3 on Hopper else fa2 (historical). Env `PINBALL_FLASH_IMPL` overrides. Process-wide. |
+| `flash_nodropout_mode` | `error` \| `token_v` | what `dropout > 0` means on fa3/fa4. `token_v` = the flex path's token-wise V dropout — **not the same regulariser as fa2**, so a token_v arm is not comparable to the existing arms as-is. Env `PINBALL_FLASH_NODROPOUT`. |
+| `local_pack_flex_backend` | `triton` \| `flash` | kernel under the flex union. `flash` = torch's FA4 CuTe template (`kernel_options BACKEND="FLASH"`, torch ≥ 2.10ish, sm_90/sm_100). Probed eagerly before compile; any failure → Triton flex with an ERROR banner (same function, speed only). |
+
+Options for the cluster, in order of comparability with existing results:
+1. `flash_impl: fa2` + `local_pack_flex_backend: flash` — keeps per-edge dropout on the L0
+   windows, takes FA4 only under flex. Needs FA2 built for sm_90 in the image.
+2. `flash_impl: fa4` + `flash_nodropout_mode: token_v` + flex `flash` — fastest, but a new
+   regulariser on the L0 windows. Run it as its own arm.
+3. `dropout: 0.0` — also a new arm.
+
+**Verify before any real run:** `python scripts/check_fa4.py` on a GPU node. It checks the
+picker resolves fa4, fa4 windows vs dense SDPA (fwd + all grads), LSE under no_grad (the
+eval-time lse merge needs it; older FA4 builds return None there), flex FLASH vs TRITON on a
+pinball-shaped mask with timing, and the real DNA config: `flex_union_status()` must show
+`flash_live_modules > 0` and `flash_failed_modules == 0`.

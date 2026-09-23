@@ -26,7 +26,7 @@ from typing import Optional, Dict, List, Tuple, Union, Any, Sequence
 
 from .layers.positional_encoding import RotaryPositionalEncoding, LagrangianPositionalEncoding
 from .layers.normalization import RMSNorm, make_norm
-from .layers.hierarchical_message_passing import HierarchicalTransformerLayer, attention_forward, pick_attention_backend
+from .layers.hierarchical_message_passing import HierarchicalTransformerLayer, attention_forward, pick_attention_backend, FLASH_BACKENDS, set_flash_preference
 from .hierarchy.unified_hierarchy_builder import UnifiedHierarchyBuilder, EdgeFeatureGenerator
 
 logger = logging.getLogger(__name__)
@@ -439,7 +439,7 @@ class PackedTransformerBlock(nn.Module):
             backend = "flash" if q.device.type == "cuda" else "sdpa"
         if backend == "flash":
             resolved_backend, flash_func = pick_attention_backend(q.device)
-            if resolved_backend not in {"fa2", "fa3"} or flash_func is None:
+            if resolved_backend not in FLASH_BACKENDS or flash_func is None:
                 if self.attn_backend == "flash":
                     raise RuntimeError("pinball multirate flash backend requested but FlashAttention is unavailable")
                 backend = "sdpa"
@@ -809,7 +809,7 @@ class PinballPackedCrossAttentionRefiner(nn.Module):
             if attn_bias is not None:
                 raise RuntimeError("pinball upper cross-attn causal mask requires backend='auto' or 'sdpa', not explicit flash")
             resolved_backend, flash_func = pick_attention_backend(q.device)
-            if resolved_backend not in {"fa2", "fa3"} or flash_func is None:
+            if resolved_backend not in FLASH_BACKENDS or flash_func is None:
                 if self.attn_backend == "flash":
                     raise RuntimeError("pinball upper cross-attn flash backend requested but FlashAttention is unavailable")
                 backend = "sdpa"
@@ -2824,6 +2824,21 @@ class HierarchicalFlowGAT(nn.Module):
         # unaffected).
         local_pack_flex_union: bool = False,
         local_pack_flex_strict: bool = False,
+        # Kernel behind the flex union. "triton" = the inductor Triton template (every
+        # result to date). "flash" = torch's experimental FA4 CuTe-DSL template
+        # (kernel_options BACKEND="FLASH"; needs flash_attn.cute, sm_90/sm_100, torch with
+        # the FLASH backend). Mask granularity is forced to 128 there (FA4's tile). Any
+        # failure falls back to "triton" with an ERROR banner (probed eagerly before
+        # compile, so a bad env never costs the layer its compiled graph).
+        local_pack_flex_backend: str = "triton",
+        # L0 window flash implementation: auto (fa3 on Hopper else fa2, historical) |
+        # fa2 | fa3 | fa4. Env PINBALL_FLASH_IMPL overrides. Process-wide (the resolved
+        # backend is cached per device), so the LAST model constructed wins.
+        flash_impl: str = "auto",
+        # What dropout > 0 means on a kernel without attention dropout (fa3, fa4):
+        # "error" raises; "token_v" applies the flex path's token-wise V dropout, which is
+        # NOT the same regulariser as fa2's per-edge dropout.
+        flash_nodropout_mode: str = "error",
         local_pack_global_select: str = "levels",
         local_pack_global_l0_budget: int = 0,
         local_pack_global_score_bias: bool = True,
@@ -3451,6 +3466,14 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_coarse_global_gate_init = float(local_pack_coarse_global_gate_init)
         self.local_pack_flex_union = bool(local_pack_flex_union)
         self.local_pack_flex_strict = bool(local_pack_flex_strict)
+        self.local_pack_flex_backend = str(local_pack_flex_backend or "triton").lower()
+        if self.local_pack_flex_backend not in ("triton", "flash"):
+            raise ValueError(f"local_pack_flex_backend must be triton|flash, got {local_pack_flex_backend!r}")
+        self.flash_impl = str(flash_impl or "auto").lower()
+        self.flash_nodropout_mode = str(flash_nodropout_mode or "error").lower()
+        # Defaults leave the preference unset, so the picker is exactly as before.
+        if self.flash_impl != "auto" or self.flash_nodropout_mode != "error":
+            set_flash_preference(self.flash_impl, self.flash_nodropout_mode)
         self.local_pack_global_select = str(local_pack_global_select).lower()
         self.local_pack_global_l0_budget = max(0, int(local_pack_global_l0_budget or 0))
         self.local_pack_global_score_bias = bool(local_pack_global_score_bias)
@@ -4283,6 +4306,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_block=int(getattr(self, "local_pack_global_block", 0) or 0),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         local_pack_flex_strict=bool(getattr(self, "local_pack_flex_strict", False)),
+                        local_pack_flex_backend=str(getattr(self, "local_pack_flex_backend", "triton")),
                         local_pack_global_select=str(getattr(self, "local_pack_global_select", "levels")),
                         local_pack_global_l0_budget=int(getattr(self, "local_pack_global_l0_budget", 0) or 0),
                         local_pack_global_score_bias=bool(getattr(self, "local_pack_global_score_bias", True)),
@@ -4391,6 +4415,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_block=int(getattr(self, "local_pack_global_block", 0) or 0),
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         local_pack_flex_strict=bool(getattr(self, "local_pack_flex_strict", False)),
+                        local_pack_flex_backend=str(getattr(self, "local_pack_flex_backend", "triton")),
                         local_pack_global_select=str(getattr(self, "local_pack_global_select", "levels")),
                         local_pack_global_l0_budget=int(getattr(self, "local_pack_global_l0_budget", 0) or 0),
                         local_pack_global_score_bias=bool(getattr(self, "local_pack_global_score_bias", True)),
@@ -6656,6 +6681,11 @@ class HierarchicalFlowGAT(nn.Module):
                     pick_attention_backend(next(transformer.parameters()).device)
                 except Exception:
                     pass
+                # Same idea for the FA4 flex probe: it must never first run inside a graph.
+                _dev = next(transformer.parameters()).device
+                for _mod in transformer.modules():
+                    if hasattr(_mod, "prepare_flex_flash"):
+                        _mod.prepare_flex_flash(_dev)
                 compiled = torch.compile(transformer.forward, dynamic=False)
             except Exception as e:
                 logger.warning("hier_layer_compile: torch.compile unavailable (%s); staying eager.", e)
@@ -8171,6 +8201,7 @@ class HierarchicalFlowGAT(nn.Module):
         against. Cheap enough to assert on every eval row.
         """
         enabled, failed, reasons = 0, 0, []
+        flash_req, flash_failed, flash_live = 0, 0, 0
         for m in self.modules():
             if not bool(getattr(m, "local_pack_flex_union", False)):
                 continue
@@ -8180,11 +8211,28 @@ class HierarchicalFlowGAT(nn.Module):
                 r = getattr(m, "_flex_union_failed_reason", "unknown")
                 if r not in reasons:
                     reasons.append(r)
+            if str(getattr(m, "local_pack_flex_backend", "triton")) == "flash":
+                flash_req += 1
+                if bool(getattr(m, "_flex_flash_failed", False)):
+                    flash_failed += 1
+                elif bool(getattr(m, "_flex_flash_probed", False)):
+                    flash_live += 1
+                    r = "FA4: " + getattr(m, "_flex_flash_failed_reason", "unknown")
+                    if r not in reasons:
+                        reasons.append(r)
         return {
             "enabled_modules": enabled,
             "failed_modules": failed,
             "live": bool(enabled > 0 and failed == 0),
             "strict": bool(getattr(self, "local_pack_flex_strict", False)),
+            # FA4 under flex, only meaningful after a forward. flash_live_modules is the proof
+            # (probed and running FA4); flash_failed_modules fell back to Triton flex (same
+            # function, slower). The remainder never reached the flex path, so they prove
+            # nothing either way -- do NOT read flash_failed_modules == 0 as "FA4 is live".
+            "backend": str(getattr(self, "local_pack_flex_backend", "triton")),
+            "flash_modules": flash_req,
+            "flash_live_modules": flash_live,
+            "flash_failed_modules": flash_failed,
             "reasons": reasons,
         }
 
