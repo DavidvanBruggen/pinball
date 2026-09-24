@@ -539,6 +539,12 @@ def _flex_idx_clamp(x: torch.Tensor, lo: Optional[int] = None,
 _FLEX_FLASH_BANNERS: set = set()
 
 
+# Both flex probes differentiate (torch.autograd.grad), so they force grad mode on: the first
+# flex call can come from no_grad/inference code (a sanity forward, an eval-first loop), where
+# the backward would raise, every rung/backend would read as broken, and the cached verdict
+# would stick for the process -- for the tile probe, the GH200 backward crash all over again.
+@torch.inference_mode(False)
+@torch.enable_grad()
 def flex_flash_supported(device: torch.device, head_dim: int,
                          dtype: torch.dtype = torch.bfloat16) -> Tuple[bool, str]:
     """Can flex_attention run with kernel_options BACKEND="FLASH" (FA4) here, correctly?
@@ -591,6 +597,8 @@ def flex_flash_supported(device: torch.device, head_dim: int,
     return _FLEX_FLASH_PROBE[key]
 
 
+@torch.inference_mode(False)
+@torch.enable_grad()
 def flex_tile_start_level(device: torch.device, head_dim: int, ladder: Tuple,
                           dtype: torch.dtype = torch.bfloat16) -> Tuple[int, str]:
     """First rung of the flex tile ladder whose forward AND backward compile here.
