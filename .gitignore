@@ -31,3 +31,5 @@ data/pg19_train.txt
 # run logs (can exceed GitHub 100 MB limit)
 logs/
 *.log
+data/.~lock.curve_text_glob400.csv#
+data/curve_text_glob400.csv

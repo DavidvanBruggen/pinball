@@ -7,12 +7,12 @@ tokenizer_name: gpt2
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt #./data/wikitext_combined.txt
 block_size: 1024 #8196 #16384 #32768 #65536 #131072 #262144 #1024
-batch_size: 4
+batch_size: 16
 val_split: 0.01
 
 num_epochs: 300 #20
 samples_per_epoch: 15625 #3125 #25000 #782 #25000
-gradient_accumulation_steps: 4  # accumulate grads over N batches before an optimizer step
+gradient_accumulation_steps: 1  # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
 # in seq-chunks of `chunked_ce_seq_chunk`, never materializing the full [B,T,vocab] logits (+ its

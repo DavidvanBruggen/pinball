@@ -329,7 +329,16 @@ def main(argv=None) -> None:
     keep_last_milestones = int(getattr(cfg, "keep_last_milestones", 3) or 0)
 
     optimizer = _build_optimizer(model, cfg)
-    lr_scheduler = _build_scheduler(optimizer, warmup_steps, max_steps)
+    # The scheduler advances once per OPTIMIZER step (trainer: lr_scheduler.step() sits
+    # inside the accumulation branch), but max_steps counts MICRO-batches. Sizing the cosine
+    # with max_steps stretched it grad_accum-fold: the 09-09 transformer run (4 x 4) was
+    # still at 98% of peak LR at epoch 112 of 300 and would never have finished decaying.
+    # warmup_steps was, and stays, in optimizer steps. Identical when grad_accum == 1.
+    optimizer_steps = max(1, math.ceil(max_steps / grad_accum))
+    lr_scheduler = _build_scheduler(optimizer, warmup_steps, optimizer_steps)
+    if grad_accum > 1:
+        logger.info("LR schedule: %d optimizer steps (%d micro-batches / grad_accum %d), "
+                    "warmup %d", optimizer_steps, max_steps, grad_accum, warmup_steps)
 
     trainer = EnhancedHierarchicalTrainer(
         model, ema_model,
