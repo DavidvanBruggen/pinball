@@ -52,6 +52,24 @@ def _resolve_device(cfg) -> torch.device:
     return torch.device("cpu")
 
 
+# Parameters of the hierarchy's own machinery (refresh gates/projections, level projections,
+# pooling gates, coarse-global gates) -- the ones `hier_lr_mult` speeds up. Matched by name
+# substring. Mirrors ChromScape/bin/optimizer_utils.py::HIERARCHY_PARAM_MARKERS so the text
+# and DNA arms of the experiment scale the same tensors; keep the two lists in sync.
+HIERARCHY_PARAM_MARKERS = (
+    "upward_refresh_gates", "downward_refresh_gates", "upper_seed_gates",
+    "upward_refresh_proj", "downward_refresh_proj", "level_projections",
+    "pool_gate_vec", "pool_gate_bias", "pool_blend", "pool_attn_query",
+    "coarse_global_gate",
+)
+
+
+def _split_hierarchy(model, params, markers=HIERARCHY_PARAM_MARKERS):
+    """Split ``params`` into (rest, hierarchy) by parameter name, preserving order."""
+    ids = {id(p) for n, p in model.named_parameters() if any(m in n for m in markers)}
+    return [p for p in params if id(p) not in ids], [p for p in params if id(p) in ids]
+
+
 def _build_optimizer(model, cfg):
     """Build the optimizer selected by ``cfg.optimizer`` (``adamw`` | ``muon_hybrid``).
 
@@ -60,13 +78,45 @@ def _build_optimizer(model, cfg):
     AdamW via ``muon_adjust_lr_fn``), while 1D params (embeddings, norms, biases) use
     AdamW at the base LR. Each group records ``lr_scale`` so the scheduler keeps the
     per-group LR ratio through warmup/decay.
+
+    ``hier_lr_mult`` != 1.0 splits each group into a regular and a ``_hier`` twin holding
+    the HIERARCHY_PARAM_MARKERS tensors, at ``hier_lr_mult`` x that group's LR. The
+    LambdaLR schedule multiplies every group's own base LR, so the hierarchy multiplier
+    warms in and decays with the global schedule. At 1.0 (default) the optimizer is built
+    exactly as before -- same groups, same order -- so old checkpoints resume; a run started
+    with != 1.0 has twice the groups and must be resumed with the same setting.
+
+    ``adamw_weight_decay`` (muon_hybrid only) sets the decay of the AdamW group -- norms,
+    biases, 1-D gates, embeddings, output head -- separately from ``weight_decay``, which then
+    applies to the Muon matrices alone. Unset (default) = ``weight_decay`` for both groups,
+    the behaviour every text run to date trained under. Mirrors ChromScape's split
+    (optimizer_utils: muon_weight_decay 0.1 / adamw_weight_decay 1e-4). Changing it moves the
+    whole run off the existing record, so it needs its own control.
     """
     lr = float(getattr(cfg, "learning_rate", 3e-4))
     weight_decay = float(getattr(cfg, "weight_decay", 0.1))
+    adamw_wd_cfg = getattr(cfg, "adamw_weight_decay", None)
+    adamw_weight_decay = weight_decay if adamw_wd_cfg is None else float(adamw_wd_cfg)
     kind = str(getattr(cfg, "optimizer", "adamw")).lower()
+    hier_lr_mult = float(getattr(cfg, "hier_lr_mult", 1.0) or 1.0)
+    if not (hier_lr_mult > 0 and math.isfinite(hier_lr_mult)):
+        raise SystemExit(f"hier_lr_mult must be finite and > 0, got {hier_lr_mult}")
+    split_hier = hier_lr_mult != 1.0
 
     if kind in {"adamw", "adam"}:
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        if adamw_wd_cfg is not None:
+            logger.warning("adamw_weight_decay is only read by optimizer: muon_hybrid; "
+                           "optimizer: adamw uses weight_decay=%g for every parameter", weight_decay)
+        if not split_hier:
+            return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        rest, hier = _split_hierarchy(model, [p for p in model.parameters() if p.requires_grad])
+        logger.info("hier_lr_mult=%.3f: %d hierarchy tensors (%s params) at %.3gx LR",
+                    hier_lr_mult, len(hier), f"{sum(p.numel() for p in hier):,}", hier_lr_mult)
+        return torch.optim.AdamW(
+            [dict(params=rest, lr=lr, lr_scale=1.0),
+             dict(params=hier, lr=lr * hier_lr_mult, lr_scale=hier_lr_mult)],
+            lr=lr, weight_decay=weight_decay,
+        )
 
     if kind != "muon_hybrid":
         raise SystemExit(f"Unknown optimizer '{kind}'. Use 'adamw' or 'muon_hybrid'.")
@@ -118,22 +168,37 @@ def _build_optimizer(model, cfg):
         if p.requires_grad and (p.ndim < 2 or id(p) in embed_param_ids)
     ]
 
+    muon_hier, other_hier = [], []
+    if split_hier:
+        muon_params, muon_hier = _split_hierarchy(model, muon_params)
+        other_params, other_hier = _split_hierarchy(model, other_params)
+
     param_groups = []
-    if muon_params:
-        param_groups.append(dict(
-            params=muon_params, lr=lr * muon_lr_mult, lr_scale=muon_lr_mult,
-            weight_decay=weight_decay, use_muon=True, adjust_lr_fn=adjust_lr_fn,
-        ))
-    if other_params:
-        param_groups.append(dict(
-            params=other_params, lr=lr, lr_scale=1.0, weight_decay=weight_decay,
-            betas=(float(betas[0]), float(betas[1])), use_muon=False,
-        ))
+    for params, scale in ((muon_params, 1.0), (muon_hier, hier_lr_mult)):
+        if params:
+            param_groups.append(dict(
+                params=params, lr=lr * muon_lr_mult * scale, lr_scale=muon_lr_mult * scale,
+                weight_decay=weight_decay, use_muon=True, adjust_lr_fn=adjust_lr_fn,
+            ))
+    for params, scale in ((other_params, 1.0), (other_hier, hier_lr_mult)):
+        if params:
+            param_groups.append(dict(
+                params=params, lr=lr * scale, lr_scale=scale, weight_decay=adamw_weight_decay,
+                betas=(float(betas[0]), float(betas[1])), use_muon=False,
+            ))
     if not param_groups:
         raise SystemExit("No trainable parameters found for the optimizer.")
 
-    logger.info("Using Muon hybrid optimizer: muon_params=%d, other_params=%d, lr_mult=%.3f",
-                len(muon_params), len(other_params), muon_lr_mult)
+    logger.info("Using Muon hybrid optimizer: muon_params=%d, other_params=%d, lr_mult=%.3f, "
+                "weight_decay muon=%g adamw=%g", len(muon_params), len(other_params), muon_lr_mult,
+                weight_decay, adamw_weight_decay)
+    if split_hier:
+        n_hier = sum(p.numel() for p in muon_hier + other_hier)
+        logger.info("hier_lr_mult=%.3f: hierarchy muon=%d, adamw=%d tensors (%s params) at %.3gx LR",
+                    hier_lr_mult, len(muon_hier), len(other_hier), f"{n_hier:,}", hier_lr_mult)
+        if not (muon_hier or other_hier):
+            logger.warning("hier_lr_mult=%.3f matched NO parameters -- check HIERARCHY_PARAM_MARKERS",
+                           hier_lr_mult)
     return po.Muon(param_groups)
 
 

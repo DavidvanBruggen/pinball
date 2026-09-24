@@ -52,10 +52,10 @@ logger = logging.getLogger("pinball.instantiate")
 # Config keys the trainer/data/generation layers own. They never reach build_model, so the
 # unused-key audit must not flag them.
 _NON_MODEL_KEYS = frozenset({
-    "batch_size", "checkpoint_dir", "dataset", "data_path", "device", "eval_every",
+    "adamw_weight_decay", "batch_size", "checkpoint_dir", "dataset", "data_path", "device", "eval_every",
     "eval_interval", "early_stopping_patience", "gen_max_length", "gen_max_new_tokens",
     "gen_prompt_tokens", "generate_every", "generation_method", "gradient_accumulation_steps",
-    "grad_accum", "learning_rate", "log_interval", "longctx_diag_every", "mask_prob",
+    "grad_accum", "hier_lr_mult", "learning_rate", "log_interval", "longctx_diag_every", "mask_prob",
     "max_grad_norm", "min_lr", "mixed_precision", "modality", "muon_adjust_lr_fn",
     "keep_last_milestones", "muon_betas", "muon_lr_mult", "num_epochs", "optimizer",
     "resume_from_checkpoint", "save_last_every_epochs", "save_milestone_every_epochs",
