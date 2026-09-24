@@ -6681,11 +6681,14 @@ class HierarchicalFlowGAT(nn.Module):
                     pick_attention_backend(next(transformer.parameters()).device)
                 except Exception:
                     pass
-                # Same idea for the FA4 flex probe: it must never first run inside a graph.
+                # Same idea for the FA4 flex probe and the flex tile probe: neither may
+                # first run inside a graph.
                 _dev = next(transformer.parameters()).device
                 for _mod in transformer.modules():
                     if hasattr(_mod, "prepare_flex_flash"):
                         _mod.prepare_flex_flash(_dev)
+                    if hasattr(_mod, "prepare_flex_tiles"):
+                        _mod.prepare_flex_tiles(_dev)
                 compiled = torch.compile(transformer.forward, dynamic=False)
             except Exception as e:
                 logger.warning("hier_layer_compile: torch.compile unavailable (%s); staying eager.", e)

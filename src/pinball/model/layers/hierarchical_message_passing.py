@@ -522,6 +522,20 @@ def _flex_compiled_singleton():
 
 
 _FLEX_FLASH_PROBE: Dict[Tuple[int, int, str], Tuple[bool, str]] = {}
+_FLEX_TILE_PROBE: Dict[Tuple, Tuple[int, str]] = {}
+
+
+def _flex_idx_clamp(x: torch.Tensor, lo: Optional[int] = None,
+                    hi: Optional[int] = None) -> torch.Tensor:
+    """clamp() for index math inside flex mask_mod/score_mod. Identical values, but built
+    from torch.where: clamp lowers to maximum/minimum, which the FA4 (BACKEND="FLASH")
+    CuteDSL template cannot codegen (torch 2.11 NGC 26.03: "UNSUPPORTED CUTEDSL OPERATION:
+    'maximum'"), so ANY clamp in a mask silently sent every layer back to Triton."""
+    if lo is not None:
+        x = torch.where(x < lo, lo, x)
+    if hi is not None:
+        x = torch.where(x > hi, hi, x)
+    return x
 _FLEX_FLASH_BANNERS: set = set()
 
 
@@ -575,6 +589,47 @@ def flex_flash_supported(device: torch.device, head_dim: int,
         ok, why = False, f"{type(exc).__name__}: {str(exc).splitlines()[0][:200] if str(exc) else ''}"
     _FLEX_FLASH_PROBE[key] = (bool(ok), why)
     return _FLEX_FLASH_PROBE[key]
+
+
+def flex_tile_start_level(device: torch.device, head_dim: int, ladder: Tuple,
+                          dtype: torch.dtype = torch.bfloat16) -> Tuple[int, str]:
+    """First rung of the flex tile ladder whose forward AND backward compile here.
+
+    Run EAGERLY, for the same reason as flex_flash_supported: the tile ladder retries on
+    exceptions from the forward call, but the backward is lowered later, inside
+    loss.backward(), where no retry can see it. Measured 2026-09-24 on GH200 (sm_90, torch
+    2.11 NGC 26.03): a 64-wide mask fails the BACKWARD lowering with NoValidChoicesError
+    for every kernel tile, while the forward compiles fine -- so rung 0 was never retried
+    and every run crashed on its first backward. A 128-wide mask works with any kernel
+    tile. A 512-token probe reproduces the failure, so this costs a few seconds per head
+    dim.
+    """
+    dev = torch.device(device)
+    key = (int(dev.index or 0), int(head_dim), str(dtype), tuple(ladder))
+    if key in _FLEX_TILE_PROBE:
+        return _FLEX_TILE_PROBE[key]
+    from torch.nn.attention.flex_attention import create_block_mask
+    n, h = 512, 2
+    fx = _flex_compiled_singleton()
+    errs = []
+    for lvl, (bs, km, kn) in enumerate(ladder):
+        try:
+            bm = create_block_mask(
+                lambda b, hh, qi, ki: ((qi - ki).abs() <= 128) | (ki < 128),
+                B=None, H=None, Q_LEN=n, KV_LEN=n, device=str(dev),
+                **({} if bs is None else {"BLOCK_SIZE": (bs, bs)}))
+            q, k, v = (torch.randn(1, h, n, int(head_dim), device=dev, dtype=dtype)
+                       .requires_grad_(True) for _ in range(3))
+            o = fx(q, k, v, block_mask=bm,
+                   kernel_options={} if km is None else {"BLOCK_M": km, "BLOCK_N": kn})
+            torch.autograd.grad(o.float().square().sum(), (q, k, v))
+            _FLEX_TILE_PROBE[key] = (lvl, "; ".join(errs) or "rung 0 ok")
+            return _FLEX_TILE_PROBE[key]
+        except Exception as exc:
+            errs.append(f"{(bs, km, kn)}: {type(exc).__name__}")
+    # Nothing compiled: leave the level at 0 so the runtime ladder/banner still reports it.
+    _FLEX_TILE_PROBE[key] = (0, "all rungs failed: " + "; ".join(errs))
+    return _FLEX_TILE_PROBE[key]
 
 
 class EdgeConditioner(nn.Module):
@@ -4216,7 +4271,11 @@ class HierarchicalMessagePassing(MessagePassing):
         pos_s, wt_s = spec["flex_ring_pos_s"], spec["flex_ring_wtok_s"]
         ing_s = spec["flex_ring_inglob_s"]
         w_mix, n = int(spec["window"]), int(rp.numel())
-        _key = (bool(causal), spec.get("flex_ring_key", ()), w_mix, self._flex_flash_active())
+        # Same tile ladder as the union call: a mask granularity that the card cannot lower
+        # fails here too (a hard-coded 64 did, on sm_90).
+        _t_bs, _t_km, _t_kn = self._flex_tile_choice()
+        _key = (bool(causal), spec.get("flex_ring_key", ()), w_mix, self._flex_flash_active(),
+                int(getattr(self, "_flex_tile_level", 0)))
         bm = spec.get("flex_ring_bm") if spec.get("flex_ring_bm_key") == _key else None
         if bm is None:
             cm = bool(causal)
@@ -4235,7 +4294,7 @@ class HierarchicalMessagePassing(MessagePassing):
                 keep = rng & (~band) & (~ing_s[ki])
                 return (keep & (dm >= 0)) if cm else keep
 
-            _bs = (self._FLEX_FLASH_BLOCK if self._flex_flash_active() else 64) \
+            _bs = (self._FLEX_FLASH_BLOCK if self._flex_flash_active() else _t_bs) \
                 if (rp.is_cuda and n >= 512) else None
             _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
             try:
@@ -4259,7 +4318,8 @@ class HierarchicalMessagePassing(MessagePassing):
             res = _flex_compiled_singleton()(
                 q_r, k_r, v_r, block_mask=bm, return_lse=want_lse,
                 kernel_options=({"BACKEND": "FLASH"} if self._flex_flash_active()
-                                else {"BLOCK_M": 64, "BLOCK_N": 64}))
+                                else {} if _t_km is None
+                                else {"BLOCK_M": _t_km, "BLOCK_N": _t_kn}))
         else:
             res = flex_attention(q_r, k_r, v_r, block_mask=bm, return_lse=want_lse)
         o_r, l_r = res if want_lse else (res, None)
@@ -4324,7 +4384,28 @@ class HierarchicalMessagePassing(MessagePassing):
             "  Same attention function, so only speed is lost; local_pack_flex_strict does\n"
             "  not apply (it guards the additive fallback, which changes the arm).\n" + "=" * 78)
 
+    def prepare_flex_tiles(self, device) -> None:
+        """Eager, once: start the tile ladder at the first rung whose backward compiles on
+        this card (see flex_tile_start_level). Idempotent; never lowers the level."""
+        if not self.local_pack_flex_union or getattr(self, "_flex_tiles_probed", False):
+            return
+        dev = torch.device(device)
+        if dev.type != "cuda":
+            return
+        self._flex_tiles_probed = True
+        lvl, why = flex_tile_start_level(dev, int(self.head_dim), self._FLEX_TILE_LADDER)
+        if lvl > int(getattr(self, "_flex_tile_level", 0)):
+            self._flex_tile_level = lvl
+            msg = (f"flex union: starting at tile {self._FLEX_TILE_LADDER[lvl]} "
+                   f"(mask BLOCK_SIZE, kernel BLOCK_M, BLOCK_N) on this card ({why})")
+            # One line per process, not per layer: every layer hits the same card limit.
+            if msg not in _FLEX_FLASH_BANNERS:
+                _FLEX_FLASH_BANNERS.add(msg)
+                logger.warning("[HMP:PACK] %s", msg)
+
     def _flex_tile_choice(self):
+        if not getattr(self, "_flex_tiles_probed", False) and not torch.compiler.is_compiling():
+            self.prepare_flex_tiles(next(self.parameters()).device)
         lvl = min(int(getattr(self, "_flex_tile_level", 0)),
                   len(self._FLEX_TILE_LADDER) - 1)
         return self._FLEX_TILE_LADDER[lvl]
@@ -4663,7 +4744,7 @@ class HierarchicalMessagePassing(MessagePassing):
 
                 def mask_mod(b, h, qi, ki):
                     is_pre = ki < _P2
-                    kpre = ki.clamp(max=_P2 - 1)
+                    kpre = _flex_idx_clamp(ki, hi=_P2 - 1)
                     same = (kpre // _G2) == (qi // _C2)
                     # THE CAUSAL TEST, in packed order -- the same one the non-chunked
                     # prefix branch uses, and the same invariant the whole packed path rests
@@ -4675,7 +4756,7 @@ class HierarchicalMessagePassing(MessagePassing):
                     # point at FUTURE rows. Do not rely on a derived invariant for causality
                     # when the direct test is one comparison.
                     pre = same & _ok2[kpre] & (qi >= _rows2[kpre])
-                    p = (ki - _P2).clamp(0, _nq2 - 1)
+                    p = _flex_idx_clamp(ki - _P2, 0, _nq2 - 1)
                     dr = qi - p
                     band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
                     if ring_wt is not None:
@@ -4699,7 +4780,7 @@ class HierarchicalMessagePassing(MessagePassing):
 
                 def mask_mod(b, h, qi, ki):
                     is_pre = ki < _G
-                    p = (ki - _G).clamp(0, _nq - 1)
+                    p = _flex_idx_clamp(ki - _G, 0, _nq - 1)
                     dr = qi - p
                     band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
                     if ring_wt is not None:
@@ -4714,7 +4795,7 @@ class HierarchicalMessagePassing(MessagePassing):
                     band = band & (~in_glob[p])
                     if causal_mask:
                         # A block row is visible once it has closed (its own packed rank).
-                        glob = qi >= kv_pre[ki.clamp(0, _G - 1)]
+                        glob = qi >= kv_pre[_flex_idx_clamp(ki, 0, _G - 1)]
                     else:
                         glob = ki >= 0
                     return torch.where(is_pre, glob, band)
@@ -4875,7 +4956,7 @@ class HierarchicalMessagePassing(MessagePassing):
                         else gsel[1].index_select(0, gsel[0])).detach().float())
 
             def _smod(sc, b, h, qi, ki):
-                return sc + torch.where(ki < _Gs, _sc_pre[ki.clamp(max=_Gs - 1)],
+                return sc + torch.where(ki < _Gs, _sc_pre[_flex_idx_clamp(ki, hi=_Gs - 1)],
                                         torch.zeros_like(sc))
 
         _pre = gsel[0] if gsel is not None else spec.get("flex_kv_prefix", None)
