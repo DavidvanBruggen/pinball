@@ -30,8 +30,9 @@
 #
 # STEP (compiled, sm_120, median):   4096 b2          32768 b1
 #   glob400 today (full refresh)     120.4 ms         483.6 ms
-#   THIS ARM (highway l0)            116.2 (-3.4%)    528.4 (+9.3%)     params -12.6M
-#   highway children instead          104.9 (-12.9%)   452.4 (-6.5%)
+#   THIS ARM (highway l0)            110.9 (-7.3%)    [32k not re-measured after the merge fix; was +9.3%]   params -12.6M
+#   highway children instead          99.5 (-16.8%)   [was -6.5% at 32k]
+#   (4096 re-measured 2026-09-25 after the merge moved to flex's native layout; glob400 119.6 ms)
 #   no refresh, no coarse call        95.0 (-21.0%)   419.7 (-13.2%)    (reference)
 #
 # CHECK ON EVERY EVAL ROW: flex_union_status() -> failed_modules 0 AND

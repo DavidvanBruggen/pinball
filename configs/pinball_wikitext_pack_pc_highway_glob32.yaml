@@ -1,6 +1,6 @@
 # ============================================================================
-# TEXT ARM @1024: PC + ONE-SOFTMAX HIERARCHY with a SMALL GLOBAL BLOCK. Derived from
-# pinball_wikitext_pack_glob400_pc.yaml (the 1024 PC arm) by:
+# TEXT ARM @1024: ONE-SOFTMAX HIERARCHY with a SMALL GLOBAL BLOCK, NO AUX. Relative to the
+# glob400 control (pinball_wikitext_pack_glob400.yaml, best 17.467 @ep251):
 #     local_pack_global_block: 400 -> 32   (L3 only)
 #     hier_upward_refresh:   true -> false
 #     hier_downward_refresh: true -> false
@@ -8,7 +8,9 @@
 #     local_pack_level_windows: 32         (new)
 #     local_pack_down_highway: children    (new)
 #     checkpoint_dir
-# No hier_lr_mult (held off), so this is directly comparable to the other 1024 runs.
+# Built from the 1024 PC arm; PC was switched OFF 2026-09-25 (hier_pc_enable false; its keys
+# remain below and are inert), so no hierarchy aux objective of any kind is on, and the
+# control is the direct comparison. No hier_lr_mult. (File name kept; "pc" is historical.)
 #
 # WHY THE BUDGET DROPS. At 1024 the levels are [1024, 128, 64, 32] = 224 coarse rows, and a
 # 400 budget puts ALL of them in the prefix: every row already sees every coarse row, so the
@@ -17,9 +19,7 @@
 #
 # READ IT AS SUBSTITUTION, NOT ADDITION. glob400 at 1024 is dense over coarse; this arm asks
 # whether band + lane + a small prefix can REPLACE full coarse visibility -- the long-context
-# regime, simulated at 1024. Compare against:
-#     glob400 control      best 17.467 @ep251   data/curve_text_glob400.csv
-#     glob400 PC (parent)  22.011 best-so-far @ep63 (still training, 2026-09-25)
+# regime, simulated at 1024. Compare against the control curve, data/curve_text_glob400.csv.
 #
 # RUN IN pinball-cs (flex strict). CHECK: flex_union_status() failed_modules 0 and
 # coarse_call_live_modules == coarse_call_layers (12/12). Leak-free: scripts/check_coarse_call.py.
@@ -205,7 +205,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/text_pc_highway_glob32/checkpoints    # own dir (was: ./pinball/text_glob400_pc/checkpoints)
+checkpoint_dir: ./pinball/text_highway_glob32/checkpoints    # own dir (the PC version of this arm used text_pc_highway_glob32)
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -789,7 +789,7 @@ sigreg_train_only: true
 #   EXPECT haux TO START HIGH under this setting. If the features are near rank-1 the centred
 #   content variance is tiny and the loss should RISE, exposing the degeneracy. A low value here
 #   again means something else is being gamed -- do not read it as success.
-hier_latent_exit_norm: [aux, predaux, pc]
+hier_latent_exit_norm: none    # back to the control's default (it only feeds the aux/PC latents)
 
 # PREDICT TOKENS FOR THE L0 PAIR instead of features. The 0:1 pair asks one L1 vector to
 # reproduce comp=16 L0 children whose effective rank is ~46 -- about 733 dimensions of
@@ -839,7 +839,7 @@ hier_pc_l0_ce: false           # DEMOTED: predicting tokens from L1 removes L0's
                                # It fixed capacity by deleting the link. Kept as an experiment.
 hier_pc_l0_ce_chunk: 512       # rows per logits chunk; bounds the [rows, 50257] tensor
 
-hier_pc_enable: true
+hier_pc_enable: false    # OFF 2026-09-25: no aux objective in this test; the PC block below is inert
 lambda_hier_pc: 0.25           # KEPT at 0.25. It was briefly dropped to 0.02 on 2026-09-15 and
                                # put back the same day: the drop was sized on an EPOCH-1
                                # TRANSIENT and the objective self-regulates.

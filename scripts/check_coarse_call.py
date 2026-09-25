@@ -14,6 +14,11 @@ disjoint for every query, so this checks that directly, then the numbers, then c
   5. live         flex_union_status(): failed_modules 0, coarse_call_live == coarse_call_layers
   6. gradients    out/dq/dk/dv of the merged call vs dense fp32 on the text 1024 highway arm
                   (the smallest real coarse call, 224 x 192)
+  7. host pattern  no_grad warm-up forward, THEN a compiled training step on a permuted,
+                  grad-requiring input -- what the ChromScape notebook does. The first merge
+                  compiled here once and then failed AOT autograd's functional-graph check on
+                  recompile (index_copy on flex's permuted output view), which checks 1-6 all
+                  missed because none of them compiles the layer after a no_grad trace.
 
 Checks 1-3 run on the DNA config with a 50-row global budget, so L3 sits outside the prefix
 and the L4 -> L3 highway is exercised (at glob400's 400 budget every L4 child is prefix).
@@ -199,6 +204,31 @@ def check_grad(device):
             f"{qr.numel()}q x {kr.numel()}k | out/dq/dk/dv rel err " + " ".join(f"{e:.1e}" for e in errs))
 
 
+def check_host_pattern(device):
+    ok, why = True, ""
+    for mode in ("children", "l0"):
+        torch._dynamo.reset()
+        m = build_pinball(cfg_path=DNA, num_tracks=1024, tie_weights=False, device=device, set_global_seed=False,
+                          override=dict(local_pack_level_windows=RADIUS, local_pack_down_highway=mode,
+                                        hier_upward_refresh=False, hier_downward_refresh=False))[0]
+        with torch.no_grad(), torch.amp.autocast("cuda", torch.bfloat16):
+            m(torch.randn(1, 1024, 4096, device=device).permute(0, 2, 1))
+        m.train()
+        x = torch.randn(2, 1024, 4096, device=device).permute(0, 2, 1).requires_grad_(True)
+        try:
+            with torch.amp.autocast("cuda", torch.bfloat16):
+                out = m(x)
+            out.float().mean().backward()
+            live = m.flex_union_status()
+            if live["coarse_call_live_modules"] != live["coarse_call_layers"]:
+                ok, why = False, f"{mode}: coarse call {live['coarse_call_live_modules']}/{live['coarse_call_layers']}"
+        except Exception as exc:  # noqa: BLE001 -- report, do not crash the other checks
+            ok, why = False, f"{mode}: {type(exc).__name__}: {str(exc).splitlines()[0][:120]}"
+        del m
+    _report("host pattern (no_grad warm-up, then compiled train step)", ok,
+            why or "children and l0 both compile and train")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--device", default="cuda:0")
@@ -208,6 +238,7 @@ def main():
         check_dense(args.device, mode, causal)
     check_causal(args.device)
     check_grad(args.device)
+    check_host_pattern(args.device)
     print("ALL PASS" if not FAILS else f"FAILED: {', '.join(FAILS)}")
     sys.exit(1 if FAILS else 0)
 

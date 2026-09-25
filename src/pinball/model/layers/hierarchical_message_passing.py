@@ -4416,14 +4416,23 @@ class HierarchicalMessagePassing(MessagePassing):
             res = flex_attention(q_c, k_c, v_c, block_mask=bm, return_lse=True, **_sm)
         o_b, l_b = res
         self._flex_cc_live = True
-        l_a = lse_main.index_select(2, qr).float()
-        l_b = l_b.float()
+        # MERGE IN [B, N, H, D]. flex returns `out` as a permuted view of a [B, N, H, D] buffer,
+        # and an out-of-place index_copy on that view decomposes to empty -> permute -> copy_,
+        # which AOT autograd rejects as a mutation when the layer is recompiled for grad after
+        # a no_grad trace (the host notebook's warm-up forward). Merging in the buffer's own
+        # layout never creates the permuted copy -- and saves a layout change.
+        out_t = out.transpose(1, 2)
+        if not out_t.is_contiguous():
+            out_t = out_t.contiguous()
+        l_a = lse_main.index_select(2, qr).float().transpose(1, 2)        # [B, Cq, H]
+        l_b = l_b.float().transpose(1, 2)
         m = torch.maximum(l_a, l_b)
         w_a = (l_a - m).exp().unsqueeze(-1)
         w_b = (l_b - m).exp().unsqueeze(-1)
-        o_a = out.index_select(2, qr)
-        merged = ((o_a.float() * w_a + o_b.float() * w_b) / (w_a + w_b)).to(out.dtype)
-        return out.index_copy(2, qr, merged)
+        o_a = out_t.index_select(1, qr)                                  # [B, Cq, H, D]
+        o_bt = o_b.transpose(1, 2)
+        merged = ((o_a.float() * w_a + o_bt.float() * w_b) / (w_a + w_b)).to(out_t.dtype)
+        return out_t.index_copy(1, qr, merged).transpose(1, 2)            # back to [B, H, N, D]
 
     def _flex_ring_call(self, qp, kp, vp, spec: Dict, causal: bool, want_lse: bool):
         """Rings as their own flex call, in level-grouped order.
