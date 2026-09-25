@@ -2831,6 +2831,24 @@ class HierarchicalFlowGAT(nn.Module):
         # failure falls back to "triton" with an ERROR banner (probed eagerly before
         # compile, so a bad env never costs the layer its compiled graph).
         local_pack_flex_backend: str = "triton",
+        # DropKey on the flex union/ring calls: each (query, key) score is dropped to -inf with
+        # this probability before the softmax, training only (per-edge, like fa2's attention
+        # dropout; the token-wise V dropout stays). 0.0 = off = bit-identical.
+        local_pack_flex_dropkey: float = 0.0,
+        # COARSE CALL (flex union + global block only). A second flex call over COARSE rows in
+        # (level, position) order, merged into the union by exact log-sum-exp, so band +
+        # global prefix + these clauses are ONE softmax over disjoint key sets:
+        #   local_pack_level_windows  per-level LANE: same-level neighbours within R_l of the
+        #       level's OWN nodes (int = every coarse level, list = per level, entry 0 ignored;
+        #       0/None = off). The flex prefix branch never had a lane clause, so with a global
+        #       block local_pack_coarse_lane was a silent no-op; this restores it, level-local.
+        #   local_pack_down_highway   off | children | l0. children: every coarse row also
+        #       reads its DIRECT CHILDREN (level l-1 nodes it pools); l0: + every L0 token in
+        #       its span. Keys the band or the prefix already deliver are excluded, so nothing
+        #       is counted twice. Causal: children close no later than their parent.
+        # Both off (default) = no second call = the previous path exactly.
+        local_pack_level_windows: Optional[Union[int, Sequence[int]]] = None,
+        local_pack_down_highway: str = "off",
         # L0 window flash implementation: auto (fa3 on Hopper else fa2, historical) |
         # fa2 | fa3 | fa4. Env PINBALL_FLASH_IMPL overrides. Process-wide (the resolved
         # backend is cached per device), so the LAST model constructed wins.
@@ -3469,6 +3487,35 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_flex_backend = str(local_pack_flex_backend or "triton").lower()
         if self.local_pack_flex_backend not in ("triton", "flash"):
             raise ValueError(f"local_pack_flex_backend must be triton|flash, got {local_pack_flex_backend!r}")
+        self.local_pack_flex_dropkey = float(local_pack_flex_dropkey or 0.0)
+        _n_cc_lv = 1 + len(compression_ratios)
+        if local_pack_level_windows is None:
+            _lw = [0] * _n_cc_lv
+        elif isinstance(local_pack_level_windows, (int, float)):
+            _lw = [0] + [max(0, int(local_pack_level_windows))] * (_n_cc_lv - 1)
+        else:
+            _lw = [max(0, int(v)) for v in local_pack_level_windows][:_n_cc_lv]
+            _lw = _lw + [0] * (_n_cc_lv - len(_lw))
+            _lw[0] = 0
+        self.local_pack_level_windows = _lw
+        self.local_pack_down_highway = str(local_pack_down_highway or "off").lower()
+        if self.local_pack_down_highway not in ("off", "children", "l0"):
+            raise ValueError("local_pack_down_highway must be off|children|l0, got "
+                             f"{local_pack_down_highway!r}")
+        self.local_pack_coarse_call = bool(any(_lw) or self.local_pack_down_highway != "off")
+        if self.local_pack_coarse_call:
+            _why = []
+            if not bool(local_pack_flex_union):
+                _why.append("local_pack_flex_union must be true")
+            if int(local_pack_global_block or 0) <= 0:
+                _why.append("local_pack_global_block must be > 0 (the call is built on the prefix layout)")
+            if local_pack_ring_windows and any(int(v) > 0 for v in local_pack_ring_windows):
+                _why.append("local_pack_ring_windows must be off (it owns the other lse slot)")
+            if str(local_pack_global_select).lower() != "levels":
+                _why.append("local_pack_global_select must be 'levels' (the key exclusion uses the static block)")
+            if _why:
+                raise ValueError("local_pack_level_windows / local_pack_down_highway: " + "; ".join(_why))
+            logger.info("Coarse call on: level windows %s, down highway %s.", _lw, self.local_pack_down_highway)
         self.flash_impl = str(flash_impl or "auto").lower()
         self.flash_nodropout_mode = str(flash_nodropout_mode or "error").lower()
         # Defaults leave the preference unset, so the picker is exactly as before.
@@ -4307,6 +4354,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         local_pack_flex_strict=bool(getattr(self, "local_pack_flex_strict", False)),
                         local_pack_flex_backend=str(getattr(self, "local_pack_flex_backend", "triton")),
+                        local_pack_flex_dropkey=float(getattr(self, "local_pack_flex_dropkey", 0.0) or 0.0),
                         local_pack_global_select=str(getattr(self, "local_pack_global_select", "levels")),
                         local_pack_global_l0_budget=int(getattr(self, "local_pack_global_l0_budget", 0) or 0),
                         local_pack_global_score_bias=bool(getattr(self, "local_pack_global_score_bias", True)),
@@ -4416,6 +4464,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_flex_union=bool(getattr(self, "local_pack_flex_union", False)),
                         local_pack_flex_strict=bool(getattr(self, "local_pack_flex_strict", False)),
                         local_pack_flex_backend=str(getattr(self, "local_pack_flex_backend", "triton")),
+                        local_pack_flex_dropkey=float(getattr(self, "local_pack_flex_dropkey", 0.0) or 0.0),
                         local_pack_global_select=str(getattr(self, "local_pack_global_select", "levels")),
                         local_pack_global_l0_budget=int(getattr(self, "local_pack_global_l0_budget", 0) or 0),
                         local_pack_global_score_bias=bool(getattr(self, "local_pack_global_score_bias", True)),
@@ -6809,6 +6858,71 @@ class HierarchicalFlowGAT(nn.Module):
             cur = cent
         return torch.cat(parts, dim=0)
 
+    def _coarse_call_spec(self, spec: Dict, perm: torch.Tensor, lvl_packed: torch.Tensor,
+                          level_offsets: torch.Tensor) -> Optional[Dict[str, object]]:
+        """Row sets and per-row arrays for the coarse flex call (see local_pack_down_highway).
+
+        Everything is in PACKED rows, which the prefix layout uses as its query/key index,
+        so a packed row number is also the band rank. Queries: every coarse row. Keys: coarse
+        rows outside the global block (block rows always arrive through the prefix), plus
+        every L0 token in l0 mode. Both sorted by (level, packed row) -- packed order is
+        close-time order, so each level is ONE contiguous, position-sorted run and a tile
+        of 64 same-level queries needs one short run per key level.
+
+        Children are exact in level-local index space: parent j at level l pools level l-1
+        nodes [j*ratio_l, j*ratio_l + comp_l - 1] (the rule _pooled_child_window_means
+        uses). L0 descendants are the token range [j*stride_l, close_j]."""
+        dev = perm.device
+        n = int(lvl_packed.numel())
+        lvl = lvl_packed.to(torch.long)
+        off = level_offsets.to(device=dev, dtype=torch.long)
+        lidx = perm.to(torch.long) - off.index_select(0, lvl.clamp(max=int(off.numel()) - 1))
+        glob = spec["global_block_mask"]
+        mode = str(getattr(self, "local_pack_down_highway", "off"))
+        wins = list(getattr(self, "local_pack_level_windows", []) or [])
+
+        def _grouped(mask):
+            r = torch.nonzero(mask, as_tuple=False).view(-1)
+            return r.index_select(0, torch.argsort(lvl.index_select(0, r) * (n + 1) + r)).contiguous()
+
+        q_rows = _grouped(lvl > 0)
+        k_mask = (lvl > 0) & ~glob
+        if mode == "l0":
+            k_mask = k_mask | (lvl == 0)
+        k_rows = _grouped(k_mask)
+        if int(q_rows.numel()) == 0 or int(k_rows.numel()) == 0:
+            return None
+        n_lv = 1 + len(self.compression_ratios)
+        comp = [0] + [int(c) for c in self.compression_ratios]
+        ratio = [0] + [max(1, int(int(c) * (1 - float(o))))
+                       for c, o in zip(self.compression_ratios, self.overlap_ratios)]
+        stride_tok = [1] + [int(self._cumulative_window(l)[1]) for l in range(1, n_lv)]
+        _t = lambda v: torch.tensor(v, dtype=torch.long, device=dev)
+        ql = lvl.index_select(0, q_rows)
+        qi = lidx.index_select(0, q_rows)
+        wins = (wins + [0] * n_lv)[:n_lv]
+        # Same clamp as the sequence builder: start = min(i*stride, n_lower - 1), so an edge
+        # parent past the end still owns the last lower node.
+        _n_lower = [0] + [int(off[l] - off[l - 1]) for l in range(1, min(n_lv, int(off.numel())))]
+        _n_lower = (_n_lower + [1] * n_lv)[:n_lv]
+        q_clo = torch.minimum(qi * _t(ratio).index_select(0, ql),
+                              (_t(_n_lower) - 1).clamp_min(0).index_select(0, ql))
+        return {
+            "q_rows": q_rows, "k_rows": k_rows,
+            "q_lvl": ql.contiguous(), "q_idx": qi.contiguous(),
+            "q_rad": _t(wins).index_select(0, ql).contiguous(),
+            "q_clo": q_clo.contiguous(),
+            "q_chi": torch.minimum(q_clo + _t(comp).index_select(0, ql) - 1,
+                                   (_t(_n_lower) - 1).index_select(0, ql)).contiguous(),
+            "q_tlo": (qi * _t(stride_tok).index_select(0, ql)).contiguous(),
+            "q_thi": spec["pos"].index_select(0, q_rows).to(torch.long).contiguous(),
+            "k_lvl": lvl.index_select(0, k_rows).contiguous(),
+            "k_idx": lidx.index_select(0, k_rows).contiguous(),
+            "children": mode in ("children", "l0"),
+            "l0": mode == "l0",
+            "key": (tuple(wins), mode, int(q_rows.numel()), int(k_rows.numel())),
+        }
+
     def _local_pack_build_spec(
         self,
         level_offsets: torch.Tensor,
@@ -7098,6 +7212,11 @@ class HierarchicalFlowGAT(nn.Module):
                             0, flex_perm_local).contiguous()
                     spec["flex_levels"] = lvl_packed.clamp(0, _max_lvl).index_select(
                         0, flex_perm_local).contiguous()
+                    if (bool(getattr(self, "local_pack_coarse_call", False))
+                            and "flex_kv_prefix" in spec):
+                        _cc = self._coarse_call_spec(spec, perm, lvl_packed, level_offsets)
+                        if _cc is not None:
+                            spec["flex_cc"] = _cc
         # GLOBAL TIER (local_pack_top_global). Whole levels top-down while they fit
         # local_pack_top_global_budget; the tier attends all-to-all over itself at cost
         # n_tier^2, linear in N exactly while n_tier <= sqrt(N). Budget 0 keeps the topmost
@@ -8205,10 +8324,14 @@ class HierarchicalFlowGAT(nn.Module):
         """
         enabled, failed, reasons = 0, 0, []
         flash_req, flash_failed, flash_live = 0, 0, 0
+        cc_live, cc_layers = 0, 0
         for m in self.modules():
             if not bool(getattr(m, "local_pack_flex_union", False)):
                 continue
             enabled += 1
+            if hasattr(m, "_flex_coarse_call_merge"):     # attention layers only, not the root
+                cc_layers += 1
+                cc_live += int(bool(getattr(m, "_flex_cc_live", False)))
             if bool(getattr(m, "_flex_union_failed", False)):
                 failed += 1
                 r = getattr(m, "_flex_union_failed_reason", "unknown")
@@ -8236,6 +8359,12 @@ class HierarchicalFlowGAT(nn.Module):
             "flash_modules": flash_req,
             "flash_live_modules": flash_live,
             "flash_failed_modules": flash_failed,
+            # Coarse call (level windows / down highway): attention layers that ran it at
+            # least once. On an arm that sets either knob, after one forward, live must equal
+            # coarse_call_layers (enabled_modules also counts this root module).
+            "coarse_call": bool(getattr(self, "local_pack_coarse_call", False)),
+            "coarse_call_layers": cc_layers,
+            "coarse_call_live_modules": cc_live,
             "reasons": reasons,
         }
 

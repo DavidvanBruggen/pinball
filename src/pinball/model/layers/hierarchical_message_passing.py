@@ -536,6 +536,60 @@ def _flex_idx_clamp(x: torch.Tensor, lo: Optional[int] = None,
     if hi is not None:
         x = torch.where(x > hi, hi, x)
     return x
+
+
+# ----- DropKey: per-(q, k) attention dropout for the flex path --------------------------------
+# flex_attention has no dropout_p, and the token-wise V dropout below drops a key for EVERY
+# query in a head. DropKey (Li et al., CVPR 2023) drops individual (query, key) scores to -inf
+# BEFORE the softmax, so each query sees its own random subset and the survivors renormalise
+# (no 1/(1-p) rescale). The randomness is a stateless integer hash of (b, h, q, k, seed) inside
+# score_mod: nothing [B, H, N, N] is materialised, and the backward recomputes the identical
+# mask from the same seed. Measured 2026-09-25 on sm_120 (2-round hash, N 4096, band 256): drop
+# fraction 0.1000 at p 0.1; out/dq/dk/dv match an explicit-mask reference
+# to bf16 precision; a fully dropped row returns 0 (finite), as a fully masked one does.
+_DROPKEY_BITS = 24
+
+
+def _dropkey_hash(b, h, qi, ki, seed):
+    """Uniform int in [0, 2**24) per (b, h, qi, ki, seed); int32 wraparound is intended.
+
+    ONE multiply round, keeping the product's upper 24 bits (the well-mixed ones). Measured
+    2026-09-25 against a 2-round murmur-style finaliser (sm_120, N 16384, band 256): kernel
+    cost +7.9% vs +15.2% over no score_mod, identical drop fraction (0.1000) and no neighbour
+    correlation (|r| <= 4e-4 for adjacent k, adjacent q, diagonal). Do NOT drop the xor mix
+    for a plain affine sum: that measured r = -0.11 between neighbouring edges.
+    """
+    x = (qi * 73856093) ^ (ki * 19349663) ^ (h * 83492791) ^ (b * 1640531527) ^ seed
+    x = x * 739982445
+    return (x >> (32 - _DROPKEY_BITS)) & ((1 << _DROPKEY_BITS) - 1)
+
+
+def _dropkey_score_mod(p: float, seed: torch.Tensor, kv_off: Optional[int] = 0, base=None):
+    """score_mod dropping each (q, k) score with probability p, composed after ``base``.
+
+    ``kv_off``: K index of query i's own row is ``i + kv_off`` (K may carry a prefix or tier
+    strip in front of the query-ordered rows); that key is never dropped, so no query loses
+    every key. ``None`` protects nothing (the ring call, whose keys exclude self anyway).
+    """
+    thr = int(round(float(p) * (1 << _DROPKEY_BITS)))
+
+    def _smod(sc, b, h, qi, ki):
+        if base is not None:
+            sc = base(sc, b, h, qi, ki)
+        drop = _dropkey_hash(b, h, qi, ki, seed) < thr
+        if kv_off is not None:
+            drop = drop & (ki != qi + kv_off)
+        return torch.where(drop, float("-inf"), sc)
+
+    return _smod
+
+
+def _dropkey_seed(device) -> torch.Tensor:
+    """Fresh 0-d int32 seed from torch's RNG: new mask every step, no recompile (the seed is
+    a tensor the score_mod captures), and replayed by checkpoint's RNG-state restore."""
+    return torch.randint(0, 2**31 - 1, (), device=device, dtype=torch.int32)
+
+
 _FLEX_FLASH_BANNERS: set = set()
 
 
@@ -545,7 +599,7 @@ _FLEX_FLASH_BANNERS: set = set()
 # would stick for the process -- for the tile probe, the GH200 backward crash all over again.
 @torch.inference_mode(False)
 @torch.enable_grad()
-def flex_flash_supported(device: torch.device, head_dim: int,
+def flex_flash_supported(device: torch.device, head_dim: int, with_dropkey: bool = False,
                          dtype: torch.dtype = torch.bfloat16) -> Tuple[bool, str]:
     """Can flex_attention run with kernel_options BACKEND="FLASH" (FA4) here, correctly?
 
@@ -560,7 +614,7 @@ def flex_flash_supported(device: torch.device, head_dim: int,
     granularity 128) agrees with the Triton kernel forward and backward.
     """
     dev = torch.device(device)
-    key = (int(dev.index or 0), int(head_dim), str(dtype))
+    key = (int(dev.index or 0), int(head_dim), str(dtype), bool(with_dropkey))
     if key in _FLEX_FLASH_PROBE:
         return _FLEX_FLASH_PROBE[key]
     ok, why = False, ""
@@ -583,8 +637,12 @@ def flex_flash_supported(device: torch.device, head_dim: int,
                                    generator=g).requires_grad_(True) for _ in range(3))
             fx = _flex_compiled_singleton()
             res = {}
+            # DropKey adds integer hash ops to score_mod; the FA4 CuteDSL template must be
+            # able to codegen them too (it could not codegen clamp), so probe with it.
+            _sm = ({"score_mod": _dropkey_score_mod(0.1, torch.ones((), device=dev, dtype=torch.int32))}
+                   if with_dropkey else {})
             for be in ("TRITON", "FLASH"):
-                o = fx(q, k, v, block_mask=bm, kernel_options={"BACKEND": be})
+                o = fx(q, k, v, block_mask=bm, kernel_options={"BACKEND": be}, **_sm)
                 res[be] = (o,) + torch.autograd.grad(o.float().square().sum(), (q, k, v))
             errs = [((a.float() - b.float()).abs().max()
                      / b.float().abs().max().clamp_min(1e-6)).item()
@@ -842,6 +900,10 @@ class HierarchicalMessagePassing(MessagePassing):
         # in ChromScape-bw (torch 2.7, sm_120) EVERY rung of _FLEX_TILE_LADDER fails.
         local_pack_flex_strict: bool = False,
         local_pack_flex_backend: str = "triton",
+        # DropKey probability on the flex union + ring calls (training only). 0 = off, the
+        # score_mod is not even built, so off is the previous kernel exactly. Stacks with the
+        # token-wise V dropout (self.dropout), which stays as it is.
+        local_pack_flex_dropkey: float = 0.0,
         # CONTENT-SELECTED GLOBAL BLOCK. "levels" is the original rule -- whole coarse levels
         # top-down while they fit the budget, i.e. selection purely by POSITION in the
         # hierarchy. "content" scores every packed row with a learned per-level direction and
@@ -1025,6 +1087,9 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_global_block = max(0, int(local_pack_global_block or 0))
         self.local_pack_flex_strict = bool(local_pack_flex_strict)
         self.local_pack_flex_backend = str(local_pack_flex_backend or "triton").lower()
+        self.local_pack_flex_dropkey = float(local_pack_flex_dropkey or 0.0)
+        if not 0.0 <= self.local_pack_flex_dropkey < 1.0:
+            raise ValueError(f"local_pack_flex_dropkey must be in [0, 1), got {local_pack_flex_dropkey}")
         self.local_pack_global_select = str(local_pack_global_select).lower()
         if self.local_pack_global_select not in {"levels", "content"}:
             raise ValueError("local_pack_global_select must be 'levels' or 'content', got "
@@ -4263,6 +4328,103 @@ class HierarchicalMessagePassing(MessagePassing):
         keep = keep / (1.0 - p_row).clamp_min(1e-6)
         return keep.view(B, -1, 1, 1).to(dtype)
 
+    # Smallest coarse call (rows, either side) that takes the compiled flex kernel: one full
+    # mask block even at FA4's 128 tile (the lowering asserts below one block). Text 1024 is
+    # 224 x 192, so it must sit at or below 192. Below it the eager math path is exact and tiny.
+    _CC_MIN_COMPILED = 128
+
+    def _flex_coarse_call_merge(self, qp, kp, vp, spec: Dict, cc: Dict, causal: bool,
+                                out: torch.Tensor, lse_main: torch.Tensor) -> torch.Tensor:
+        """Coarse flex call (per-level lane + down highway), merged into the union EXACTLY.
+
+        The union ran in prefix layout, so its output row r IS packed row r and ``out`` /
+        ``lse_main`` are [B, H, N, D] / [B, H, N]. This call's key set is disjoint from the
+        union's for every query -- it drops band keys (the same one-/two-sided test the
+        union uses) and never holds a global-block row -- so
+            o = (o_A e^{L_A} + o_B e^{L_B}) / (e^{L_A} + e^{L_B})
+        is the single softmax over (band | prefix | lane | highway). A query with no keys
+        here returns L_B = -inf and keeps o_A untouched.
+
+        Layout: queries and keys in (level, position) order, so each level is one contiguous
+        run (see _coarse_call_spec). Folding these clauses into the packed-order union
+        instead measured +150% (4k) / +300% (32k) on the kernel; this call + merge measured
+        +33% compiled at both lengths (2026-09-25, sm_120, H 16, D 64)."""
+        from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+        qr, kr = cc["q_rows"], cc["k_rows"]
+        nq, nk = int(qr.numel()), int(kr.numel())
+        w_mix = int(spec["window"])
+        _t_bs, _t_km, _t_kn = self._flex_tile_choice()
+        _key = (bool(causal), w_mix, cc["key"], self._flex_flash_active(),
+                int(getattr(self, "_flex_tile_level", 0)))
+        bm = spec.get("flex_cc_bm") if spec.get("flex_cc_bm_key") == _key else None
+        if bm is None:
+            q_lvl, q_idx, q_rad = cc["q_lvl"], cc["q_idx"], cc["q_rad"]
+            q_clo, q_chi, q_tlo, q_thi = cc["q_clo"], cc["q_chi"], cc["q_tlo"], cc["q_thi"]
+            k_lvl, k_idx = cc["k_lvl"], cc["k_idx"]
+            use_child, use_l0, cm = bool(cc["children"]), bool(cc["l0"]), bool(causal)
+
+            def cc_mask(b, h, qi, ki):
+                # q_rows/k_rows are packed rows == union band ranks (prefix layout)
+                dr = qr[qi] - kr[ki]
+                kl, ql = k_lvl[ki], q_lvl[qi]
+                kx = k_idx[ki]
+                keep = (kl == ql) & ((q_idx[qi] - kx).abs() <= q_rad[qi])          # level window
+                if use_child:
+                    keep = keep | ((kl == ql - 1) & (kx >= q_clo[qi]) & (kx <= q_chi[qi]))
+                if use_l0:
+                    keep = keep | ((kl == 0) & (kx >= q_tlo[qi]) & (kx <= q_thi[qi]))
+                # DISJOINT from the union: drop exactly the keys its band delivers.
+                band = ((dr >= 0) & (dr <= w_mix)) if cm else (dr.abs() <= w_mix)
+                keep = keep & (~band)
+                return (keep & (dr >= 0)) if cm else keep
+
+            _bs = (self._FLEX_FLASH_BLOCK if self._flex_flash_active() else _t_bs) \
+                if (qr.is_cuda and min(nq, nk) >= self._CC_MIN_COMPILED) else None
+            _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
+            try:
+                bm = create_block_mask(cc_mask, B=None, H=None, Q_LEN=nq, KV_LEN=nk,
+                                       device=str(qr.device), _compile=True, **_kw)
+            except TypeError:
+                bm = create_block_mask(cc_mask, B=None, H=None, Q_LEN=nq, KV_LEN=nk,
+                                       device=str(qr.device), **_kw)
+            spec["flex_cc_bm"], spec["flex_cc_bm_key"] = bm, _key
+        q_c = qp.index_select(1, qr).transpose(1, 2)
+        k_c = kp.index_select(1, kr).transpose(1, 2)
+        v_c = vp.index_select(1, kr).transpose(1, 2)
+        _p = float(self.dropout.p) if self.training else 0.0
+        if _p > 0.0:
+            # Token-wise V dropout, as in the union call; B's keys are disjoint from it.
+            _keep = torch.rand(v_c.shape[0], v_c.shape[1], v_c.shape[2], 1,
+                               device=v_c.device, dtype=torch.float32) >= _p
+            v_c = v_c * (_keep.to(v_c.dtype) / (1.0 - _p))
+        _dk = float(getattr(self, "local_pack_flex_dropkey", 0.0)) if self.training else 0.0
+        # No self key here (self is in the band), so nothing to protect.
+        _sm = ({"score_mod": _dropkey_score_mod(_dk, _dropkey_seed(q_c.device), kv_off=None)}
+               if _dk > 0.0 else {})
+        # Compiled kernel down to one mask block. The union's 512-row floor guards
+        # generation-prefix graphs smaller than a block; this call is only 224 x 192 at text
+        # 1024 and would otherwise take the eager math path. (The one extra graph break this
+        # call adds under hier_layer_compile is create_block_mask's warnings.warn on the FIRST
+        # build -- the mask is cached in the spec after that, as the union's own is.)
+        if q_c.is_cuda and min(nq, nk) >= self._CC_MIN_COMPILED:
+            res = _flex_compiled_singleton()(
+                q_c, k_c, v_c, block_mask=bm, return_lse=True, **_sm,
+                kernel_options=({"BACKEND": "FLASH"} if self._flex_flash_active()
+                                else {} if _t_km is None
+                                else {"BLOCK_M": _t_km, "BLOCK_N": _t_kn}))
+        else:
+            res = flex_attention(q_c, k_c, v_c, block_mask=bm, return_lse=True, **_sm)
+        o_b, l_b = res
+        self._flex_cc_live = True
+        l_a = lse_main.index_select(2, qr).float()
+        l_b = l_b.float()
+        m = torch.maximum(l_a, l_b)
+        w_a = (l_a - m).exp().unsqueeze(-1)
+        w_b = (l_b - m).exp().unsqueeze(-1)
+        o_a = out.index_select(2, qr)
+        merged = ((o_a.float() * w_a + o_b.float() * w_b) / (w_a + w_b)).to(out.dtype)
+        return out.index_copy(2, qr, merged)
+
     def _flex_ring_call(self, qp, kp, vp, spec: Dict, causal: bool, want_lse: bool):
         """Rings as their own flex call, in level-grouped order.
 
@@ -4322,14 +4484,19 @@ class HierarchicalMessagePassing(MessagePassing):
             _keep = torch.rand(v_r.shape[0], v_r.shape[1], v_r.shape[2], 1,
                                device=v_r.device, dtype=torch.float32) >= _p
             v_r = v_r * (_keep.to(v_r.dtype) / (1.0 - _p))
+        _dk = float(getattr(self, "local_pack_flex_dropkey", 0.0)) if self.training else 0.0
+        # Ring keys exclude self (the band holds it), so nothing to protect: a ring row that
+        # loses every key returns lse -inf and weight 0 in the merge, like an empty ring row.
+        _rsm = ({"score_mod": _dropkey_score_mod(_dk, _dropkey_seed(q_r.device), kv_off=None)}
+                if _dk > 0.0 else {})
         if q_r.is_cuda and n >= 512:
             res = _flex_compiled_singleton()(
-                q_r, k_r, v_r, block_mask=bm, return_lse=want_lse,
+                q_r, k_r, v_r, block_mask=bm, return_lse=want_lse, **_rsm,
                 kernel_options=({"BACKEND": "FLASH"} if self._flex_flash_active()
                                 else {} if _t_km is None
                                 else {"BLOCK_M": _t_km, "BLOCK_N": _t_kn}))
         else:
-            res = flex_attention(q_r, k_r, v_r, block_mask=bm, return_lse=want_lse)
+            res = flex_attention(q_r, k_r, v_r, block_mask=bm, return_lse=want_lse, **_rsm)
         o_r, l_r = res if want_lse else (res, None)
         return (o_r.transpose(1, 2).index_select(1, inv),
                 l_r.index_select(2, inv) if l_r is not None else None)
@@ -4365,7 +4532,8 @@ class HierarchicalMessagePassing(MessagePassing):
                 or getattr(self, "_flex_flash_probed", False)):
             return not getattr(self, "_flex_flash_failed", False)
         self._flex_flash_probed = True
-        ok, why = flex_flash_supported(torch.device(device), int(self.head_dim))
+        ok, why = flex_flash_supported(torch.device(device), int(self.head_dim),
+                                       with_dropkey=float(getattr(self, "local_pack_flex_dropkey", 0.0)) > 0)
         if ok:
             self._local_pack_log_once(f"flex FLASH (FA4) backend live ({why})")
         else:
@@ -5023,12 +5191,22 @@ class HierarchicalMessagePassing(MessagePassing):
                                device=v_s.device, dtype=torch.float32) >= _p
             v_s = v_s * (_keep.to(v_s.dtype) / (1.0 - _p))
 
+        _dk = float(getattr(self, "local_pack_flex_dropkey", 0.0)) if self.training else 0.0
+        if _dk > 0.0:
+            # Every layout keeps the query-ordered rows LAST in K (prefix / tier strip in
+            # front), so query i's own key sits at i + (len K - len Q).
+            _smod = _dropkey_score_mod(_dk, _dropkey_seed(q_s.device),
+                                       kv_off=int(k_s.shape[2]) - int(q_s.shape[2]), base=_smod)
+
         # Compiled kernel only for real graphs: the inductor lowering asserts on tiny
         # sequences (< one mask block, e.g. generation-prefix graphs), and eager flex
         # (math composite, O(n^2) but n is tiny there) is fine for those.
         _rmode = str(spec.get("flex_ring_merge", "union"))
         _ring = _rmode in ("additive", "lse") and "flex_ring_perm" in spec
-        _lse = _ring and _rmode == "lse"
+        # Coarse call: prefix layout only (identity queries, so union row == packed row), and
+        # the model refuses the knobs without a levels-mode global block and without rings.
+        _cc = spec.get("flex_cc", None) if (_pre is not None and gsel is None and not _ring) else None
+        _lse = (_ring and _rmode == "lse") or (_cc is not None)
         if q_s.is_cuda and int(perm.numel()) >= 512:
             fn = _flex_compiled_singleton()
             # Default tiles exceed the workstation Blackwell's 101KB shared memory, so the
@@ -5043,6 +5221,8 @@ class HierarchicalMessagePassing(MessagePassing):
             out = flex_attention(q_s, k_s, v_s, block_mask=bm, return_lse=_lse,
                                  **({"score_mod": _smod} if _smod is not None else {}))
         out, lse_main = out if _lse else (out, None)
+        if _cc is not None:
+            out = self._flex_coarse_call_merge(qp, kp, vp, spec, _cc, bool(causal), out, lse_main)
         out = out.transpose(1, 2)  # [B, N, H, D]
         if not _ring:
             return out
@@ -6304,6 +6484,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_flex_union: bool = False,  # ONE flex_attention call w/ block-sparse union mask
         local_pack_flex_strict: bool = False,  # raise instead of silently degrading to additive
         local_pack_flex_backend: str = "triton",
+        local_pack_flex_dropkey: float = 0.0,  # per-(q,k) DropKey on the flex calls (train only)
         local_pack_global_select: str = "levels",  # levels | content (learned top-K rows)
         local_pack_global_l0_budget: int = 0,  # rows of the budget that may be L0 tokens
         local_pack_global_score_bias: bool = True,  # score -> logit, trains the nominator
@@ -6412,6 +6593,7 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_flex_union=local_pack_flex_union,
             local_pack_flex_strict=local_pack_flex_strict,
             local_pack_flex_backend=local_pack_flex_backend,
+            local_pack_flex_dropkey=local_pack_flex_dropkey,
             local_pack_global_select=local_pack_global_select,
             local_pack_global_l0_budget=local_pack_global_l0_budget,
             local_pack_global_score_bias=local_pack_global_score_bias,
