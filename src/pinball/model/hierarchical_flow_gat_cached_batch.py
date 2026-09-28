@@ -477,6 +477,106 @@ class PackedTransformerBlock(nn.Module):
         return x
 
 
+class PinballUpperStageBlock(nn.Module):
+    """One pre-norm block over the gathered UPPER hierarchy (local_pack_upper_*).
+
+    Rows are the upper levels' nodes in node order, i.e. level-major and ascending, so each
+    level is one contiguous slice (`segs`) and per-level weights are a short loop of dense
+    matmuls rather than a gather. Attention is ONE softmax over every upper row, restricted by
+    `mask` ([R, R] bool, True = attend; None = all-to-all). L0 never enters.
+
+    qkv_mode:  shared | per_level  -- Q/K/V + output projection (and norm1) per level.
+    ffn_mode:  shared | per_level  -- SwiGLU FFN (and norm2) per level.
+    ffn_dim:   0 = the main layer's width (8/3 * hidden, multiple of 256); > 0 = fat FFN with
+               the per_level_ffn_dims semantics (inner ~ 8/3 * ffn_dim).
+    Shared-QKV mode adds a zero-init level embedding to the normed input, BEFORE the rotation,
+    so level identity reaches Q/K without the post-RoPE tag problem.
+
+    Identity at init: every output projection and FFN down projection is zero-init (unlike
+    a zero scalar gate, a zero matrix still receives gradient: dW = y^T g).
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        norm_type: str,
+        norm_eps: float,
+        levels: Sequence[int],
+        num_levels: int,
+        qkv_mode: str = "shared",
+        ffn_mode: str = "shared",
+        ffn_dim: int = 0,
+        max_seq_len: int = 131072,
+    ):
+        super().__init__()
+        hidden_dim = int(hidden_dim)
+        num_heads = int(num_heads)
+        if hidden_dim % num_heads != 0:
+            raise ValueError("PinballUpperStageBlock hidden_dim must be divisible by num_heads")
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.levels = [int(l) for l in levels]
+        self.qkv_mode = str(qkv_mode)
+        self.ffn_mode = str(ffn_mode)
+        self.dropout_p = max(0.0, float(dropout))
+        n_q = len(self.levels) if self.qkv_mode == "per_level" else 1
+        n_f = len(self.levels) if self.ffn_mode == "per_level" else 1
+        self.norm1 = nn.ModuleList([make_norm(hidden_dim, norm_type=norm_type, eps=norm_eps) for _ in range(n_q)])
+        self.norm2 = nn.ModuleList([make_norm(hidden_dim, norm_type=norm_type, eps=norm_eps) for _ in range(n_f)])
+        self.qkv = nn.ModuleList([nn.Linear(hidden_dim, 3 * hidden_dim, bias=False) for _ in range(n_q)])
+        self.out_proj = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(n_q)])
+        self.ffn = nn.ModuleList([PackedSwiGLUFFN(hidden_dim, ffn_dim=int(ffn_dim)) for _ in range(n_f)])
+        self.level_emb = nn.Embedding(int(num_levels), hidden_dim) if n_q == 1 else None
+        self.rope = RotaryPositionalEncoding(self.head_dim, max_seq_len=int(max_seq_len))
+        self.drop = nn.Dropout(self.dropout_p)
+        self.reset_identity()
+
+    @torch.no_grad()
+    def reset_identity(self) -> None:
+        """Zero the residual outputs (and the level embedding). The model's constructor runs
+        self.apply(_init_weights) over every Linear/Embedding at the end, so it must call this
+        again afterwards or the stage starts as a random residual."""
+        for m in self.out_proj:
+            nn.init.zeros_(m.weight)
+        for f in self.ffn:
+            nn.init.zeros_(f.down_proj.weight)
+        if self.level_emb is not None:
+            nn.init.zeros_(self.level_emb.weight)
+
+    @staticmethod
+    def _per_seg(mods, x: torch.Tensor, segs: Tuple[Tuple[int, int], ...],
+                 seg_mod: Tuple[int, ...]) -> torch.Tensor:
+        if len(mods) == 1:
+            return mods[0](x)
+        return torch.cat([mods[i](x[:, s:e]) for i, (s, e) in zip(seg_mod, segs)], dim=1)
+
+    def forward(self, x: torch.Tensor, pos: torch.Tensor, row_level: torch.Tensor,
+                mask: Optional[torch.Tensor], segs: Tuple[Tuple[int, int], ...],
+                seg_mod: Tuple[int, ...]) -> torch.Tensor:
+        B, R, _ = x.shape
+        h = self._per_seg(self.norm1, x, segs, seg_mod)
+        if self.level_emb is not None:
+            h = h + self.level_emb(row_level).unsqueeze(0).to(h.dtype)
+        qkv = self._per_seg(self.qkv, h, segs, seg_mod)
+        q, k, v = qkv.view(B, R, 3, self.num_heads, self.head_dim).unbind(2)
+        pos_rep = pos.view(1, R).expand(B, R).reshape(-1)
+        q = self.rope.apply_rotary_pos_emb(q.reshape(B * R, self.num_heads, self.head_dim), pos_rep)
+        k = self.rope.apply_rotary_pos_emb(k.reshape(B * R, self.num_heads, self.head_dim), pos_rep)
+        q = q.view(B, R, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, R, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.transpose(1, 2)
+        am = None if mask is None else mask.view(1, 1, R, R)
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=am, dropout_p=self.dropout_p if self.training else 0.0)
+        y = y.transpose(1, 2).reshape(B, R, self.hidden_dim)
+        x = x + self.drop(self._per_seg(self.out_proj, y, segs, seg_mod))
+        x = x + self.drop(self._per_seg(self.ffn, self._per_seg(self.norm2, x, segs, seg_mod), segs, seg_mod))
+        return x
+
+
 class PinballPackedLevelRefiner(nn.Module):
     """Read-once/write-once packed dense refiner over selected hierarchy levels."""
 
@@ -2849,6 +2949,31 @@ class HierarchicalFlowGAT(nn.Module):
         # Both off (default) = no second call = the previous path exactly.
         local_pack_level_windows: Optional[Union[int, Sequence[int]]] = None,
         local_pack_down_highway: str = "off",
+        # UPPER STAGE: extra compute cycles over the upper hierarchy only. After every
+        # `every`-th main layer (never after the last), the upper levels' rows are sliced out
+        # of node order, run through `depth` dedicated pre-norm blocks (PinballUpperStageBlock,
+        # unshared across stages), and written back. L0 never joins, so the stage costs a
+        # small fraction of a main layer; the main layers keep sensing, the stage thinks.
+        #   local_pack_upper_every      0 = off (no modules built = bit-identical)
+        #   local_pack_upper_depth      blocks per stage
+        #   local_pack_upper_budget     all-to-all CORE: whole levels top-down while their rows
+        #       fit (null = local_pack_global_block, so core == global block by default)
+        #   local_pack_upper_extend     levels BELOW the core that also join, each reading its
+        #       same-level lane (+-local_pack_upper_window), its parents/children, and the core
+        #   local_pack_upper_from_level absolute override: every level >= this joins (wins
+        #       over extend; must be >= 1)
+        #   local_pack_upper_qkv / _ffn  shared | per_level;  _ffn_dim 0 = standard width
+        # Causal packs mask by (close time, level) -- the packed order -- so the stage is as
+        # causal as the pack; bidirectional packs are unmasked in the core.
+        local_pack_upper_every: int = 0,
+        local_pack_upper_depth: int = 1,
+        local_pack_upper_budget: Optional[int] = None,
+        local_pack_upper_extend: int = 0,
+        local_pack_upper_from_level: Optional[int] = None,
+        local_pack_upper_window: int = 32,
+        local_pack_upper_qkv: str = "shared",
+        local_pack_upper_ffn: str = "shared",
+        local_pack_upper_ffn_dim: int = 0,
         # L0 window flash implementation: auto (fa3 on Hopper else fa2, historical) |
         # fa2 | fa3 | fa4. Env PINBALL_FLASH_IMPL overrides. Process-wide (the resolved
         # backend is cached per device), so the LAST model constructed wins.
@@ -4533,6 +4658,77 @@ class HierarchicalFlowGAT(nn.Module):
                 logger.warning("Unified refinement selected with share_transformers=False but num_refinement_layers=0. No dedicated refinement layers created.")
 
 
+        # Upper stage (see local_pack_upper_every). Off = nothing built.
+        self.local_pack_upper_every = max(0, int(local_pack_upper_every or 0))
+        self.local_pack_upper_depth = max(1, int(local_pack_upper_depth or 1))
+        self.local_pack_upper_budget = None if local_pack_upper_budget is None else max(0, int(local_pack_upper_budget))
+        self.local_pack_upper_extend = max(0, int(local_pack_upper_extend or 0))
+        self.local_pack_upper_from_level = None if local_pack_upper_from_level is None else int(local_pack_upper_from_level)
+        self.local_pack_upper_window = max(0, int(local_pack_upper_window or 0))
+        self.local_pack_upper_qkv = str(local_pack_upper_qkv or "shared").lower()
+        self.local_pack_upper_ffn = str(local_pack_upper_ffn or "shared").lower()
+        self.local_pack_upper_ffn_dim = max(0, int(local_pack_upper_ffn_dim or 0))
+        self.upper_stage_blocks = None
+        self._upper_stage_runs = 0
+        if self.local_pack_upper_every > 0:
+            _why = []
+            for _k, _v in (("local_pack_upper_qkv", self.local_pack_upper_qkv),
+                           ("local_pack_upper_ffn", self.local_pack_upper_ffn)):
+                if _v not in ("shared", "per_level"):
+                    _why.append(f"{_k} must be shared|per_level, got {_v!r}")
+            if self.local_pack_upper_from_level is not None and self.local_pack_upper_from_level < 1:
+                _why.append("local_pack_upper_from_level must be >= 1 (L0 never joins the stage)")
+            if (self.local_pack_upper_from_level is None
+                    and "per_level" in (self.local_pack_upper_qkv, self.local_pack_upper_ffn)):
+                # A budget-resolved core depends on the RUNTIME level sizes, but weights must
+                # exist before the first forward; building every coarse level left the ones
+                # that never join as dead parameters (33-69M at DNA 4096).
+                _why.append("per_level weights need an explicit local_pack_upper_from_level "
+                            "(the lowest level that joins, e.g. 3 for DNA glob400 at 4096)")
+            _bud = self.local_pack_upper_budget
+            if _bud is None:
+                _bud = int(getattr(self, "local_pack_global_block", 0) or 0)
+            if self.local_pack_upper_from_level is None and _bud <= 0:
+                _why.append("set local_pack_upper_budget (or local_pack_global_block, its default) "
+                            "or local_pack_upper_from_level")
+            _n_main = int(self.num_refinement_layers or 0)
+            _n_stages = (_n_main - 1) // self.local_pack_upper_every if _n_main > 1 else 0
+            if _n_stages <= 0:
+                _why.append(f"no stage fits: {_n_main} main layers, every {self.local_pack_upper_every} "
+                            "(a stage never runs after the last layer)")
+            if _why:
+                raise ValueError("local_pack_upper_*: " + "; ".join(_why))
+            _n_lv = int(getattr(self, "num_hier_levels", 1 + len(self.compression_ratios)))
+            # Per-level weights exist for the levels that can join. With from_level that set is
+            # fixed; a budget-resolved core depends on the runtime level sizes, so every coarse
+            # level gets weights and flex_union_status() reports which ones actually run.
+            _lo = self.local_pack_upper_from_level if self.local_pack_upper_from_level is not None else 1
+            _levels = list(range(int(_lo), _n_lv))
+            self.upper_stage_blocks = nn.ModuleList([
+                nn.ModuleList([
+                    PinballUpperStageBlock(
+                        hidden_dim=self.pinball_work_dim,
+                        num_heads=self.pinball_work_num_heads,
+                        dropout=dropout,
+                        norm_type=self.norm_type,
+                        norm_eps=self.norm_eps,
+                        levels=_levels,
+                        num_levels=_n_lv,
+                        qkv_mode=self.local_pack_upper_qkv,
+                        ffn_mode=self.local_pack_upper_ffn,
+                        ffn_dim=self.local_pack_upper_ffn_dim,
+                        max_seq_len=self.max_seq_len,
+                    )
+                    for _ in range(self.local_pack_upper_depth)
+                ])
+                for _ in range(_n_stages)
+            ])
+            logger.info(
+                "Upper stage on: %d stages x %d blocks (every %d of %d layers), qkv %s, ffn %s (dim %d), "
+                "levels built %s.", _n_stages, self.local_pack_upper_depth, self.local_pack_upper_every,
+                _n_main, self.local_pack_upper_qkv, self.local_pack_upper_ffn,
+                self.local_pack_upper_ffn_dim, _levels)
+
         # Layer / RMS normalization
         self.layer_norm = make_norm(hidden_dim, norm_type=self.norm_type, eps=self.norm_eps)
         self.pinball_refinement_norm = make_norm(self.pinball_work_dim, norm_type=self.norm_type, eps=self.norm_eps)
@@ -5213,6 +5409,10 @@ class HierarchicalFlowGAT(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+        if self.upper_stage_blocks is not None:
+            for _m in self.upper_stage_blocks.modules():
+                if isinstance(_m, PinballUpperStageBlock):
+                    _m.reset_identity()
         nn.init.normal_(self.cond_film.weight, std=1e-3)
         nn.init.zeros_(self.cond_film.bias)
         if self.refine_cond_film is not None:
@@ -6923,6 +7123,141 @@ class HierarchicalFlowGAT(nn.Module):
             "key": (tuple(wins), mode, int(q_rows.numel()), int(k_rows.numel())),
         }
 
+    def _upper_stage_spec(self, x: torch.Tensor, node_level: torch.Tensor,
+                          node_ar_time: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
+        """Rows, per-level slices, RoPE positions and mask for the upper stage.
+
+        Level membership is resolved from the RUNTIME level sizes, exactly like the global
+        block: CORE = whole levels top-down while their rows fit the budget (all-to-all, one
+        softmax); then `extend` more levels below it, or every level >= from_level. Non-core
+        rows read the core, their same-level lane (+-local_pack_upper_window) and their
+        parents/children (the pooling rule of _coarse_call_spec: parent j of level l owns
+        level l-1 nodes [min(j*ratio, n-1), min(that + comp - 1, n-1)]); the core reads
+        everything. Causal packs additionally require key <= query in packed order
+        (close time, then level: lower levels first at equal close time). Content-independent,
+        so cached on tensor identity; the one host sync is on a cache miss."""
+        N = int(x.size(1))
+        key = (int(node_level.data_ptr()), N, str(x.device),
+               int(node_ar_time.data_ptr()) if node_ar_time is not None else -1)
+        cached = getattr(self, "_upper_stage_spec_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        dev = x.device
+        lvl = node_level.to(device=dev, dtype=torch.long)
+        n_lv = int(getattr(self, "num_hier_levels", 1 + len(self.compression_ratios)))
+        counts = torch.bincount(lvl, minlength=n_lv).tolist()
+        present = [l for l in range(1, len(counts)) if counts[l] > 0]
+        if not present:
+            self._upper_stage_spec_cache = (key, None)
+            return None
+        bud = self.local_pack_upper_budget
+        if bud is None:
+            bud = int(getattr(self, "local_pack_global_block", 0) or 0)
+        core, tot = [], 0
+        if bud > 0:
+            for l in sorted(present, reverse=True):
+                if tot + counts[l] > bud:
+                    break
+                core.append(l); tot += counts[l]
+        if self.local_pack_upper_from_level is not None:
+            stage = [l for l in present if l >= self.local_pack_upper_from_level]
+        else:
+            lo = min(core) if core else max(present) + 1
+            stage = sorted(set(core) | {l for l in present if lo - self.local_pack_upper_extend <= l < lo})
+        core = sorted(l for l in core if l in stage)
+        if not stage:
+            self._upper_stage_spec_cache = (key, None)
+            return None
+        built = list(self.upper_stage_blocks[0][0].levels)
+        missing = [l for l in stage if l not in built]
+        if missing:
+            raise RuntimeError(f"upper stage: levels {missing} joined but have no weights (built {built})")
+
+        in_stage = torch.zeros(len(counts), dtype=torch.bool, device=dev)
+        in_stage[torch.tensor(stage, device=dev)] = True
+        rows = torch.nonzero(in_stage.index_select(0, lvl), as_tuple=False).view(-1)
+        rl = lvl.index_select(0, rows)
+        order = torch.argsort(rl * (N + 1) + rows)           # level-major, node order within
+        rows = rows.index_select(0, order).contiguous()
+        rl = rl.index_select(0, order).contiguous()
+        R = int(rows.numel())
+        if R > 16384:
+            raise RuntimeError(f"upper stage: {R} rows is past the dense-mask path (16384); "
+                               "lower local_pack_upper_extend / raise from_level")
+        segs, s = [], 0
+        for l in stage:
+            segs.append((s, s + counts[l])); s += counts[l]
+        seg_mod = tuple(built.index(l) for l in stage)
+        r0, r1 = rows[:1].tolist()[0], rows[-1:].tolist()[0]
+        contiguous = bool(r1 - r0 + 1 == R)
+        seg_start = torch.tensor([a for a, _ in segs], device=dev, dtype=torch.long)
+        lvl_pos = torch.zeros(len(counts), dtype=torch.long, device=dev)
+        lvl_pos[torch.tensor(stage, device=dev)] = torch.arange(len(stage), device=dev)
+        li = torch.arange(R, device=dev) - seg_start.index_select(0, lvl_pos.index_select(0, rl))
+        if node_ar_time is not None:
+            pos = node_ar_time.to(device=dev, dtype=torch.long).index_select(0, rows).contiguous()
+        else:
+            pos = li.clone()
+        causal = not bool(getattr(self, "local_pack_bidirectional", False))
+        is_core = torch.zeros(len(counts), dtype=torch.bool, device=dev)
+        if core:
+            is_core[torch.tensor(core, device=dev)] = True
+        rc = is_core.index_select(0, rl)
+        if len(core) == len(stage) and not causal:
+            mask = None
+        else:
+            allow = rc.view(R, 1) | rc.view(1, R)
+            same = rl.view(R, 1) == rl.view(1, R)
+            allow = allow | (same & ((li.view(R, 1) - li.view(1, R)).abs() <= self.local_pack_upper_window))
+            comp = [0] + [int(c) for c in self.compression_ratios]
+            ratio = [0] + [max(1, int(int(c) * (1 - float(o))))
+                           for c, o in zip(self.compression_ratios, self.overlap_ratios)]
+            n_lower = [0] + [int(counts[l - 1]) for l in range(1, len(counts))]
+            _t = lambda v: torch.tensor((v + [0] * len(counts))[:len(counts)], dtype=torch.long, device=dev)
+            nlo = (_t(n_lower) - 1).clamp_min(0).index_select(0, rl)
+            clo = torch.minimum(li * _t(ratio).index_select(0, rl), nlo)
+            chi = torch.minimum(clo + _t(comp).index_select(0, rl) - 1, nlo)
+            child = ((rl.view(1, R) == rl.view(R, 1) - 1)
+                     & (li.view(1, R) >= clo.view(R, 1)) & (li.view(1, R) <= chi.view(R, 1)))
+            allow = allow | child | child.transpose(0, 1)
+            if causal:
+                ok = pos * (len(counts) + 1) + rl
+                allow = allow & (ok.view(1, R) <= ok.view(R, 1))
+            mask = allow.contiguous()
+        spec = {
+            "rows": rows, "slice": (r0, r1 + 1) if contiguous else None,
+            "pos": pos, "row_level": rl, "mask": mask,
+            "segs": tuple(segs), "seg_mod": seg_mod,
+        }
+        self._upper_stage_info = {
+            "levels": stage, "core_levels": core, "rows": R,
+            "core_rows": int(sum(counts[l] for l in core)), "masked": mask is not None,
+            "causal": causal, "level_counts": counts,
+        }
+        self._upper_stage_spec_cache = (key, spec)
+        return spec
+
+    def _apply_upper_stage(self, x: torch.Tensor, node_level: torch.Tensor,
+                           node_ar_time: Optional[torch.Tensor], stage_idx: int) -> torch.Tensor:
+        """One upper stage: slice the upper rows out, run the stage's blocks, write back
+        out of place (an in-place write into a tensor the next layer's autograd graph saved
+        would break compiled backward, same as the coarse-call merge)."""
+        spec = self._upper_stage_spec(x, node_level, node_ar_time)
+        if spec is None:
+            return x
+        sl = spec["slice"]
+        xs = x[:, sl[0]:sl[1]] if sl is not None else x.index_select(1, spec["rows"])
+        _ckpt = bool(getattr(self, "use_gradient_checkpointing", False)) and self.training and torch.is_grad_enabled()
+        for blk in self.upper_stage_blocks[int(stage_idx)]:
+            fn = self._layer_callable(blk)
+            args = (xs, spec["pos"], spec["row_level"], spec["mask"], spec["segs"], spec["seg_mod"])
+            xs = torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False) if _ckpt else fn(*args)
+        xs = xs.to(x.dtype)
+        self._upper_stage_runs += 1
+        if sl is not None:
+            return torch.cat([x[:, :sl[0]], xs, x[:, sl[1]:]], dim=1)
+        return x.index_copy(1, spec["rows"], xs)
+
     def _local_pack_build_spec(
         self,
         level_offsets: torch.Tensor,
@@ -8365,6 +8700,13 @@ class HierarchicalFlowGAT(nn.Module):
             "coarse_call": bool(getattr(self, "local_pack_coarse_call", False)),
             "coarse_call_layers": cc_layers,
             "coarse_call_live_modules": cc_live,
+            # Upper stage: resolved membership of the LAST built spec (None before a forward)
+            # and how many stage applications have run. On an arm that sets
+            # local_pack_upper_every, runs must be > 0 after a forward.
+            "upper_stage": bool(getattr(self, "upper_stage_blocks", None) is not None),
+            "upper_stage_stages": len(self.upper_stage_blocks) if getattr(self, "upper_stage_blocks", None) is not None else 0,
+            "upper_stage_runs": int(getattr(self, "_upper_stage_runs", 0)),
+            "upper_stage_info": getattr(self, "_upper_stage_info", None),
             "reasons": reasons,
         }
 
@@ -15465,6 +15807,19 @@ class HierarchicalFlowGAT(nn.Module):
                 # native layer (memory graph evolves at the same depth as the native graph).
                 if per_layer_hook is not None:
                     x = per_layer_hook(x, int(layer_idx), int(entry_idx))
+
+                # Upper stage: after every k-th layer except the last (nothing would read it).
+                _ue = int(getattr(self, "local_pack_upper_every", 0) or 0)
+                if (_ue > 0 and self.upper_stage_blocks is not None
+                        and layer_step % _ue == 0 and layer_step < len(schedule_entries)):
+                    _si = layer_step // _ue - 1
+                    if _si < len(self.upper_stage_blocks):
+                        x = self._apply_upper_stage(x, base_nl, base_ar_time, _si)
+                    elif not getattr(self, "_upper_stage_overrun_logged", False):
+                        logger.warning("upper stage: schedule wants stage %d but only %d were built "
+                                       "(more layer steps than num_refinement_layers?); skipping.",
+                                       _si, len(self.upper_stage_blocks))
+                        self._upper_stage_overrun_logged = True
 
                 if multirate_active:
                     is_cycle_end = bool(
