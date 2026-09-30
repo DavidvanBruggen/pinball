@@ -154,7 +154,14 @@ def _build_optimizer(model, cfg):
     # positions in one window and should be SIMILAR, not orthogonal. `.bias` is a 2-D [comp,
     # hidden] table and orthogonalising a bias is meaningless. Loss-only tensors, never in the
     # forward, so this cannot affect inference.
-    head_name_markers = ("output_projection", "lm_head", "hier_pc_decoder")
+    # global_nominate_vec: a [levels, heads*head_dim] table of per-level SCORING directions for
+    # the content-selected global block, not a weight matrix. Under Muon each step is a
+    # fixed-magnitude orthogonalised direction whatever the gradient size, and rows are
+    # coupled; measured 2026-09-29 (l0sel sanity, 2 epochs): layer 0's L0 row collapsed
+    # 0.39 -> 0.003 and the picks covered FEWER copy targets than random rows.
+    # nom_boost_u: likewise a [heads, head_dim] table of per-head directions, not a weight matrix.
+    head_name_markers = ("output_projection", "lm_head", "hier_pc_decoder", "global_nominate_vec",
+                         "nom_boost_u")
     for name, p in model.named_parameters():
         if any(marker in name for marker in head_name_markers):
             embed_param_ids.add(id(p))
@@ -199,6 +206,11 @@ def _build_optimizer(model, cfg):
         if not (muon_hier or other_hier):
             logger.warning("hier_lr_mult=%.3f matched NO parameters -- check HIERARCHY_PARAM_MARKERS",
                            hier_lr_mult)
+    if bool(getattr(cfg, "muon_batched", False)):
+        # Same update, Newton-Schulz batched per shape (src/pinball/train/muon_batched.py).
+        from .train.muon_batched import BatchedMuon
+        logger.info("muon_batched: Newton-Schulz batched per matrix shape")
+        return BatchedMuon(param_groups)
     return po.Muon(param_groups)
 
 
@@ -428,6 +440,7 @@ def main(argv=None) -> None:
         copy_task_max_gap=int(getattr(cfg, "copy_task_max_gap", 0)),
         longctx_diag_every=int(getattr(cfg, "longctx_diag_every", 0) or 0),
         longctx_diag_max_seqs=int(getattr(cfg, "longctx_diag_max_seqs", 64) or 64),
+        longctx_diag_long_edges=list(getattr(cfg, "longctx_diag_long_edges", None) or []),
         train_feature_chunked_ce_enable=bool(getattr(cfg, "train_feature_chunked_ce_enable", False)),
         chunked_ce_seq_chunk=int(getattr(cfg, "chunked_ce_seq_chunk", 0) or 0),
         chunked_ce_enable=bool(getattr(cfg, "chunked_ce_enable", False)),

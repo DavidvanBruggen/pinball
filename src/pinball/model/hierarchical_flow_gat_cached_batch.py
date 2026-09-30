@@ -2563,6 +2563,16 @@ class HierarchicalFlowGAT(nn.Module):
         num_refinement_layers: int = 2, # For unified style when share=False
         per_level_local_qkv: bool = False,  # per-level intra-level Q/K/V in refinement layers (backbone QKV stays shared)
         per_level_ffn_dims: Optional[List[int]] = None,  # per-level FFN processing dim (U-Net-style: L0 small, coarse big)
+        # LEVEL-SPECIFIC WEIGHTS in every main layer, standard width: shared | l0_coarse |
+        # per_level. Group 0 (L0) keeps the shared weights; l0_coarse adds ONE set for all
+        # coarse rows, per_level one per coarse level. hier_level_qkv covers q/k/v/out_proj
+        # (applied in node order around the unchanged packed flex softmax -- one joint softmax,
+        # level-specific projections; needs local_pack_cross_level + local_pack_flex_union);
+        # hier_level_ffn covers the SwiGLU (exclusive with per_level_ffn_dims). Copy-init from
+        # the shared weights: identical at init, then specialize. Rows (activations) and FLOPs
+        # are unchanged; only parameter/optimizer memory grows, and not with context length.
+        hier_level_qkv: str = "shared",
+        hier_level_ffn: str = "shared",
         per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up-project local attn to this head_dim (narrow residual)
         upper_init: str = "mask",  # "mask" | "zeros" | "pooled": how coarse (L1+) nodes are seeded at input
@@ -2989,6 +2999,18 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_dedup: bool = True,
         local_pack_global_logit: bool = False,
         local_pack_global_chunk: int = 0,
+        # content + chunk only: "levels" keeps the static top-down coarse block and adds
+        # the per-chunk L0 content slots on top of it (see the layer docstring).
+        local_pack_global_coarse: str = "content",
+        # levels-mode slot selection: "key" = learned per-level direction . key (default);
+        # "head" = hierarchy nomination heads (parent -> child weight, see the layer).
+        local_pack_global_nominator: str = "key",
+        local_pack_global_candidates: str = "l0",   # head only: l0 | all (any non-static row)
+        local_pack_global_gumbel: float = 0.0,      # head only: Gumbel top-k temperature (train)
+        local_pack_global_nom_dim: int = 64,        # head only: bilinear nomination width
+        local_pack_global_nom_gate: str = "raw",    # head only: raw | zscore (see the layer)
+        local_pack_global_boost: str = "logit",     # head only: logit | key (see the layer)
+        local_pack_global_gumbel_norm: str = "raw", # head only: raw | chunk (see the layer)
         # DropNode on the hierarchy: zero a coarse row's VALUE in the packed K/V set per
         # (batch, row, step). L0 never dropped; residual stream and refresh paths untouched.
         hier_node_dropout: float = 0.0,
@@ -3531,6 +3553,14 @@ class HierarchicalFlowGAT(nn.Module):
         self.share_transformers = share_transformers # Store even if only used by unified
         self.num_refinement_layers = num_refinement_layers # Store even if only used by unified
         self.per_level_local_qkv = bool(per_level_local_qkv)
+        self.hier_level_qkv = str(hier_level_qkv or "shared").lower()
+        self.hier_level_ffn = str(hier_level_ffn or "shared").lower()
+        for _k, _v in (("hier_level_qkv", self.hier_level_qkv), ("hier_level_ffn", self.hier_level_ffn)):
+            if _v not in ("shared", "l0_coarse", "per_level"):
+                raise ValueError(f"{_k} must be shared|l0_coarse|per_level, got {_v!r}")
+        if self.hier_level_qkv != "shared" and not (bool(local_pack_cross_level) and bool(local_pack_flex_union)):
+            raise ValueError("hier_level_qkv needs local_pack_cross_level and local_pack_flex_union "
+                             "(the level-specific out_proj lives on the flex-union path)")
         self.per_level_ffn_dims = [int(d) for d in (per_level_ffn_dims or [])]
         self.per_level_attn_mult = [float(m) for m in (per_level_attn_mult or [])]
         self.local_attn_head_dim = int(local_attn_head_dim)
@@ -3653,6 +3683,14 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_dedup = bool(local_pack_global_dedup)
         self.local_pack_global_logit = bool(local_pack_global_logit)
         self.local_pack_global_chunk = max(0, int(local_pack_global_chunk or 0))
+        self.local_pack_global_coarse = str(local_pack_global_coarse or "content").lower()
+        self.local_pack_global_nominator = str(local_pack_global_nominator or "key").lower()
+        self.local_pack_global_candidates = str(local_pack_global_candidates or "l0").lower()
+        self.local_pack_global_gumbel = float(local_pack_global_gumbel or 0.0)
+        self.local_pack_global_nom_dim = int(local_pack_global_nom_dim or 64)
+        self.local_pack_global_nom_gate = str(local_pack_global_nom_gate or "raw").lower()
+        self.local_pack_global_boost = str(local_pack_global_boost or "logit").lower()
+        self.local_pack_global_gumbel_norm = str(local_pack_global_gumbel_norm or "raw").lower()
         self.hier_node_dropout = float(hier_node_dropout)
         self.local_window_dropout = float(local_window_dropout)
         if self.local_window_dropout > 0.0:
@@ -4487,6 +4525,14 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_dedup=bool(getattr(self, "local_pack_global_dedup", True)),
                         local_pack_global_logit=bool(getattr(self, "local_pack_global_logit", False)),
                         local_pack_global_chunk=int(getattr(self, "local_pack_global_chunk", 0) or 0),
+                        local_pack_global_coarse=str(getattr(self, "local_pack_global_coarse", "content")),
+                        local_pack_global_nominator=str(getattr(self, "local_pack_global_nominator", "key")),
+                        local_pack_global_candidates=str(getattr(self, "local_pack_global_candidates", "l0")),
+                        local_pack_global_gumbel=float(getattr(self, "local_pack_global_gumbel", 0.0)),
+                        local_pack_global_nom_dim=int(getattr(self, "local_pack_global_nom_dim", 64)),
+                        local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
+                        local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
+                        local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
                         local_window_dropout=float(getattr(self, "local_window_dropout", 0.0)),
@@ -4562,6 +4608,8 @@ class HierarchicalFlowGAT(nn.Module):
                         per_level_local_qkv=self.per_level_local_qkv,
                         num_local_levels=int(getattr(self, "num_hier_levels", 4)),
                         per_level_ffn_dims=self.per_level_ffn_dims,
+                        hier_level_qkv=self.hier_level_qkv,
+                        hier_level_ffn=self.hier_level_ffn,
                         per_level_attn_mult=self.per_level_attn_mult,
                         local_attn_head_dim=int(getattr(self, "local_attn_head_dim", 0)),
                         learn_edge_from_attn=self.learn_edge_from_attn,
@@ -4597,6 +4645,14 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_dedup=bool(getattr(self, "local_pack_global_dedup", True)),
                         local_pack_global_logit=bool(getattr(self, "local_pack_global_logit", False)),
                         local_pack_global_chunk=int(getattr(self, "local_pack_global_chunk", 0) or 0),
+                        local_pack_global_coarse=str(getattr(self, "local_pack_global_coarse", "content")),
+                        local_pack_global_nominator=str(getattr(self, "local_pack_global_nominator", "key")),
+                        local_pack_global_candidates=str(getattr(self, "local_pack_global_candidates", "l0")),
+                        local_pack_global_gumbel=float(getattr(self, "local_pack_global_gumbel", 0.0)),
+                        local_pack_global_nom_dim=int(getattr(self, "local_pack_global_nom_dim", 64)),
+                        local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
+                        local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
+                        local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
                         local_window_dropout=float(getattr(self, "local_window_dropout", 0.0)),
@@ -5409,6 +5465,13 @@ class HierarchicalFlowGAT(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+        # Level-specific weights start as copies of the shared ones; _init_weights above just
+        # re-randomized them independently, so copy again.
+        for _m in self.modules():
+            if getattr(_m, "hier_level_qkv", "shared") != "shared" and hasattr(_m, "sync_level_qkv_from_shared") and _m is not self:
+                _m.sync_level_qkv_from_shared()
+            if getattr(_m, "hier_level_ffn", "shared") != "shared" and hasattr(_m, "sync_level_ffn_from_shared") and _m is not self:
+                _m.sync_level_ffn_from_shared()
         if self.upper_stage_blocks is not None:
             for _m in self.upper_stage_blocks.modules():
                 if isinstance(_m, PinballUpperStageBlock):
@@ -7123,6 +7186,27 @@ class HierarchicalFlowGAT(nn.Module):
             "key": (tuple(wins), mode, int(q_rows.numel()), int(k_rows.numel())),
         }
 
+    def _node_level_segs(self, node_level: Optional[torch.Tensor]):
+        """((start, end, level), ...) node-order slices, one per level, as python ints. None
+        if node order is not level-major. Cached on tensor identity (one sync per skeleton)."""
+        if node_level is None:
+            return None
+        key = (int(node_level.data_ptr()), int(node_level.numel()), str(node_level.device))
+        c = getattr(self, "_node_level_segs_cache", None)
+        if c is not None and c[0] == key:
+            return c[1]
+        lvl = node_level.to(torch.long).view(-1)
+        segs = None
+        if int(lvl.numel()) > 0 and bool((lvl[1:] >= lvl[:-1]).all()):
+            counts = torch.bincount(lvl).tolist()
+            segs, a = [], 0
+            for l, n in enumerate(counts):
+                if n > 0:
+                    segs.append((a, a + int(n), int(l))); a += int(n)
+            segs = tuple(segs)
+        self._node_level_segs_cache = (key, segs)
+        return segs
+
     def _upper_stage_spec(self, x: torch.Tensor, node_level: torch.Tensor,
                           node_ar_time: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
         """Rows, per-level slices, RoPE positions and mask for the upper stage.
@@ -7358,6 +7442,16 @@ class HierarchicalFlowGAT(nn.Module):
                 _mask[_rows] = True
                 spec["global_block_mask"] = _mask
 
+        # NOMINATION PARENTS (local_pack_global_nominator: head). Each node's weighting
+        # parent is the EARLIEST-CLOSING node one level up whose window contains it, so its
+        # weight is available as soon as possible; its grandparent supplies the top-down
+        # term. Node-order maps for the heads (which read the node-order layer input) and a
+        # packed "available from" row per packed row: a row may be nominated for a chunk only
+        # once every node its weight reads has closed before that chunk's limit.
+        if (str(getattr(self, "local_pack_global_nominator", "key")) == "head"
+                and spec.get("global_block", None) is not None):
+            spec.update(self._nomination_parent_map(t, lvl, perm, _n_lvl))
+
         # Ring radii, converted from nodes-at-that-level to L0 tokens via the cumulative
         # stride so the consumer can test them against spec["pos"] with one subtraction.
         # Comparing positions rather than level ranks keeps the range test and the causality
@@ -7529,6 +7623,12 @@ class HierarchicalFlowGAT(nn.Module):
                     spec["flex_is_coarse"] = (lvl_packed > 0).index_select(
                         0, flex_perm_local).contiguous()
                     spec["flex_query_nodes"] = perm.index_select(0, flex_perm_local)
+                    # Inverse permutation when every node is a query (the usual case): lets the
+                    # level-specific out_proj (hier_level_qkv) gather flex output straight into
+                    # node order instead of zero-buffer + scatter + gather back.
+                    _fq = spec["flex_query_nodes"]
+                    spec["flex_query_inv"] = (torch.argsort(_fq)
+                                              if int(_fq.numel()) == int(perm.numel()) else None)
                     spec["flex_n_lane"] = n_lane_rows
                     # COARSE RANK FOR *EVERY* ROW, not just coarse ones -- the same array
                     # as flex_lane_rank now that it is derived from the mixed cumsum
@@ -7599,6 +7699,47 @@ class HierarchicalFlowGAT(nn.Module):
                 spec["pack_gather"] = _selq.index_select(0, _order).contiguous()
         self._local_pack_spec_cache = (key, spec)
         return spec
+
+    def _nomination_parent_map(self, t: torch.Tensor, lvl: torch.Tensor, perm: torch.Tensor,
+                               n_lvl: int) -> Dict[str, torch.Tensor]:
+        """Parent / grandparent maps for the hierarchy nomination heads (see the spec).
+
+        Window of a level-l node in L0 tokens: [ar_time - span_l + 1, ar_time] (span 1 for
+        L0), spans from _cumulative_window. The parent is the first level-(l+1) node whose
+        window ends at or after the child's and starts at or before it. -1 = none (top level,
+        or a truncated tail window that no parent covers)."""
+        n = int(t.numel()); dev = t.device
+        parent = torch.full((n,), -1, dtype=torch.long, device=dev)
+        for l in range(n_lvl - 1):
+            c_idx = torch.nonzero(lvl == l, as_tuple=False).view(-1)
+            p_idx = torch.nonzero(lvl == l + 1, as_tuple=False).view(-1)
+            if c_idx.numel() == 0 or p_idx.numel() == 0:
+                continue
+            span_c = 1 if l == 0 else int(self._cumulative_window(l)[0])
+            span_p = int(self._cumulative_window(l + 1)[0])
+            tp, order = torch.sort(t.index_select(0, p_idx))
+            p_sorted = p_idx.index_select(0, order)
+            tc = t.index_select(0, c_idx)
+            start_c = tc - span_c + 1
+            j0 = torch.searchsorted(tp, tc, right=False)
+            chosen = torch.full_like(c_idx, -1)
+            for d in range(4):                       # overlap <= 75%: a container is within 4
+                j = (j0 + d).clamp(max=int(tp.numel()) - 1)
+                okj = ((j0 + d) < tp.numel()) & (tp.index_select(0, j) - span_p + 1 <= start_c) \
+                    & (tp.index_select(0, j) >= tc) & (chosen < 0)
+                chosen = torch.where(okj, p_sorted.index_select(0, j), chosen)
+            parent[c_idx] = chosen
+        gparent = torch.where(parent >= 0, parent.index_select(0, parent.clamp(min=0)), parent)
+        inv = torch.empty_like(perm); inv[perm] = torch.arange(n, device=dev)
+        prow = torch.where(parent >= 0, inv.index_select(0, parent.clamp(min=0)), parent)
+        grow = torch.where(gparent >= 0, inv.index_select(0, gparent.clamp(min=0)), gparent)
+        avail_node = torch.where(parent >= 0, torch.maximum(prow, grow),
+                                 torch.full_like(prow, n))           # n = never
+        return {
+            "nom_parent_node": parent, "nom_gparent_node": gparent,
+            "nom_avail": avail_node.index_select(0, perm).contiguous(),   # packed order
+            "nom_parent_packed": prow.index_select(0, perm).contiguous(),
+        }
 
     def _resolve_global_tier(self, level_rows: List[torch.Tensor], top_level: int):
         """Levels forming the all-to-all global tier: whole levels top-down while they fit
@@ -15123,10 +15264,15 @@ class HierarchicalFlowGAT(nn.Module):
             if _local_pack_spec_fw is not None
             else None
         )
+        # Static node-order level slices for level-specific weights and per_level_ffn_dims
+        # (python ints -> compile constants; replaces a per-layer host sync).
+        _level_segs_fw = self._node_level_segs(base_nl)
         for _t in getattr(self, "refinement_transformers", []) or []:
+            _t._level_segs = _level_segs_fw
             _mp = getattr(_t, "message_passing", None)
             if _mp is None:
                 continue
+            _mp._level_segs = _level_segs_fw
             if getattr(_mp, "_hqd_out_query_gate", None) is not None:
                 _mp._hqd_out_query_gate = None
             _mp._local_pack_spec = _local_pack_spec_fw

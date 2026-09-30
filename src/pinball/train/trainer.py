@@ -2207,6 +2207,7 @@ class EnhancedHierarchicalTrainer:
         longctx_diag_every=0,        # >0: every N validations, log next-token PPL bucketed by
                                      # in-context recurrence distance (cheap, reuses val batches)
         longctx_diag_max_seqs=64,    # cap sequences scanned for the diagnostic (keeps it cheap)
+        longctx_diag_long_edges=None,  # e.g. [8192]: split ">2k" into "2k-8k", ">8k" (default: off)
         ce_label_smoothing_train=0.0,
         copy_task_enable=False,
         copy_task_train_prob=0.1,
@@ -2343,6 +2344,11 @@ class EnhancedHierarchicalTrainer:
         self.eval_report_truncated_ppl = bool(eval_report_truncated_ppl)
         self.longctx_diag_every = max(0, int(longctx_diag_every))
         self.longctx_diag_max_seqs = max(1, int(longctx_diag_max_seqs))
+        self._lcd_long_edges = sorted(int(e) for e in (longctx_diag_long_edges or []) if int(e) > 2048)
+        if self._lcd_long_edges:
+            _lo = ["2k"] + [f"{e // 1024}k" for e in self._lcd_long_edges]
+            self._LCD_LABELS = self._LCD_LABELS[:4] + tuple(
+                f"{a}-{b}" for a, b in zip(_lo[:-1], _lo[1:])) + (f">{_lo[-1]}",)
         self._longctx_diag_calls = 0
         self.ce_label_smoothing_train = max(0.0, float(ce_label_smoothing_train))
         self.copy_task_enable = bool(copy_task_enable)
@@ -6468,8 +6474,7 @@ class EnhancedHierarchicalTrainer:
     # split that matters is <128 (inside the local window) vs >=128 (needs the hierarchy).
     _LCD_LABELS = ("never", "<128", "128-511", "512-2k", ">2k")
 
-    @staticmethod
-    def _lcd_bucket(dist):
+    def _lcd_bucket(self, dist):
         if dist is None:
             return 0
         if dist < 128:
@@ -6478,7 +6483,12 @@ class EnhancedHierarchicalTrainer:
             return 2
         if dist < 2048:
             return 3
-        return 4
+        # longctx_diag_long_edges (default none): extra edges past 2048 for long-context
+        # corpora, e.g. [8192] -> "2k-8k", ">8k"; empty keeps the original ">2k" bucket.
+        for i, edge in enumerate(self._lcd_long_edges):
+            if dist < edge:
+                return 4 + i
+        return 4 + len(self._lcd_long_edges)
 
     def _accumulate_longctx_diag(self, input_ids, shift_logits, valid_2d, acc, seqs_done):
         """Accumulate per-token NLL into recurrence-distance buckets. `acc` is a list of

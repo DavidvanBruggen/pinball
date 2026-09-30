@@ -3,6 +3,7 @@
 # Part of Pinball — a hierarchical graph transformer for efficient long-context sequence modeling.
 # Licensed under the GNU GPL v3.0 (see LICENSE). Please cite via CITATION.cff.
 import os
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -832,6 +833,56 @@ class EdgeConditioner(nn.Module):
 
 
 
+def _level_group_segs(level_segs, num_nodes: int, mode: str):
+    """Node-order slices -> (start, end, group) runs for a level-specific module set.
+
+    level_segs: ((start, end, level), ...) python ints, injected by the model (node order is
+    level-major, so each level is one contiguous slice). group 0 = L0 (the shared module);
+    l0_coarse puts every coarse level in group 1, per_level gives level l group l. Adjacent
+    runs of the same group are merged, so l0_coarse is exactly two matmuls. None if the
+    segments are missing or do not cover num_nodes (a subset call)."""
+    if not level_segs or int(level_segs[-1][1]) != int(num_nodes) or int(level_segs[0][0]) != 0:
+        return None
+    out = []
+    for s, e, l in level_segs:
+        g = 0 if int(l) == 0 else (1 if mode == "l0_coarse" else int(l))
+        if out and out[-1][2] == g and out[-1][1] == s:
+            out[-1] = (out[-1][0], e, g)
+        else:
+            out.append((s, e, g))
+    return tuple(out)
+
+
+def _level_group_apply(mods, x: torch.Tensor, segs) -> torch.Tensor:
+    """mods[g] applied to each (start, end, g) slice of x [B, N, C] along dim 1."""
+    return torch.cat([mods[g](x[:, s:e]) for s, e, g in segs], dim=1)
+
+
+def _level_group_ffn(ffns, x: torch.Tensor, segs) -> torch.Tensor:
+    """Level-group SwiGLU with gate+up fused into ONE matmul per group (same math as
+    SwiGLUFFN.forward: down(silu(gate(x)) * up(x)), then its dropout)."""
+    out = []
+    for s, e, g in segs:
+        f = ffns[g]
+        w = torch.cat([f.gate_proj.weight, f.up_proj.weight], dim=0)
+        b = (torch.cat([f.gate_proj.bias, f.up_proj.bias], dim=0)
+             if f.gate_proj.bias is not None else None)
+        a, u = F.linear(x[:, s:e], w, b).chunk(2, dim=-1)
+        out.append(f.dropout(f.down_proj(F.silu(a) * u)))
+    return torch.cat(out, dim=1)
+
+
+def _level_group_qkv(qs, ks, vs, x: torch.Tensor, segs) -> torch.Tensor:
+    """Fused level-group Q/K/V: ONE matmul per group against [Wq; Wk; Wv] -> [B, N, 3C]."""
+    out = []
+    for s, e, g in segs:
+        w = torch.cat([qs[g].weight, ks[g].weight, vs[g].weight], dim=0)
+        b = (torch.cat([qs[g].bias, ks[g].bias, vs[g].bias], dim=0)
+             if qs[g].bias is not None else None)
+        out.append(F.linear(x[:, s:e], w, b))
+    return torch.cat(out, dim=1)
+
+
 class HierarchicalMessagePassing(MessagePassing):
     """
     Custom message passing layer for hierarchical graphs with level awareness.
@@ -868,6 +919,7 @@ class HierarchicalMessagePassing(MessagePassing):
         per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
+        hier_level_qkv: str = "shared",      # shared | l0_coarse | per_level  (see the out_proj block)
         # QK normalization over head_dim, applied to q and k right after their projections
         # and so inherited by every consumer (packed window, coarse lane, per-level local,
         # graph scatter, HQD). Bounds the attention logits structurally. Applied BEFORE RoPE
@@ -951,6 +1003,55 @@ class HierarchicalMessagePassing(MessagePassing):
         #     inside a query's local band, so dedup is exact BY CONSTRUCTION and the mask
         #     needs no membership test at all (it stays cacheable across re-selections).
         local_pack_global_chunk: int = 0,
+        # WHAT FILLS THE COARSE SLOTS on the chunked path. "content" (default): the budget is
+        # split k_co coarse + k_l0 L0 per chunk and both are picked by score, so the static
+        # top-down block is REPLACED. "levels": the static block (whole levels top-down
+        # within local_pack_global_block, exactly the levels-mode prefix) is kept in front,
+        # and each chunk adds local_pack_global_l0_budget content-picked L0 slots behind it.
+        # That makes an arm differ from its levels-mode parent ONLY by the L0 reads.
+        local_pack_global_coarse: str = "content",
+        # WHO PICKS THE SLOTS in levels mode. "key" (default): the learned per-level direction
+        # dotted with each row's key (global_nominate_vec) -- measured 2026-09-29 NOT to learn
+        # useful picks (below random on copy-target coverage; gate stuck at 0.5). "head": the
+        # HIERARCHY nominates. Every row gets a weight from its earliest-closing containing
+        # parent (bilinear on the layer input: parent-query . child-key, per level) plus the
+        # parent's own weight from ITS parent (importance flows top-down) plus a per-level
+        # offset; one global ranking, top-k per chunk over the causally visible part. Trained
+        # by the value gate sigmoid(weight) on picked slots; Gumbel noise on the RANKING only
+        # (training) so unpicked rows get tried. Separate from attention on purpose: what a
+        # parent attends to for its summary need not be what a later query needs.
+        local_pack_global_nominator: str = "key",
+        local_pack_global_candidates: str = "l0",
+        local_pack_global_gumbel: float = 0.0,
+        local_pack_global_nom_dim: int = 64,
+        # GATE vs RANKING (head only). "raw": gate = sigmoid(weight), the SAME number that ranks
+        # -- measured 2026-09-29 (text, ep27): every layer's gate saturated to 0.000 or ~1.0
+        # via a uniform shift of the weights, so the heads stopped receiving gradient and the
+        # picks froze below random. "zscore": the gate reads the weight STANDARDISED over the
+        # chunk's allowed candidates (causal: only rows that chunk may see), plus a learned
+        # per-layer bias: gate = sigmoid(z + b). A uniform shift no longer moves the gate, so
+        # the only way to open or close a layer is b, and the heads keep a bounded, live
+        # gradient on RELATIVE weights. The ranking is unchanged (affine within a chunk); the
+        # detached logit also reads z.
+        local_pack_global_nom_gate: str = "raw",
+        # HOW A NOMINATED SLOT COMPETES IN THE SOFTMAX (head + zscore only). "logit"
+        # (default): the detached gate value added to every query's score on that slot
+        # (local_pack_global_logit) -- measured 2026-09-30: it carries the mid-range (removing
+        # it at eval: 128-2k +13-17%) but is QUERY-INDEPENDENT, so it also pulls queries with
+        # nothing to copy onto the slots ("never" -4% without it), and being detached it cannot
+        # learn otherwise. "key": no logit; each slot KEY gets z_j * RoPE_pos(j)(u) added, u a
+        # learned per-layer, per-head direction (init 0). The extra score is z_j * (q_i . u)/sqrt(d):
+        # the QUERY decides how much it wants nominated content, through ordinary key
+        # gradients (no differentiable score_mod), and z stays differentiable -- a true softmax
+        # gradient into the nomination heads on top of the value gate. u is rotated at the
+        # slot's position so the term stays relative, like every other key.
+        local_pack_global_boost: str = "logit",
+        # EXPLORATION SCALE (head only, training only). "raw" (default): rank = w + tau*Gumbel on
+        # the raw weight, so the heads can shrink exploration by growing |w|. "chunk": the noise
+        # is scaled by each chunk's weight spread over its allowed candidates (stats detached),
+        # i.e. the ranking is z + tau*Gumbel -- exploration stays fixed at tau whatever the
+        # weight scale, so only a real RELATIVE margin keeps a row reliably picked.
+        local_pack_global_gumbel_norm: str = "raw",
         # DropNode on the hierarchy: per (batch, coarse row) each step, zero that row's
         # VALUE in the packed key/value set so nothing reads its content this step. L0 is
         # never dropped and the residual stream is untouched, so the upward/downward refresh
@@ -1100,6 +1201,47 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_global_dedup = bool(local_pack_global_dedup)
         self.local_pack_global_logit = bool(local_pack_global_logit)
         self.local_pack_global_chunk = max(0, int(local_pack_global_chunk or 0))
+        self.local_pack_global_coarse = str(local_pack_global_coarse or "content").lower()
+        if self.local_pack_global_coarse not in {"content", "levels"}:
+            raise ValueError("local_pack_global_coarse must be 'content' or 'levels', got "
+                             f"{local_pack_global_coarse!r}")
+        if self.local_pack_global_coarse == "levels" and not (
+                self.local_pack_global_select == "content" and self.local_pack_global_chunk > 0
+                and self.local_pack_global_l0_budget > 0 and bool(local_pack_flex_union)):
+            raise ValueError(
+                "local_pack_global_coarse='levels' needs local_pack_global_select='content', "
+                "local_pack_global_chunk > 0, local_pack_global_l0_budget > 0 and "
+                "local_pack_flex_union (the static+chunk prefix exists on the flex path only)")
+        self.local_pack_global_nominator = str(local_pack_global_nominator or "key").lower()
+        self.local_pack_global_candidates = str(local_pack_global_candidates or "l0").lower()
+        self.local_pack_global_gumbel = max(0.0, float(local_pack_global_gumbel or 0.0))
+        if self.local_pack_global_nominator not in {"key", "head"}:
+            raise ValueError("local_pack_global_nominator must be 'key' or 'head', got "
+                             f"{local_pack_global_nominator!r}")
+        if self.local_pack_global_candidates not in {"l0", "all"}:
+            raise ValueError("local_pack_global_candidates must be 'l0' or 'all', got "
+                             f"{local_pack_global_candidates!r}")
+        self.local_pack_global_nom_gate = str(local_pack_global_nom_gate or "raw").lower()
+        if self.local_pack_global_nom_gate not in {"raw", "zscore"}:
+            raise ValueError("local_pack_global_nom_gate must be 'raw' or 'zscore', got "
+                             f"{local_pack_global_nom_gate!r}")
+        self.local_pack_global_gumbel_norm = str(local_pack_global_gumbel_norm or "raw").lower()
+        if self.local_pack_global_gumbel_norm not in {"raw", "chunk"}:
+            raise ValueError("local_pack_global_gumbel_norm must be 'raw' or 'chunk', got "
+                             f"{local_pack_global_gumbel_norm!r}")
+        self.local_pack_global_boost = str(local_pack_global_boost or "logit").lower()
+        if self.local_pack_global_boost not in {"logit", "key"}:
+            raise ValueError("local_pack_global_boost must be 'logit' or 'key', got "
+                             f"{local_pack_global_boost!r}")
+        if self.local_pack_global_boost == "key" and (
+                self.local_pack_global_nominator != "head" or self.local_pack_global_nom_gate != "zscore"):
+            raise ValueError("local_pack_global_boost='key' needs local_pack_global_nominator='head' "
+                             "and local_pack_global_nom_gate='zscore'")
+        if self.local_pack_global_boost == "key" and bool(local_pack_rope_axial):
+            raise ValueError("local_pack_global_boost='key' rotates u with 1-D packed positions; "
+                             "axial RoPE (local_pack_rope_axial) is not supported yet")
+        if self.local_pack_global_nominator == "head" and self.local_pack_global_coarse != "levels":
+            raise ValueError("local_pack_global_nominator='head' needs local_pack_global_coarse='levels'")
         if (self.local_pack_global_select == "content"
                 and self.local_pack_global_block > 0
                 and self.local_pack_global_chunk <= 0
@@ -1128,8 +1270,28 @@ class HierarchicalMessagePassing(MessagePassing):
             # num_local_levels, not self.level_embedding: that module is built ~200 lines
             # below this point and the attribute does not exist yet.
             _nlv = max(1, int(num_local_levels))
-            self.global_nominate_vec = nn.Parameter(
-                torch.randn(_nlv, int(self.num_heads) * int(self.head_dim)) * 0.02)
+            if self.local_pack_global_nominator == "head":
+                # parent-query / child-key per level on the LAYER INPUT, plus a per-level
+                # offset (1-D -> AdamW) that puts summaries and tokens on one scale.
+                _d = max(8, int(local_pack_global_nom_dim or 64))
+                _H = int(self.num_heads) * int(self.head_dim)
+                # nom_parent_q[l-1] reads a level-l parent, nom_child_k[l] a level-l child
+                # (l < top): exactly the pairs that exist, no dead weights.
+                self.nom_parent_q = nn.ModuleList(nn.Linear(_H, _d, bias=False) for _ in range(_nlv - 1))
+                self.nom_child_k = nn.ModuleList(nn.Linear(_H, _d, bias=False) for _ in range(_nlv - 1))
+                self.nom_level_offset = nn.Parameter(torch.zeros(_nlv))
+                if self.local_pack_global_nom_gate == "zscore":
+                    # per-layer open/close for the slots; 0-d -> AdamW; 0 = gate 0.5 at z = 0
+                    self.nom_gate_bias = nn.Parameter(torch.zeros(()))
+                if self.local_pack_global_boost == "key":
+                    # per-head key-space direction for the query-conditioned boost; init 0
+                    # (starts as "no boost", learns through ordinary key gradients). A
+                    # [heads, head_dim] table, routed to AdamW by name in cli._build_optimizer.
+                    self.nom_boost_u = nn.Parameter(torch.zeros(int(self.num_heads), int(self.head_dim)))
+                self.local_pack_global_nom_dim = _d
+            else:
+                self.global_nominate_vec = nn.Parameter(
+                    torch.randn(_nlv, int(self.num_heads) * int(self.head_dim)) * 0.02)
         if self.local_pack_coarse_global or self.local_pack_global_block > 0:
             # Raw scalar, NOT a sigmoid: init 0.0 must be EXACT identity so a warm start
             # is bit-identical to the flag being off. Grafting this term ungated onto
@@ -1414,6 +1576,24 @@ class HierarchicalMessagePassing(MessagePassing):
         
         # Output projection
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # LEVEL-SPECIFIC ATTENTION PROJECTIONS (hier_level_qkv). Group 0 is the shared
+        # q/k/v/out above (used by L0); extra groups serve the coarse rows -- l0_coarse: one set
+        # for every coarse level, per_level: one per coarse level. Q/K/V are applied in NODE
+        # order (level-contiguous slices, bounds injected by the model as _level_segs) BEFORE
+        # packing, and out_proj after the flex output is scattered back to node order, so the
+        # packed softmax itself is untouched: ONE joint softmax, level-specific projections.
+        # Copy-initialized from the shared set (the model re-syncs after its _init_weights),
+        # so an enabled model is identical at init and then specializes. Flex-union only.
+        self.hier_level_qkv = str(hier_level_qkv or "shared").lower()
+        if self.hier_level_qkv not in ("shared", "l0_coarse", "per_level"):
+            raise ValueError(f"hier_level_qkv must be shared|l0_coarse|per_level, got {hier_level_qkv!r}")
+        _n_extra = {"shared": 0, "l0_coarse": 1}.get(self.hier_level_qkv, max(0, int(num_local_levels) - 1))
+        if _n_extra > 0:
+            for _nm in ("q_proj", "k_proj", "v_proj", "out_proj"):
+                setattr(self, _nm + "_lg", nn.ModuleList(
+                    [nn.Linear(hidden_dim, hidden_dim) for _ in range(_n_extra)]))
+            self.sync_level_qkv_from_shared()
 
         # --- Fat-QKV: decoupled wide Q/K and V head dims for the SPARSE-SCATTER paths
         # (cross-level graph message passing + HQD scatter read). Flash/SDPA local-window
@@ -2153,6 +2333,24 @@ class HierarchicalMessagePassing(MessagePassing):
             return self.q_proj_level, self.k_proj_level, self.v_proj_level
         return None, None, None
 
+    @torch.no_grad()
+    def sync_level_qkv_from_shared(self) -> None:
+        """Copy the shared q/k/v/out into every level group (hier_level_qkv)."""
+        for _nm in ("q_proj", "k_proj", "v_proj", "out_proj"):
+            src = getattr(self, _nm)
+            for m in getattr(self, _nm + "_lg", None) or []:
+                m.weight.copy_(src.weight)
+                if m.bias is not None and src.bias is not None:
+                    m.bias.copy_(src.bias)
+
+    def _level_qkv_segs(self, num_nodes: int):
+        segs = _level_group_segs(getattr(self, "_level_segs", None), num_nodes, self.hier_level_qkv)
+        if segs is None:
+            raise RuntimeError(
+                "hier_level_qkv: no node-order level bounds for this call (the model injects "
+                "_level_segs per forward; a subset/active-level call is not supported)")
+        return segs
+
     def _xlevel_active(self):
         ql, kl, _ = self._resolve_xlevel_lists()
         return ql is not None and kl is not None
@@ -2702,9 +2900,16 @@ class HierarchicalMessagePassing(MessagePassing):
         # shared-mode cross path / per-level route fallback. HQD edge decisions happen later in
         # this forward, so we cannot safely predict at this point whether they're needed -> always
         # compute them. (Per-level cross_level_qkv adds qx/kx/vx on top; that extra is inherent.)
-        q = self.q_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
+        if getattr(self, "hier_level_qkv", "shared") != "shared":
+            _lsegs = self._level_qkv_segs(num_nodes)
+            _qkv = _level_group_qkv([self.q_proj, *self.q_proj_lg], [self.k_proj, *self.k_proj_lg],
+                                    [self.v_proj, *self.v_proj_lg], x, _lsegs)
+            q, k, v = (t.reshape(B, num_nodes, self.num_heads, self.head_dim)
+                       for t in _qkv.split(self.hidden_dim, dim=-1))
+        else:
+            q = self.q_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
+            k = self.k_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
+            v = self.v_proj(x).view(B, num_nodes, self.num_heads, self.head_dim)
         # QK norm (qk_norm), before RoPE and before the packed level tags so every path
         # below -- pack, lane, per-level local, graph scatter, HQD -- reads normalized q/k.
         # Cast back: autocast runs norms in fp32, and the flash kernels reject fp32 q/k.
@@ -2901,6 +3106,7 @@ class HierarchicalMessagePassing(MessagePassing):
                     out=out, q_pre=q_prerope, k_pre=k_prerope, v=v,
                     spec=_pack_spec, source_gates=source_gates,
                     active_level_set=active_level_set, B=B, num_nodes=num_nodes,
+                    x_nodes=x,
                 )
             for lvl, cfg in self.local_attn_config.items():
                 lvl_int = int(lvl)
@@ -4597,7 +4803,8 @@ class HierarchicalMessagePassing(MessagePassing):
 
     @torch._dynamo.disable
     def _nominate_global_rows(self, kp: torch.Tensor, spec: Dict,
-                              lvl_packed: Optional[torch.Tensor], budget: int):
+                              lvl_packed: Optional[torch.Tensor], budget: int,
+                              x_nodes: Optional[torch.Tensor] = None):
         """Content-selected global block -> (packed rows [K], per-row score [N] or None).
 
         Scores come off the packed KEYS rather than raw features: they are what the block
@@ -4619,6 +4826,11 @@ class HierarchicalMessagePassing(MessagePassing):
         rather than being forced to attend it.
         """
         rows_default = spec["global_block"]["rows"]
+        if getattr(self, "local_pack_global_nominator", "key") == "head":
+            if x_nodes is None or lvl_packed is None or "nom_avail" not in spec:
+                raise RuntimeError("local_pack_global_nominator='head' needs the layer input and "
+                                   "the model's nomination parent map (spec['nom_avail'])")
+            return self._nominate_by_head(spec, lvl_packed, x_nodes)
         if not hasattr(self, "global_nominate_vec") or lvl_packed is None:
             return rows_default, None, None
         vec = self.global_nominate_vec
@@ -4633,6 +4845,9 @@ class HierarchicalMessagePassing(MessagePassing):
         u = vec.index_select(0, lvl).to(flat.dtype)                     # [N, D]
         score = (flat * u.unsqueeze(0)).sum(-1).float()                 # [B, N]
         score = score * (float(flat.size(-1)) ** -0.5)
+        if str(getattr(self, "local_pack_global_coarse", "content")) == "levels":
+            # static coarse block + per-sequence chunked L0 slots: its own selector
+            return self._nominate_l0_chunks(spec, lvl_packed, score)
         s_shared = score.mean(dim=0)                                    # [N]
 
         # Level-0 row count is geometry, so it is a host int already -- no sync, and no
@@ -4695,6 +4910,183 @@ class HierarchicalMessagePassing(MessagePassing):
         # the flex score_mod must index it with a SINGLE gather (a nested/2-D gather inside a
         # compiled mask is what produced the illegal memory access documented on tier_pk).
         return rows, s_shared, None
+
+    def _nomination_weights(self, spec: Dict, lvl_packed: torch.Tensor,
+                            x_nodes: torch.Tensor) -> torch.Tensor:
+        """Hierarchy nomination weight per PACKED row -> [B, n] (differentiable).
+
+        w(r) = e(r) + e(parent(r)) + offset[level(r)], where e(c) = <Q_{l+1}(x_parent),
+        K_l(x_c)> / sqrt(d) is the earliest-closing containing parent's bilinear score for
+        child c (0 for nodes without a parent). The e(parent) term is the parent's own weight
+        from ITS parent: importance flows top-down one step, so an upper level can raise or
+        sink a whole region. Reads the layer's (normed) node-order input."""
+        B, N = int(x_nodes.size(0)), int(x_nodes.size(1))
+        par = spec["nom_parent_node"]
+        cache = spec.get("nom_level_nodes", None)
+        if cache is None:
+            node_lvl = torch.empty_like(lvl_packed); node_lvl[spec["perm"]] = lvl_packed
+            cache = []
+            for l in range(len(self.nom_child_k)):
+                c = torch.nonzero((node_lvl == l) & (par >= 0), as_tuple=False).view(-1)
+                P = torch.nonzero(node_lvl == l + 1, as_tuple=False).view(-1)
+                slot = torch.full((N,), -1, dtype=torch.long, device=par.device)
+                slot[P] = torch.arange(int(P.numel()), device=par.device)
+                cache.append((l, c, P, slot.index_select(0, par.index_select(0, c))))
+            spec["nom_level_nodes"] = cache
+            spec["nom_node_level"] = node_lvl
+        scale = float(self.local_pack_global_nom_dim) ** -0.5
+        e = x_nodes.new_zeros(B, N, dtype=torch.float32)
+        for l, c, P, pslot in cache:
+            if int(c.numel()) == 0:
+                continue
+            # project each parent ONCE (P rows), then gather the narrow result per child
+            qp_ = self.nom_parent_q[l](x_nodes.index_select(1, P)).index_select(1, pslot)
+            kc_ = self.nom_child_k[l](x_nodes.index_select(1, c))
+            e = e.index_copy(1, c, ((qp_ * kc_).sum(-1).float() * scale))
+        up = torch.where((par >= 0).view(1, -1), e.index_select(1, par.clamp(min=0)),
+                         torch.zeros_like(e))
+        w = e + up + self.nom_level_offset.float().index_select(0, spec["nom_node_level"]).view(1, -1)
+        return w.index_select(1, spec["perm"])                          # packed order
+
+    def _nominate_by_head(self, spec: Dict, lvl_packed: torch.Tensor, x_nodes: torch.Tensor):
+        """Hierarchy-nominated slots -> (rows [B, nch*K], weight [B, nch*K], meta).
+
+        Same slot contract as _nominate_l0_chunks (static block in front, per-sequence
+        slots, geometry-only mask), different candidates and ranking:
+          candidates: rows outside the static block (L0 only, or every level with
+            local_pack_global_candidates: all) whose weight is AVAILABLE before the chunk
+            limit (parent and grandparent closed) and that closed before it themselves;
+          ranking: ONE global weight per row (query-independent), so each chunk takes the
+            top of the same ordering restricted to what it may see; Gumbel noise on the
+            ranking only, in training, so unpicked rows get tried;
+          gate: sigmoid(weight) on the picked VALUES -- the heads' gradient path.
+        """
+        w = self._nomination_weights(spec, lvl_packed, x_nodes)          # [B, n]
+        B, n = int(w.size(0)), int(w.size(1))
+        dev = w.device
+        C = int(self.local_pack_global_chunk)
+        W = int(spec.get("window", 0) or 0)
+        nch = (n + C - 1) // C
+        K = max(1, min(int(self.local_pack_global_l0_budget), n))
+        # Candidate set, per-chunk allowed mask and live-slot count are pure geometry:
+        # built once per skeleton (cached in the spec, shared by every layer).
+        _gk = ("nom_geom", C, W, K, self.local_pack_global_candidates)
+        _geo = spec.get(_gk, None)
+        if _geo is None:
+            gm = spec.get("global_block_mask", None)
+            cand = spec["nom_avail"] < n
+            if gm is not None:
+                cand = cand & ~gm
+            if self.local_pack_global_candidates == "l0":
+                cand = cand & (lvl_packed == 0)
+            limit = (torch.arange(nch, device=dev) * C - W).clamp(min=0)      # [nch]
+            idx = torch.arange(n, device=dev)
+            allowed = (cand.view(1, -1) & (idx.view(1, -1) < limit.view(-1, 1))
+                       & (spec["nom_avail"].view(1, -1) < limit.view(-1, 1)))  # [nch, n]
+            count = allowed.sum(1)
+            ok = (torch.arange(K, device=dev).view(1, -1) < count.view(-1, 1))  # [nch, K]
+            _geo = (allowed, ok)
+            spec[_gk] = _geo
+        allowed, ok = _geo
+        rank = w.detach()
+        tau = float(getattr(self, "local_pack_global_gumbel", 0.0))
+        neg = torch.finfo(rank.dtype).min
+        if self.training and tau > 0.0:
+            u = torch.rand_like(rank).clamp_(1e-6, 1.0 - 1e-6)
+            gn = -torch.log(-torch.log(u))                                   # [B, n]
+            if self.local_pack_global_gumbel_norm == "chunk":
+                # noise in units of each chunk's weight spread: ranking == z + tau*Gumbel
+                am = allowed.to(rank.dtype); cnt = am.sum(1).clamp(min=1.0)
+                mu = (rank.unsqueeze(1) * am).sum(-1) / cnt
+                sdc = ((((rank.unsqueeze(1) - mu.unsqueeze(-1)) ** 2) * am).sum(-1) / cnt + 1e-6).sqrt()
+                sc = rank.unsqueeze(1) + tau * sdc.unsqueeze(-1) * gn.unsqueeze(1)   # [B, nch, n]
+            else:
+                sc = (rank + tau * gn).unsqueeze(1).expand(-1, nch, -1)
+            sc = sc.masked_fill(~allowed.unsqueeze(0), neg)
+        else:
+            sc = rank.unsqueeze(1).masked_fill(~allowed.unsqueeze(0), neg)  # [B, nch, n]
+        top = torch.topk(sc, K, dim=-1).indices                              # [B, nch, K]
+        # Causal by construction, whatever the scores: a live slot must hold an allowed row.
+        legal = allowed.unsqueeze(0).expand(B, -1, -1).gather(2, top)
+        top = torch.where(legal, top, torch.zeros_like(top))
+        rows = top.reshape(B, nch * K).contiguous()
+        okf = ok.reshape(-1).contiguous()
+        g = w.gather(1, rows)
+        if self.local_pack_global_nom_gate == "zscore":
+            # standardise over each chunk's ALLOWED set (causal), differentiable stats, so a
+            # uniform shift of w is invisible to the gate; bias decides open/close per layer
+            am = allowed.to(w.dtype)                                          # [nch, n]
+            cnt = am.sum(1).clamp(min=1.0)                                    # [nch]
+            mu = (w.unsqueeze(1) * am).sum(-1) / cnt                          # [B, nch]
+            var = (((w.unsqueeze(1) - mu.unsqueeze(-1)) ** 2) * am).sum(-1) / cnt
+            sd = (var + 1e-6).sqrt()
+            g = ((g.view(B, nch, K) - mu.unsqueeze(-1)) / sd.unsqueeze(-1)).reshape(B, nch * K)
+            g = g + self.nom_gate_bias.to(g.dtype)
+        g = torch.where(okf.view(1, -1), g, torch.full_like(g, torch.finfo(g.dtype).min))
+        with torch.no_grad():
+            # sync-free diagnostics (masked sums, no boolean indexing); read by probes
+            _live = okf.view(1, -1).to(torch.float32)
+            _nl = (_live.sum() * B).clamp(min=1.0)
+            _co = (lvl_packed.index_select(0, rows.reshape(-1)).view(B, -1) > 0).float()
+            _sg = torch.sigmoid(g.detach().clamp(min=-60.0))
+            _m = (_sg * _live).sum() / _nl
+            self._nom_stats = {
+                "coarse_frac": (_co * _live).sum() / _nl,
+                "gate_mean": _m,
+                "gate_std": ((((_sg - _m) ** 2) * _live).sum() / _nl).sqrt(),
+                "illegal_picks": (~legal & ok.unsqueeze(0)).sum(),
+            }
+        st = spec["global_block"]["rows"]
+        return rows, g, {"chunk": C, "G": K, "nch": int(nch), "ok": okf,
+                         "n_static": int(st.numel()), "static_rows": st, "per_batch": True}
+
+    def _nominate_l0_chunks(self, spec: Dict, lvl_packed: torch.Tensor, score: torch.Tensor):
+        """local_pack_global_coarse='levels' -> (rows [B, nch*K], score [B, nch*K], meta).
+
+        The static top-down block stays the coarse prefix (exactly the levels-mode rows);
+        each query chunk of `local_pack_global_chunk` packed rows adds K =
+        local_pack_global_l0_budget L0 rows picked by score from rows that closed before
+        `c*chunk - window`. Two differences from _nominate_chunked, both deliberate:
+
+        PER SEQUENCE. Picks come from each batch element's own score [B, N], not the batch
+        mean -- a shared set is K rows chosen for the AVERAGE of B unrelated sequences.
+        EVERY CALL, NO CADENCE. The picks are row NUMBERS; each step is a new batch, so
+        held rows would point at arbitrary positions of a different text. That is affordable
+        because the mask below never reads the rows: causality is enforced HERE, by
+        construction -- every live slot's row is clamped under its chunk's limit
+        (limit <= q - window for every query q of the chunk), so the flex mask is pure
+        geometry (chunk index, slot validity, static block), cached once per skeleton and
+        shared by every layer. The clamp is a no-op unless a score is -inf/NaN; it exists
+        so that causality never rests on the ordering of top-k.
+        """
+        dev = score.device
+        B, n = int(score.size(0)), int(score.size(1))
+        C = int(self.local_pack_global_chunk)
+        W = int(spec.get("window", 0) or 0)
+        nch = (n + C - 1) // C
+        lr = spec.get("level_rows", None)
+        n_l0 = int(lr[0].numel()) if lr else 0
+        K = max(1, min(int(self.local_pack_global_l0_budget), n_l0))
+        is_l0 = lvl_packed == 0
+        limit = (torch.arange(nch, device=dev) * C - W).clamp(min=0)          # [nch]
+        allowed = (torch.arange(n, device=dev).view(1, -1) < limit.view(-1, 1)) & is_l0.view(1, -1)
+        neg = torch.finfo(score.dtype).min
+        sc = score.detach().unsqueeze(1).masked_fill(~allowed.unsqueeze(0), neg)  # [B, nch, n]
+        top = torch.topk(sc, K, dim=-1).indices                                   # [B, nch, K]
+        cum_l0 = is_l0.to(torch.long).cumsum(0)
+        navail = torch.where(limit > 0, cum_l0.index_select(0, (limit - 1).clamp(min=0)),
+                             torch.zeros_like(limit))
+        ok = (torch.arange(K, device=dev).view(1, -1) < navail.view(-1, 1))   # [nch, K]
+        lim = limit.view(1, -1, 1)
+        top = torch.where(top < lim, top, (lim - 1).clamp(min=0).expand_as(top))
+        rows = top.reshape(B, nch * K).contiguous()
+        ok = ok.reshape(-1).contiguous()
+        g_score = score.gather(1, rows)                    # differentiable: the scorer's path
+        g_score = torch.where(ok.view(1, -1), g_score, torch.full_like(g_score, neg))
+        st = spec["global_block"]["rows"]
+        return rows, g_score, {"chunk": C, "G": K, "nch": int(nch), "ok": ok,
+                               "n_static": int(st.numel()), "static_rows": st,
+                               "per_batch": True}
 
     def _nominate_chunked(self, spec: Dict, lvl_packed: torch.Tensor,
                           s_shared: torch.Tensor, budget: int, chunk: int,
@@ -4837,15 +5229,24 @@ class HierarchicalMessagePassing(MessagePassing):
         # restoring the causal clause, because the clause was right and the rows it was
         # checking were not. Keyed by id(self) only in content mode, so the levels path keeps
         # sharing one mask across layers as before.
-        _bm_key = _bm_key + (id(self) if (gsel is not None) else None,
-                             bool(_tier_rows is not None),
-                             # chunked: mask is geometry-only, so version is irrelevant
-                             ("chunk", int(gsel[2]["G"]), int(gsel[2]["chunk"]),
-                              int(gsel[0].numel()),
-                              int(getattr(self, "_gsel_version", 0)))
-                             if (gsel is not None and len(gsel) > 2 and gsel[2] is not None)
-                             else (int(getattr(self, "_gsel_version", 0))
-                                   if gsel is not None else None))
+        # Static coarse + per-sequence L0 chunks: the mask is pure geometry (see
+        # _nominate_l0_chunks), so one key for every layer and every re-pick.
+        _l0s = bool(gsel is not None and len(gsel) > 2 and gsel[2] is not None
+                    and gsel[2].get("per_batch", False))
+        if _l0s:
+            _bm_key = _bm_key + ("l0chunk", int(gsel[2]["G"]), int(gsel[2]["chunk"]),
+                                 int(gsel[2]["n_static"]), int(gsel[0].size(1)),
+                                 bool(_tier_rows is not None))
+        else:
+            _bm_key = _bm_key + (id(self) if (gsel is not None) else None,
+                               bool(_tier_rows is not None),
+                               # chunked: mask is geometry-only, so version is irrelevant
+                               ("chunk", int(gsel[2]["G"]), int(gsel[2]["chunk"]),
+                                int(gsel[0].numel()),
+                                int(getattr(self, "_gsel_version", 0)))
+                               if (gsel is not None and len(gsel) > 2 and gsel[2] is not None)
+                               else (int(getattr(self, "_gsel_version", 0))
+                                     if gsel is not None else None))
         bm = spec.get("flex_block_mask") if spec.get("flex_block_mask_key") == _bm_key else None
         if bm is None:
             r = spec["flex_r_mixed"]
@@ -4898,7 +5299,10 @@ class HierarchicalMessagePassing(MessagePassing):
                     spec["flex_tier_fx"] = tier_fx
 
             kv_pre = spec.get("flex_kv_prefix", None)
-            if gsel is not None:
+            if _l0s:
+                # length only (static block + batch 0's slots); the mask never reads rows
+                kv_pre = torch.cat([gsel[2]["static_rows"], gsel[0][0]])
+            elif gsel is not None:
                 # Content selection reuses the ORIGINAL prefix clauses (exact dedup, exact
                 # causal visibility) rather than moving them into a score_mod -- see the
                 # measurement note at the flex call. That makes the mask depend on WHICH
@@ -4922,12 +5326,46 @@ class HierarchicalMessagePassing(MessagePassing):
                 # re-selection. No dedup clause is needed: the `- window` in the candidate
                 # limit already makes a selected row unreachable from any band.
                 _G2, _C2 = int(_cm["G"]), int(_cm["chunk"])
+                _S2 = int(_cm.get("n_static", 0))
                 _P2 = int(kv_pre.numel())
                 _nq2 = int(perm.numel())
                 _ok2 = _cm["ok"]
                 _rows2 = kv_pre
 
-                def mask_mod(b, h, qi, ki):
+                if _S2:
+                    # STATIC COARSE + CHUNKED L0 (local_pack_global_coarse: levels). Keys
+                    # [0, S) are the static block with the levels-mode clauses (visible once
+                    # closed; band drops them so each is ONE key), keys [S, P) are the chunk
+                    # slots: same chunk and a live slot. No row test -- the selector clamps
+                    # every live row under its chunk limit (<= q - window), so causality and
+                    # band-disjointness hold by construction and the mask is pure geometry.
+                    _srows = _cm["static_rows"]
+                    _sin = torch.zeros(int(spec["num_nodes"]), dtype=torch.bool,
+                                       device=perm.device)
+                    _sin[_srows] = True
+                    _sin = _sin.index_select(0, spec["flex_perm"]).contiguous()
+                    _PC = _P2 - _S2
+
+                    def mask_mod(b, h, qi, ki):
+                        is_st = ki < _S2
+                        is_pre = ki < _P2
+                        st = qi >= _srows[_flex_idx_clamp(ki, hi=_S2 - 1)] if causal_mask \
+                            else ki >= 0
+                        kc = _flex_idx_clamp(ki - _S2, 0, _PC - 1)
+                        pre = ((kc // _G2) == (qi // _C2)) & _ok2[kc]
+                        p = _flex_idx_clamp(ki - _P2, 0, _nq2 - 1)
+                        dr = qi - p
+                        band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
+                        if ring_wt is not None:
+                            wt = ring_wt[ring_lvl[p]]
+                            ring = (wt > 0) & ((ring_pos[qi] - ring_pos[p]).abs() <= wt)
+                            if causal_mask:
+                                ring = ring & (dr >= 0)
+                            band = band | ring
+                        band = band & (~_sin[p])
+                        return torch.where(is_st, st, torch.where(is_pre, pre, band))
+
+                def mask_mod_chunk(b, h, qi, ki):
                     is_pre = ki < _P2
                     kpre = _flex_idx_clamp(ki, hi=_P2 - 1)
                     same = (kpre // _G2) == (qi // _C2)
@@ -4951,6 +5389,9 @@ class HierarchicalMessagePassing(MessagePassing):
                             ring = ring & (dr >= 0)
                         band = band | ring
                     return torch.where(is_pre, pre, band)
+
+                if not _S2:
+                    mask_mod = mask_mod_chunk
 
             elif kv_pre is not None and in_glob is not None:
                 # UNIFIED SOFTMAX, PERMUTATION-FREE. Queries stay in packed order (so r is
@@ -5129,6 +5570,7 @@ class HierarchicalMessagePassing(MessagePassing):
         _smod = None
         if (gsel is not None and gsel[1] is not None
                 and bool(getattr(self, "local_pack_global_logit", False))
+                and str(getattr(self, "local_pack_global_boost", "logit")) != "key"
                 and int(gsel[0].numel()) > 0):
             _Gs = int(gsel[0].numel())
             # DETACHED, and that is load-bearing -- see local_pack_global_logit. fp32 to
@@ -5144,8 +5586,47 @@ class HierarchicalMessagePassing(MessagePassing):
                 return sc + torch.where(ki < _Gs, _sc_pre[_flex_idx_clamp(ki, hi=_Gs - 1)],
                                         torch.zeros_like(sc))
 
+            if _l0s:
+                # per sequence: [static (no logit) | slots] per batch row, flattened so the
+                # score_mod stays a SINGLE 1-D gather (b * stride + k)
+                _S3 = int(gsel[2]["n_static"])
+                _Gs = _S3 + int(gsel[0].size(1))
+                _sc_pre = torch.cat([_sc_pre.new_zeros(int(_sc_pre.size(0)), _S3), _sc_pre],
+                                    1).reshape(-1).contiguous()
+                _n3 = int(_sc_pre.numel())
+
+                def _smod(sc, b, h, qi, ki):
+                    j = _flex_idx_clamp(b * _Gs + ki, hi=_n3 - 1)
+                    return sc + torch.where(ki < _Gs, _sc_pre[j], torch.zeros_like(sc))
+
         _pre = gsel[0] if gsel is not None else spec.get("flex_kv_prefix", None)
-        if _pre is not None:
+        if _l0s:
+            # [static block | this sequence's own chunk slots], gathered per batch row.
+            # Static rows read exactly as in levels mode (no gate); slots carry the
+            # nomination gate, the scorer's gradient path.
+            q_s = qp.transpose(1, 2)
+            _st = gsel[2]["static_rows"]
+            _B0 = int(kp.size(0))
+            _ix = gsel[0].view(_B0, -1, 1, 1).expand(-1, -1, kp.size(2), kp.size(3))
+            _g = torch.sigmoid(gsel[1]).to(vp.dtype).view(_B0, -1, 1, 1)
+            _ks = kp.gather(1, _ix)
+            if str(getattr(self, "local_pack_global_boost", "logit")) == "key":
+                # QUERY-CONDITIONED BOOST: k_j += z_j * R_pos(j) u, so the extra score is
+                # z_j (q_i . u)/sqrt(d) -- relative like any key (u rotated at the slot's
+                # position), differentiable through ordinary key gradients. Dead slots get z 0
+                # (they are masked anyway; finfo.min would overflow the key).
+                _okb = gsel[2]["ok"].view(1, -1)
+                _z = torch.where(_okb, gsel[1] - self.nom_gate_bias.to(gsel[1].dtype),
+                                 torch.zeros_like(gsel[1]))                       # [B, P]
+                _P = int(_z.size(1)); _H, _D = int(kp.size(2)), int(kp.size(3))
+                _pos = spec["pos"].index_select(0, gsel[0].reshape(-1))            # [B*P]
+                _u = self.nom_boost_u.to(kp.dtype).view(1, _H, _D).expand(_B0 * _P, _H, _D)
+                _ur = self.rotary_pos_enc.apply_rotary_pos_emb(_u, _pos).view(_B0, _P, _H, _D)
+                _ks = _ks + _z.to(kp.dtype).view(_B0, _P, 1, 1) * _ur
+            k_s = torch.cat([kp.index_select(1, _st), _ks, kp], 1).transpose(1, 2)
+            v_s = torch.cat([vp.index_select(1, _st), vp.gather(1, _ix) * _g, vp],
+                            1).transpose(1, 2)
+        elif _pre is not None:
             # Identity layout: no q gather, K/V carry the block rows as a prefix.
             q_s = qp.transpose(1, 2)                                   # [B, H, N, D]
             _vpre = vp.index_select(1, _pre)
@@ -5331,6 +5812,7 @@ class HierarchicalMessagePassing(MessagePassing):
         active_level_set: Optional[set],
         B: int,
         num_nodes: int,
+        x_nodes: Optional[torch.Tensor] = None,
     ) -> set:
         """Packed cross-level local attention: ONE causal sliding-window attention over ALL
         nodes interleaved by close time (model-built spec), so fine queries see recent CLOSED
@@ -5447,7 +5929,8 @@ class HierarchicalMessagePassing(MessagePassing):
                     _gr, _gs, _gm = self._nominate_global_rows(
                         kp, spec, lvl_packed,
                         int(spec["global_block"].get(
-                            "budget", spec["global_block"]["rows"].numel())))
+                            "budget", spec["global_block"]["rows"].numel())),
+                        x_nodes=x_nodes)
                     _gsel = (_gr, _gs, _gm)
                 # Retry across the tile ladder before giving up: the common failure is a
                 # lowering guard on the mask granularity, not a broken environment, and a
@@ -5457,7 +5940,25 @@ class HierarchicalMessagePassing(MessagePassing):
                     try:
                         out_flex = self._flex_union_attn(qp, kp, vp, spec, pack_causal,
                                                          gsel=_gsel)
-                        contrib = self.out_proj(out_flex.reshape(B, out_flex.size(1), -1))
+                        if getattr(self, "hier_level_qkv", "shared") != "shared":
+                            # level-specific out_proj: scatter to node order (level-contiguous),
+                            # project per level group, gather the query rows back
+                            _raw = out_flex.reshape(B, out_flex.size(1), -1)
+                            _qn = spec["flex_query_nodes"]
+                            _inv = spec.get("flex_query_inv")
+                            _mods = [self.out_proj, *self.out_proj_lg]
+                            if _inv is not None and source_gates is None:
+                                # every node queried: flex output is a permutation of node
+                                # order -> one gather, project, add in node order
+                                out.add_(_level_group_apply(
+                                    _mods, _raw.index_select(1, _inv),
+                                    self._level_qkv_segs(num_nodes)).to(dtype=out.dtype))
+                                return query_levels
+                            _buf = _raw.new_zeros(B, num_nodes, _raw.size(-1)).index_copy(1, _qn, _raw)
+                            contrib = _level_group_apply(
+                                _mods, _buf, self._level_qkv_segs(num_nodes)).index_select(1, _qn)
+                        else:
+                            contrib = self.out_proj(out_flex.reshape(B, out_flex.size(1), -1))
                         if source_gates is not None:
                             contrib = source_gates["local"] * contrib
                         out.index_add_(1, spec["flex_query_nodes"], contrib.to(dtype=out.dtype))
@@ -5492,6 +5993,11 @@ class HierarchicalMessagePassing(MessagePassing):
                         break
             else:
                 self._local_pack_log_once("flex union needs all levels queried; merge/additive fallback")
+
+        if getattr(self, "hier_level_qkv", "shared") != "shared":
+            raise RuntimeError(
+                "hier_level_qkv: the level-specific out_proj lives on the flex-union path, which "
+                "did not run for this call (flex off/failed, or not every level queried)")
 
         # LSE merge (local_pack_lane_merge): combine the mixed window and the coarse lane
         # for coarse queries as ONE softmax over the union of both key sets, instead of
@@ -5818,6 +6324,10 @@ class HierarchicalMessagePassing(MessagePassing):
             if str(getattr(self, "local_pack_global_select", "levels")) == "content":
                 k_rows, g_score, g_meta = self._nominate_global_rows(
                     kp, spec, lvl_packed, int(_gblk.get("budget", k_rows.numel())))
+                if g_meta is not None and int(g_meta.get("n_static", 0)):
+                    raise RuntimeError(
+                        "local_pack_global_coarse='levels' reached the additive path (flex off "
+                        "or failed); its static+chunk prefix exists on the flex path only")
             q_rows = sel                                  # all packed query rows
             if int(k_rows.numel()) > 0 and int(q_rows.numel()) > 0:
                 q_g = qp.index_select(1, q_rows).permute(0, 2, 1, 3)
@@ -6478,6 +6988,8 @@ class HierarchicalTransformerLayer(nn.Module):
         per_level_attn_mult: Optional[List[float]] = None,  # per-level local-attn dim mult (scales num_heads; head_dim fixed)
         local_attn_head_dim: int = 0,  # 0 = hidden//num_heads; >0 = up/down-project local attn to this head_dim
         local_pack_level_bias: bool = False,  # per-level per-head K/V tags for the packed mixed-level local call
+        hier_level_qkv: str = "shared",      # shared | l0_coarse | per_level  (see the out_proj block)
+        hier_level_ffn: str = "shared",      # shared | l0_coarse | per_level  (see _apply_ffn)
         qk_norm: bool = True,
         qk_norm_type: str = "rms",
         local_pack_lane_merge: bool = False,  # LSE-merge the mixed window + coarse lane (unified softmax)
@@ -6501,6 +7013,14 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_dedup: bool = True,  # False = +ln2 on collisions, mask stops depending on membership
         local_pack_global_logit: bool = False,  # detached nomination logit on top of the gate
         local_pack_global_chunk: int = 0,  # >0 = per-chunk CAUSAL selection (AR-safe)
+        local_pack_global_coarse: str = "content",  # levels = static coarse block + chunked L0 slots
+        local_pack_global_nominator: str = "key",  # key | head (hierarchy nomination heads)
+        local_pack_global_candidates: str = "l0",  # head: l0 | all non-static rows
+        local_pack_global_gumbel: float = 0.0,  # head: Gumbel top-k temperature, training only
+        local_pack_global_nom_dim: int = 64,  # head: bilinear nomination width
+        local_pack_global_nom_gate: str = "raw",  # head: raw | zscore gate
+        local_pack_global_boost: str = "logit",  # head: logit (detached) | key (query-conditioned)
+        local_pack_global_gumbel_norm: str = "raw",  # head: raw | chunk (noise scaled per chunk)
         hier_node_dropout: float = 0.0,  # DropNode on coarse rows (value-side, L0 exempt)
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,  # overrides the scalar
         local_window_dropout: float = 0.0,  # DropNode on L0 rows -- forces use of the hierarchy
@@ -6587,6 +7107,7 @@ class HierarchicalTransformerLayer(nn.Module):
             per_level_attn_mult=per_level_attn_mult,
             local_attn_head_dim=local_attn_head_dim,
             local_pack_level_bias=local_pack_level_bias,
+            hier_level_qkv=hier_level_qkv,
             qk_norm=qk_norm,
             qk_norm_type=qk_norm_type,
             local_pack_lane_merge=local_pack_lane_merge,
@@ -6610,6 +7131,14 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_dedup=local_pack_global_dedup,
             local_pack_global_logit=local_pack_global_logit,
             local_pack_global_chunk=local_pack_global_chunk,
+            local_pack_global_coarse=local_pack_global_coarse,
+            local_pack_global_nominator=local_pack_global_nominator,
+            local_pack_global_candidates=local_pack_global_candidates,
+            local_pack_global_gumbel=local_pack_global_gumbel,
+            local_pack_global_nom_dim=local_pack_global_nom_dim,
+            local_pack_global_nom_gate=local_pack_global_nom_gate,
+            local_pack_global_boost=local_pack_global_boost,
+            local_pack_global_gumbel_norm=local_pack_global_gumbel_norm,
             hier_node_dropout=hier_node_dropout,
             hier_node_dropout_per_level=hier_node_dropout_per_level,
             local_window_dropout=local_window_dropout,
@@ -6723,6 +7252,17 @@ class HierarchicalTransformerLayer(nn.Module):
         # nodes) get a large dim -> capacity, mimicking a U-Net's channel growth at the
         # bottleneck. Input/output stay hidden_dim so the residual + cross-level path are intact.
         self.per_level_ffn_dims = [int(d) for d in (per_level_ffn_dims or [])]
+        # Level-specific FFN at the SHARED width (hier_level_ffn): group 0 = self.ffn (L0),
+        # extra groups for coarse rows (l0_coarse: one; per_level: one per coarse level), so
+        # no shared FFN sits dead. Copy-initialized from self.ffn (the model re-syncs after its
+        # _init_weights). Exclusive with per_level_ffn_dims (which sets per-level WIDTHS).
+        self.hier_level_ffn = str(hier_level_ffn or "shared").lower()
+        if self.hier_level_ffn not in ("shared", "l0_coarse", "per_level"):
+            raise ValueError(f"hier_level_ffn must be shared|l0_coarse|per_level, got {hier_level_ffn!r}")
+        if self.hier_level_ffn != "shared" and self.per_level_ffn_dims:
+            raise ValueError("hier_level_ffn and per_level_ffn_dims are exclusive")
+        _n_extra_f = {"shared": 0, "l0_coarse": 1}.get(self.hier_level_ffn, max(0, int(num_local_levels) - 1))
+        self.ffn_lg = nn.ModuleList([copy.deepcopy(self.ffn) for _ in range(_n_extra_f)])
         self.ffn_level = nn.ModuleList()
         if self.per_level_ffn_dims:
             for d in self.per_level_ffn_dims:
@@ -6773,11 +7313,25 @@ class HierarchicalTransformerLayer(nn.Module):
         if hasattr(self.message_passing, "reset_lateral_edge_traces"):
             self.message_passing.reset_lateral_edge_traces()
     
+    @torch.no_grad()
+    def sync_level_ffn_from_shared(self) -> None:
+        """Copy self.ffn into every hier_level_ffn group."""
+        for m in self.ffn_lg:
+            m.load_state_dict(self.ffn.state_dict())
+
     def _apply_ffn(self, x_normed, node_level, level_offsets=None):
         """Per-level FFN dispatch: each hierarchy level's nodes go through their own SwiGLU
         (per-level expansion width). Falls back to the shared FFN when per_level_ffn_dims is
-        unset. Uses contiguous level_offsets slices when available (one host sync), else a
-        masked path (for the active-level subset, which isn't level-contiguous)."""
+        unset. Uses contiguous level slices -- the model-injected static _level_segs when they
+        cover this call (no host sync, compile-safe), else level_offsets (one host sync) --
+        or a masked path (for the active-level subset, which isn't level-contiguous)."""
+        _segs = getattr(self, "_level_segs", None)
+        if self.hier_level_ffn != "shared":
+            g = _level_group_segs(_segs, int(x_normed.size(-2)), self.hier_level_ffn) if x_normed.dim() == 3 else None
+            if g is None:
+                raise RuntimeError("hier_level_ffn: no node-order level bounds for this call "
+                                   "(subset/active-level calls are not supported)")
+            return _level_group_ffn([self.ffn, *self.ffn_lg], x_normed, g)
         if not self.per_level_ffn_dims:
             return self.ffn(x_normed)
         nlv = len(self.per_level_ffn_dims)
@@ -6793,7 +7347,10 @@ class HierarchicalTransformerLayer(nn.Module):
                 out[lo:hi, :] = res
 
         bounds = None
-        if isinstance(level_offsets, torch.Tensor) and level_offsets.numel() >= 2:
+        if (x_normed.dim() == 3 and _segs and int(_segs[0][0]) == 0 and int(_segs[-1][1]) == N
+                and all(int(l) == i for i, (_, _, l) in enumerate(_segs))):
+            bounds = [(int(a), int(b)) for a, b, _ in _segs]
+        elif isinstance(level_offsets, torch.Tensor) and level_offsets.numel() >= 2:
             loff = level_offsets.detach().to("cpu").tolist()
             bounds = [(int(loff[i]), int(loff[i + 1])) for i in range(len(loff) - 1)]
         if bounds is not None:

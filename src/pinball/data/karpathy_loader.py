@@ -69,7 +69,11 @@ def create_karpathy_dataloaders(
         # load‑or‑tokenize whole file
         if token_path.exists():
             logger.info(f"Loading tokenised data from {token_path}")
-            tokens = torch.load(token_path)
+            # mmap: map the cached tensor instead of copying it into RAM. PG19's cache is
+            # 24.5 GB int64; with a plain load every process holds its own copy, so two runs
+            # side by side need ~49 GB. Mapped, they share one page-cache copy and only each
+            # batch's slices are materialised. Same tokens either way.
+            tokens = torch.load(token_path, mmap=True)
         else:
             logger.info(f"Reading raw text from {text_path}")
             logger.info("Tokenising …")
