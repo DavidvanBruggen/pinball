@@ -383,6 +383,8 @@ def build_pinball_model(
         local_pack_global_nom_gate=str(getattr(args, "local_pack_global_nom_gate", "raw") or "raw"),
         local_pack_global_boost=str(getattr(args, "local_pack_global_boost", "logit") or "logit"),
         local_pack_global_gumbel_norm=str(getattr(args, "local_pack_global_gumbel_norm", "raw") or "raw"),
+        local_pack_global_region_cap=int(getattr(args, "local_pack_global_region_cap", 0) or 0),
+        local_pack_global_region_level=int(getattr(args, "local_pack_global_region_level", 2) or 2),
         local_pack_ring_windows=(list(getattr(args, "local_pack_ring_windows", None) or []) or None),
         local_pack_ring_merge=str(getattr(args, "local_pack_ring_merge", "additive")),
         hier_node_dropout=float(getattr(args, "hier_node_dropout", 0.0)),

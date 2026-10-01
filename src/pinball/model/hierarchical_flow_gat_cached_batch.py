@@ -3011,6 +3011,8 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_nom_gate: str = "raw",    # head only: raw | zscore (see the layer)
         local_pack_global_boost: str = "logit",     # head only: logit | key (see the layer)
         local_pack_global_gumbel_norm: str = "raw", # head only: raw | chunk (see the layer)
+        local_pack_global_region_cap: int = 0,      # head only: max picks per region (0 = off)
+        local_pack_global_region_level: int = 2,    # head only: level whose nodes define regions
         # DropNode on the hierarchy: zero a coarse row's VALUE in the packed K/V set per
         # (batch, row, step). L0 never dropped; residual stream and refresh paths untouched.
         hier_node_dropout: float = 0.0,
@@ -3691,6 +3693,8 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_nom_gate = str(local_pack_global_nom_gate or "raw").lower()
         self.local_pack_global_boost = str(local_pack_global_boost or "logit").lower()
         self.local_pack_global_gumbel_norm = str(local_pack_global_gumbel_norm or "raw").lower()
+        self.local_pack_global_region_cap = max(0, int(local_pack_global_region_cap or 0))
+        self.local_pack_global_region_level = max(1, int(local_pack_global_region_level or 2))
         self.hier_node_dropout = float(hier_node_dropout)
         self.local_window_dropout = float(local_window_dropout)
         if self.local_window_dropout > 0.0:
@@ -4533,6 +4537,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
                         local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
+                        local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
+                        local_pack_global_region_level=int(getattr(self, "local_pack_global_region_level", 2)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
                         local_window_dropout=float(getattr(self, "local_window_dropout", 0.0)),
@@ -4653,6 +4659,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
                         local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
+                        local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
+                        local_pack_global_region_level=int(getattr(self, "local_pack_global_region_level", 2)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
                         hier_node_dropout_per_level=getattr(self, "hier_node_dropout_per_level", None),
                         local_window_dropout=float(getattr(self, "local_window_dropout", 0.0)),

@@ -1052,6 +1052,15 @@ class HierarchicalMessagePassing(MessagePassing):
         # i.e. the ranking is z + tau*Gumbel -- exploration stays fixed at tau whatever the
         # weight scale, so only a real RELATIVE margin keeps a row reliably picked.
         local_pack_global_gumbel_norm: str = "raw",
+        # DIVERSITY (head only). At most `region_cap` picks per region, a region being a
+        # candidate's ancestor at `region_level` (L2 = 64 tokens at 4096; a row at or above that
+        # level is its own region). Measured 2026-09-30 on the q arms: the deterministic top-k
+        # concentrates on copy-useful tokens, and random or noisy picks are ~3% better on
+        # "never" -- diverse past context helps general prediction. The cap spreads the SAME
+        # global ranking across the context; the live-slot count stays pure geometry
+        # (sum over regions of min(cap, allowed)). 0 = off (default).
+        local_pack_global_region_cap: int = 0,
+        local_pack_global_region_level: int = 2,
         # DropNode on the hierarchy: per (batch, coarse row) each step, zero that row's
         # VALUE in the packed key/value set so nothing reads its content this step. L0 is
         # never dropped and the residual stream is untouched, so the upward/downward refresh
@@ -1226,6 +1235,8 @@ class HierarchicalMessagePassing(MessagePassing):
             raise ValueError("local_pack_global_nom_gate must be 'raw' or 'zscore', got "
                              f"{local_pack_global_nom_gate!r}")
         self.local_pack_global_gumbel_norm = str(local_pack_global_gumbel_norm or "raw").lower()
+        self.local_pack_global_region_cap = max(0, int(local_pack_global_region_cap or 0))
+        self.local_pack_global_region_level = max(1, int(local_pack_global_region_level or 2))
         if self.local_pack_global_gumbel_norm not in {"raw", "chunk"}:
             raise ValueError("local_pack_global_gumbel_norm must be 'raw' or 'chunk', got "
                              f"{local_pack_global_gumbel_norm!r}")
@@ -4968,9 +4979,12 @@ class HierarchicalMessagePassing(MessagePassing):
         W = int(spec.get("window", 0) or 0)
         nch = (n + C - 1) // C
         K = max(1, min(int(self.local_pack_global_l0_budget), n))
+        _cap = int(getattr(self, "local_pack_global_region_cap", 0) or 0)
+        reg = self._nom_region_ids(spec, lvl_packed) if _cap > 0 else None
         # Candidate set, per-chunk allowed mask and live-slot count are pure geometry:
         # built once per skeleton (cached in the spec, shared by every layer).
-        _gk = ("nom_geom", C, W, K, self.local_pack_global_candidates)
+        _gk = ("nom_geom", C, W, K, self.local_pack_global_candidates,
+               _cap, int(self.local_pack_global_region_level) if _cap > 0 else 0)
         _geo = spec.get(_gk, None)
         if _geo is None:
             gm = spec.get("global_block_mask", None)
@@ -4983,7 +4997,13 @@ class HierarchicalMessagePassing(MessagePassing):
             idx = torch.arange(n, device=dev)
             allowed = (cand.view(1, -1) & (idx.view(1, -1) < limit.view(-1, 1))
                        & (spec["nom_avail"].view(1, -1) < limit.view(-1, 1)))  # [nch, n]
-            count = allowed.sum(1)
+            if _cap > 0:
+                # live slots = sum over regions of min(cap, allowed in region): geometry only
+                _cnt = torch.zeros(nch, 2 * n, dtype=torch.long, device=dev).scatter_add_(
+                    1, reg.view(1, -1).expand(nch, -1), allowed.to(torch.long))
+                count = _cnt.clamp(max=_cap).sum(1)
+            else:
+                count = allowed.sum(1)
             ok = (torch.arange(K, device=dev).view(1, -1) < count.view(-1, 1))  # [nch, K]
             _geo = (allowed, ok)
             spec[_gk] = _geo
@@ -5005,6 +5025,8 @@ class HierarchicalMessagePassing(MessagePassing):
             sc = sc.masked_fill(~allowed.unsqueeze(0), neg)
         else:
             sc = rank.unsqueeze(1).masked_fill(~allowed.unsqueeze(0), neg)  # [B, nch, n]
+        if _cap > 0:
+            sc = self._region_cap(sc, reg, _cap, neg)
         top = torch.topk(sc, K, dim=-1).indices                              # [B, nch, K]
         # Causal by construction, whatever the scores: a live slot must hold an allowed row.
         legal = allowed.unsqueeze(0).expand(B, -1, -1).gather(2, top)
@@ -5039,6 +5061,47 @@ class HierarchicalMessagePassing(MessagePassing):
         st = spec["global_block"]["rows"]
         return rows, g, {"chunk": C, "G": K, "nch": int(nch), "ok": okf,
                          "n_static": int(st.numel()), "static_rows": st, "per_batch": True}
+
+    def _nom_region_ids(self, spec: Dict, lvl_packed: torch.Tensor) -> torch.Tensor:
+        """Region id per PACKED row: the node index of its ancestor at region_level (a row at
+        or above that level is its own region; a row without that ancestor -- truncated tail
+        windows -- gets a unique id n + row, i.e. is never capped). Cached per spec."""
+        R = int(self.local_pack_global_region_level)
+        key = ("nom_region", R)
+        reg = spec.get(key, None)
+        if reg is not None:
+            return reg
+        par = spec["nom_parent_node"]
+        node_lvl = spec.get("nom_node_level", None)
+        if node_lvl is None:
+            node_lvl = torch.empty_like(lvl_packed); node_lvl[spec["perm"]] = lvl_packed
+        N = int(par.numel())
+        anc = torch.arange(N, device=par.device)
+        for _ in range(R):
+            step = (node_lvl.index_select(0, anc) < R) & (par.index_select(0, anc) >= 0)
+            anc = torch.where(step, par.index_select(0, anc), anc)
+        ok = node_lvl.index_select(0, anc) >= R
+        ok = ok | (node_lvl >= R)
+        ids = torch.where(ok, anc, N + torch.arange(N, device=par.device))
+        reg = ids.index_select(0, spec["perm"]).contiguous()
+        spec[key] = reg
+        return reg
+
+    @staticmethod
+    def _region_cap(sc: torch.Tensor, reg: torch.Tensor, cap: int, neg: float) -> torch.Tensor:
+        """Keep at most `cap` highest-scoring rows per region in each [B, nch, :] row of `sc`
+        (others -> neg). Masked rows already hold neg, sort last within their region, and so
+        never consume the cap."""
+        n = int(sc.size(-1))
+        o1 = torch.argsort(sc, dim=-1, descending=True, stable=True)
+        r2, o2 = torch.sort(reg.index_select(0, o1.reshape(-1)).view_as(o1), dim=-1, stable=True)
+        order = o1.gather(-1, o2)                          # region-major, score-desc within
+        idx = torch.arange(n, device=sc.device).view(1, 1, -1).expand_as(r2)
+        start = torch.ones_like(r2, dtype=torch.bool)
+        start[..., 1:] = r2[..., 1:] != r2[..., :-1]
+        seg0 = torch.where(start, idx, torch.zeros_like(idx)).cummax(-1).values
+        keep = torch.zeros_like(start).scatter(-1, order, (idx - seg0) < cap)
+        return sc.masked_fill(~keep, neg)
 
     def _nominate_l0_chunks(self, spec: Dict, lvl_packed: torch.Tensor, score: torch.Tensor):
         """local_pack_global_coarse='levels' -> (rows [B, nch*K], score [B, nch*K], meta).
@@ -7021,6 +7084,8 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_nom_gate: str = "raw",  # head: raw | zscore gate
         local_pack_global_boost: str = "logit",  # head: logit (detached) | key (query-conditioned)
         local_pack_global_gumbel_norm: str = "raw",  # head: raw | chunk (noise scaled per chunk)
+        local_pack_global_region_cap: int = 0,  # head: max picks per region (0 = off)
+        local_pack_global_region_level: int = 2,  # head: level defining regions
         hier_node_dropout: float = 0.0,  # DropNode on coarse rows (value-side, L0 exempt)
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,  # overrides the scalar
         local_window_dropout: float = 0.0,  # DropNode on L0 rows -- forces use of the hierarchy
@@ -7139,6 +7204,8 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_nom_gate=local_pack_global_nom_gate,
             local_pack_global_boost=local_pack_global_boost,
             local_pack_global_gumbel_norm=local_pack_global_gumbel_norm,
+            local_pack_global_region_cap=local_pack_global_region_cap,
+            local_pack_global_region_level=local_pack_global_region_level,
             hier_node_dropout=hier_node_dropout,
             hier_node_dropout_per_level=hier_node_dropout_per_level,
             local_window_dropout=local_window_dropout,
