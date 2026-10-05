@@ -161,7 +161,7 @@ def _build_optimizer(model, cfg):
     # 0.39 -> 0.003 and the picks covered FEWER copy targets than random rows.
     # nom_boost_u: likewise a [heads, head_dim] table of per-head directions, not a weight matrix.
     head_name_markers = ("output_projection", "lm_head", "hier_pc_decoder", "global_nominate_vec",
-                         "nom_boost_u")
+                         "nom_boost_u", "lap_pe_proj", "far_level_bias")
     for name, p in model.named_parameters():
         if any(marker in name for marker in head_name_markers):
             embed_param_ids.add(id(p))

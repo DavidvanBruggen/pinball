@@ -758,9 +758,11 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
         }
         # LapPE (raw) — compute once on CPU for this layout
         if self.lap_pe_transform is not None and (self.lap_pe_k or 0) > 0:
-            g_cpu_tmp = Data(edge_index=sk["edge_index_cpu"], num_nodes=sk["num_nodes"])
-            g_cpu_tmp = self.lap_pe_transform(g_cpu_tmp)  # CPU op
-            sk["lap_pe_raw_cpu"] = g_cpu_tmp.lap_pe.detach().to("cpu").contiguous()
+            # Geometry LapPE (_hier_lap_pe_cpu): undirected window graph, unit-RMS, sign-fixed.
+            # Replaces PyG AddLaplacianEigenvectorPE on edge_index_cpu, which is AR-filtered
+            # (directed) yet was treated as undirected, gave unit-norm columns (~1/sqrt(N)
+            # entries) and used an unseeded ARPACK start (signs could flip on a resume).
+            sk["lap_pe_raw_cpu"] = self._hier_lap_pe_cpu(sk["node_level_cpu"])
         else:
             sk["lap_pe_raw_cpu"] = None
             logger.debug("LapPE transform disabled; skipping LapPE skeleton caching.")
@@ -2498,12 +2500,8 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 if self.lap_pe_transform is not None and getattr(self, "lap_pe_k", 0) > 0:
                     try:
                         # 1) apply LapPE transform on CPU
-                        g_cpu_tmp = Data(
-                            edge_index=unified_graph.edge_index,
-                            num_nodes=unified_graph.num_nodes,
-                        )
-                        g_cpu_tmp = self.lap_pe_transform(g_cpu_tmp)
-                        lap_raw = g_cpu_tmp.lap_pe.detach().to(dtype=torch.float32, device="cpu").contiguous()
+                        # geometry LapPE, see the skeleton builder above
+                        lap_raw = self._hier_lap_pe_cpu(unified_graph.node_level)
                         #lap_raw = g_cpu_tmp.lap_pe.to(dtype=torch.float32).contiguous()
 
                         # 2) store both raw and projected (optional)

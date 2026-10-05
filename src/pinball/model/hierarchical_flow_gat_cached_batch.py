@@ -3011,6 +3011,9 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_nom_gate: str = "raw",    # head only: raw | zscore (see the layer)
         local_pack_global_boost: str = "logit",     # head only: logit | key (see the layer)
         local_pack_global_gumbel_norm: str = "raw", # head only: raw | chunk (see the layer)
+        local_pack_far_nope_dims: int = 0,  # far keys (global block + slots) unrotated tail only; 0 = off
+        local_pack_far_bias: str = "off",   # off | level: per-level logit bias on far keys (see the layer)
+        lap_pe_bias: bool = True,           # lap_pe_proj bias; False for a clean A/B (no constant offset)
         local_pack_global_region_cap: int = 0,      # head only: max picks per region (0 = off)
         local_pack_global_region_level: int = 2,    # head only: level whose nodes define regions
         # DropNode on the hierarchy: zero a coarse row's VALUE in the packed K/V set per
@@ -3693,6 +3696,9 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_nom_gate = str(local_pack_global_nom_gate or "raw").lower()
         self.local_pack_global_boost = str(local_pack_global_boost or "logit").lower()
         self.local_pack_global_gumbel_norm = str(local_pack_global_gumbel_norm or "raw").lower()
+        self.local_pack_far_nope_dims = max(0, int(local_pack_far_nope_dims or 0))
+        self.local_pack_far_bias = str(local_pack_far_bias or "off").lower()
+        self.lap_pe_bias = bool(lap_pe_bias)
         self.local_pack_global_region_cap = max(0, int(local_pack_global_region_cap or 0))
         self.local_pack_global_region_level = max(1, int(local_pack_global_region_level or 2))
         self.hier_node_dropout = float(hier_node_dropout)
@@ -4472,7 +4478,17 @@ class HierarchicalFlowGAT(nn.Module):
                 is_undirected=True # Assume graph is undirected for efficiency
             )
             # Projection layer maps k features -> hidden_dim
-            self.lap_pe_proj = nn.Linear(self.lap_pe_k, hidden_dim)
+            # RNG-ISOLATED: built under a forked RNG and skipped by the model-wide
+            # _init_weights, so it consumes NO global random numbers and every other module
+            # initialises exactly as with lap_pe_k = 0 (the first arm's projection shifted
+            # the whole init, i.e. it ran as a different seed from its control).
+            with torch.random.fork_rng(devices=[]):
+                self.lap_pe_proj = nn.Linear(self.lap_pe_k, hidden_dim, bias=bool(self.lap_pe_bias))
+            self.lap_pe_proj._skip_global_init = True
+            # Zero init (applied after the model-wide _init_weights, below): the arm starts
+            # as its parent and the PE opens by gradient (the input features are unit-RMS,
+            # see _hier_lap_pe_cpu). Routed to AdamW in cli. lap_pe_bias: false drops the
+            # constant offset the first arm grew (norm 0.6, load-bearing, position-free).
         else:
             self.lap_pe_transform = None
             self.lap_pe_proj = None
@@ -4537,6 +4553,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
                         local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
+                        local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
+                        local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
                         local_pack_global_region_level=int(getattr(self, "local_pack_global_region_level", 2)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
@@ -4659,6 +4677,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
                         local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
+                        local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
+                        local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
                         local_pack_global_region_level=int(getattr(self, "local_pack_global_region_level", 2)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
@@ -5473,6 +5493,11 @@ class HierarchicalFlowGAT(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+        if self.lap_pe_proj is not None:
+            # zero init (see its construction; _init_weights skips it)
+            nn.init.zeros_(self.lap_pe_proj.weight)
+            if self.lap_pe_proj.bias is not None:
+                nn.init.zeros_(self.lap_pe_proj.bias)
         # Level-specific weights start as copies of the shared ones; _init_weights above just
         # re-randomized them independently, so copy again.
         for _m in self.modules():
@@ -5550,6 +5575,8 @@ class HierarchicalFlowGAT(nn.Module):
 
     def _init_weights(self, module):
         """Initialize the weights."""
+        if getattr(module, "_skip_global_init", False):
+            return      # initialised by its owner without the global RNG (lap_pe_proj)
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.weight.data.normal_(mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
@@ -7426,17 +7453,32 @@ class HierarchicalFlowGAT(nn.Module):
         # GLOBAL BLOCK (local_pack_global_block): whole levels top-down while they fit the
         # budget. Rows are concatenated top-level-first and kept contiguous so the flex mask
         # clause stays block-coherent; the additive path just uses them as a key set.
+        # Level MEMBERSHIP is decided at the training length (max_seq_len), as
+        # _resolve_global_tier does: deciding it from the current sizes let a short prefix
+        # pull an extra level in (at 4096/budget 400 the block is L3+L2; below ~1830 tokens L1
+        # fits too), so uncompiled generation and short evals ran a different static block
+        # than training (frontier logits off by 0.50 at a 1500-token prefix; exact above the
+        # threshold). Longer than max_seq_len: no reference, the current sizes decide.
         _B = int(getattr(self, "local_pack_global_block", 0) or 0)
         if _B > 0:
+            _cur = [int(r.numel()) for r in spec["level_rows"]]
+            _ref = None
+            if hasattr(self, "_predict_level_sizes"):
+                _ref = [int(v) for v in self._predict_level_sizes(int(self.max_seq_len))]
+                if len(_ref) < len(_cur) or any(c > r for c, r in zip(_cur, _ref)):
+                    _ref = None
+            _sizes = _ref if _ref is not None else _cur
             _blk, _tot, _lvls = [], 0, []
             for _lv in range(len(spec["level_rows"]) - 1, 0, -1):
                 _r = spec["level_rows"][_lv]
-                _n = int(_r.numel())
+                _n = int(_sizes[_lv])
                 if _n == 0:
                     continue
                 if _tot + _n > _B:
                     break
-                _blk.append(_r); _tot += _n; _lvls.append(_lv)
+                _tot += _n
+                if int(_r.numel()) > 0:
+                    _blk.append(_r); _lvls.append(_lv)
             if _blk:
                 _rows = torch.cat(_blk)
                 spec["global_block"] = {
@@ -9748,6 +9790,11 @@ class HierarchicalFlowGAT(nn.Module):
         )
         unified_graph.node_pos_local = node_pos_local
         unified_graph.level_grid_shapes = list(level_grid_shapes)
+        # LapPE (lap_pe_k > 0): consumed by the true_batch_nozip refinement entry
+        # (x += lap_pe_proj(pe)). The Enhanced subclass's skeleton builder sets the same
+        # tensor from the same cached function; this covers direct use of this class.
+        if self.lap_pe_proj is not None and not twin_mode:
+            unified_graph.lap_pe_raw_cpu = self._hier_lap_pe_cpu(unified_node_level)
 
         # Cache lightweight topology (int tensors, no grad) for the level connectivity reporter.
         self._last_topology = (
@@ -14821,6 +14868,115 @@ class HierarchicalFlowGAT(nn.Module):
             g_aux.node_ar_time = base_ar_time.repeat(B)
         return self._compute_hierarchy_aux_loss_runtime(g_aux)
 
+    def _hier_lap_pe_cpu(self, node_level: torch.Tensor) -> torch.Tensor:
+        """Laplacian eigenvector PE of the hierarchy GEOMETRY, [N, lap_pe_k] float32 on CPU,
+        in the given node order. Content-free (depends on positions only): no causal leak.
+
+        LENGTH-CONSISTENT: the eigenvectors are computed ONCE, at the training length
+        (max_seq_len), and every graph takes its rows from that reference by (level,
+        level-local index); level-l node j is the window starting at token j * stride_l at
+        any length. A training block (N == max_seq_len) is the reference itself; a shorter
+        prefix (generation without fixed-shape padding, a short eval) gets exactly the codes
+        those positions had in training. Computing at the current N instead would hand every
+        decode step a different basis. A graph longer than max_seq_len has no consistent
+        answer: it is computed at its own length, with a one-time warning."""
+        k = int(self.lap_pe_k)
+        lvl = node_level.detach().to("cpu", torch.long)
+        n_lv = int(lvl.max().item()) + 1 if lvl.numel() > 0 else 0
+        sizes = tuple(int((lvl == l).sum().item()) for l in range(n_lv))
+        cache = getattr(self, "_hier_lap_pe_cache", None)
+        if cache is None:
+            cache = {}
+            self._hier_lap_pe_cache = cache
+        key = ("graph", sizes, k)
+        if key in cache:
+            return cache[key]
+        if str(getattr(self, "graph_geometry_mode", "sequence")).lower() != "sequence":
+            raise NotImplementedError("lap_pe_k > 0 needs sequence geometry (1-D windows)")
+        ref_sizes = None
+        if hasattr(self, "_predict_level_sizes"):
+            ref_sizes = tuple(int(v) for v in self._predict_level_sizes(int(self.max_seq_len)))[:n_lv]
+        if ref_sizes is None or len(ref_sizes) < n_lv or any(s_ > r_ for s_, r_ in zip(sizes, ref_sizes)):
+            if not getattr(self, "_hier_lap_pe_len_warned", False):
+                logger.warning("lap_pe: graph level sizes %s exceed the max_seq_len=%d reference %s; "
+                               "PE computed at this length (NOT consistent with training).",
+                               sizes, int(self.max_seq_len), ref_sizes)
+                self._hier_lap_pe_len_warned = True
+            ref_sizes = sizes
+        ref = self._hier_lap_pe_geometry(ref_sizes)
+        ref_off = [0]
+        for r_ in ref_sizes:
+            ref_off.append(ref_off[-1] + r_)
+        src = torch.empty(lvl.numel(), dtype=torch.long)
+        for l in range(n_lv):
+            idx = torch.nonzero(lvl == l, as_tuple=False).view(-1)
+            src[idx] = torch.arange(idx.numel()) + ref_off[l]
+        out = ref.index_select(0, src).contiguous()
+        if len(cache) >= 8:
+            cache.clear()
+        cache[key] = out
+        return out
+
+    def _hier_lap_pe_geometry(self, sizes: Tuple[int, ...]) -> torch.Tensor:
+        """Eigenvectors for the hierarchy with these level sizes, level-major node order.
+
+        The graph is the hierarchy's own membership, not the skeleton's edge_index (which is
+        AR-filtered and, in cleaner mode, stripped of cross-level edges): an L0 chain (t, t+1)
+        plus every parent-child edge of _create_next_level's rule (parent i holds children
+        [i*stride, min(i*stride + comp, n_lower)); 2 parents per child at 50% overlap). The
+        rule does not depend on the total length, so node j of a level is the same window at
+        every length. (Note: _cumulative_window's span under-counts the true L0 coverage of
+        L2+ -- an L2 node covers 40 tokens, not 32 -- so it is not used here.) Symmetric-normalised Laplacian; the trivial eigenvector is dropped and the
+        vectors taken in random-walk form (D^-1/2 v). On this near-path graph the low
+        eigenvectors are smooth cosines over the block, and a coarse node takes the value of
+        the region it covers: absolute, level-consistent position. Columns are scaled to unit
+        RMS (raw entries are ~1/sqrt(N)) and sign-fixed so the largest-|v| entry is positive,
+        with a fixed ARPACK start, so a resume rebuilds identical features."""
+        k = int(self.lap_pe_k)
+        cache = self._hier_lap_pe_cache
+        key = ("geom", tuple(sizes), k)
+        if key in cache:
+            return cache[key]
+        import numpy as np
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+
+        off = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+        n = int(off[-1])
+        rows, cols = [np.arange(sizes[0] - 1)], [np.arange(1, sizes[0])]   # L0 chain
+        for l in range(1, len(sizes)):
+            # _create_next_level: parent i holds children [i*stride, min(i*stride + comp, n_lower))
+            comp = int(self.compression_ratios[l - 1])
+            stride = max(1, int(comp * (1 - self.overlap_ratios[l - 1])))
+            par = np.repeat(np.arange(sizes[l]), comp)
+            ch = par * stride + np.tile(np.arange(comp), sizes[l])
+            keep = ch < sizes[l - 1]
+            rows.append(off[l - 1] + ch[keep]); cols.append(off[l] + par[keep])
+        r = np.concatenate(rows); c = np.concatenate(cols)
+        a = sp.coo_matrix((np.ones(r.size), (r, c)), shape=(n, n)).tocsr()
+        a = ((a + a.T) > 0).astype(np.float64)
+        deg = np.asarray(a.sum(axis=1)).ravel()
+        if np.any(deg == 0):
+            raise RuntimeError(f"lap_pe: {int((deg == 0).sum())} isolated hierarchy nodes")
+        dinv = sp.diags(1.0 / np.sqrt(deg))
+        lap = sp.identity(n, format="csr") - dinv @ a @ dinv
+        v0 = np.full(n, 1.0 / math.sqrt(n))
+        # shift-invert just below 0: the low eigenvalues scale ~1/N^2 (5e-6 at N=5k), so a
+        # fixed shift (-1e-4) leaves them unseparated and ARPACK crawls at 16k+
+        vals, vecs = spla.eigsh(lap.tocsc(), k=k + 1, sigma=-10.0 / float(n) ** 2, which="LM", v0=v0)
+        order = np.argsort(vals)
+        # random-walk form D^-1/2 v: removes the sqrt(degree) factor of the sym eigenvectors,
+        # which made coarse rows (~18 neighbours vs ~4 for a token) ~2x larger -- a level
+        # signal mixed into the position code. Same eigenvalues (L_rw ~ L_sym).
+        vecs = vecs[:, order[1:k + 1]] / np.sqrt(deg)[:, None]
+        vecs = vecs / np.sqrt(np.mean(vecs ** 2, axis=0, keepdims=True))
+        sign = np.sign(vecs[np.argmax(np.abs(vecs), axis=0), np.arange(vecs.shape[1])])
+        vecs = vecs * sign
+        out = torch.from_numpy(np.ascontiguousarray(vecs)).to(torch.float32)
+        self._hier_lap_pe_eigvals = vals[order[1:k + 1]]
+        cache[key] = out
+        return out
+
     def _lap_pe_raw_on_device(self, lap_pe: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         key = (
             int(lap_pe.data_ptr()),
@@ -17297,6 +17453,8 @@ class HierarchicalFlowGAT(nn.Module):
             reasons.append("hier_copredict_l0 on")
         if bool(getattr(self, "pinball_level_cycle_enable", False)):
             reasons.append("pinball_level_cycle on")
+        if int(getattr(self, "lap_pe_k", 0) or 0) > 0:
+            reasons.append("lap_pe on (tail graph would index the PE from 0, not from t0)")
         return reasons
 
     def _generate_incremental(

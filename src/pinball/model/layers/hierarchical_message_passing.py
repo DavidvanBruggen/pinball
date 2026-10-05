@@ -1061,6 +1061,22 @@ class HierarchicalMessagePassing(MessagePassing):
         # (sum over regions of min(cap, allowed)). 0 = off (default).
         local_pack_global_region_cap: int = 0,
         local_pack_global_region_level: int = 2,
+        # FAR-PATH PARTIAL RoPE (borrowed: HSA, "NoPE on the long-range path"). The LAST
+        # `far_nope_dims` dims of every packed q/k stay UNROTATED -- RoPE's interleaved pairs
+        # put the slowest frequencies there, which barely turn inside a ~128-token window, so
+        # local attention is all but unchanged. Far keys (the static global block and the
+        # chunk slots) get their ROTATED dims zeroed, so a far score is q_nope . k_nope:
+        # position-free, the same at any distance. Static rows that fall inside a query's
+        # band are reached through the band (rotated) instead of the prefix. The key boost u
+        # lives in the unrotated dims. 0 = off (default, bit-identical).
+        local_pack_far_nope_dims: int = 0,
+        # FAR-KEY BIAS (borrowed: HiLS mass calibration). "level": reserve the last unrotated
+        # dim -- q = 1 there for every query, k = 0 for band keys, k = sqrt(d) * b[head,
+        # level] for far keys -- so each far key gets a TRUE query-independent logit bias
+        # b[head, level(row)], learned per layer (init 0). The level tag cannot do this: it
+        # is added before RoPE, so its score q.R(d)t_L depends on the query and the distance.
+        # Needs far_nope_dims >= 2. "off" = default.
+        local_pack_far_bias: str = "off",
         # DropNode on the hierarchy: per (batch, coarse row) each step, zero that row's
         # VALUE in the packed key/value set so nothing reads its content this step. L0 is
         # never dropped and the residual stream is untouched, so the upward/downward refresh
@@ -1237,6 +1253,25 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_global_gumbel_norm = str(local_pack_global_gumbel_norm or "raw").lower()
         self.local_pack_global_region_cap = max(0, int(local_pack_global_region_cap or 0))
         self.local_pack_global_region_level = max(1, int(local_pack_global_region_level or 2))
+        self.local_pack_far_nope_dims = max(0, int(local_pack_far_nope_dims or 0))
+        self.local_pack_far_bias = str(local_pack_far_bias or "off").lower()
+        if self.local_pack_far_bias not in {"off", "level"}:
+            raise ValueError("local_pack_far_bias must be 'off' or 'level', got "
+                             f"{local_pack_far_bias!r}")
+        _fnd = self.local_pack_far_nope_dims
+        if _fnd:
+            if _fnd % 2 or _fnd >= int(self.head_dim):
+                raise ValueError(f"local_pack_far_nope_dims={_fnd} must be even and < head_dim "
+                                 f"({self.head_dim}): RoPE rotates dims in pairs")
+            if bool(local_pack_rope_axial):
+                raise ValueError("local_pack_far_nope_dims needs 1-D packed RoPE "
+                                 "(local_pack_rope_axial is not supported)")
+            if self.local_pack_global_block <= 0:
+                raise ValueError("local_pack_far_nope_dims needs local_pack_global_block > 0 "
+                                 "(the far keys are the K/V prefix of the flex-union call)")
+        if self.local_pack_far_bias != "off" and _fnd < 2:
+            raise ValueError("local_pack_far_bias needs local_pack_far_nope_dims >= 2 (the bias "
+                             "lives in an unrotated dim)")
         if self.local_pack_global_gumbel_norm not in {"raw", "chunk"}:
             raise ValueError("local_pack_global_gumbel_norm must be 'raw' or 'chunk', got "
                              f"{local_pack_global_gumbel_norm!r}")
@@ -1303,6 +1338,11 @@ class HierarchicalMessagePassing(MessagePassing):
             else:
                 self.global_nominate_vec = nn.Parameter(
                     torch.randn(_nlv, int(self.num_heads) * int(self.head_dim)) * 0.02)
+        if self.local_pack_far_bias == "level":
+            # b[head, level] for far keys (see local_pack_far_bias); init 0 = no bias. A
+            # [heads, levels] table, routed to AdamW by name in cli._build_optimizer.
+            self.far_level_bias = nn.Parameter(
+                torch.zeros(int(self.num_heads), max(1, int(num_local_levels))))
         if self.local_pack_coarse_global or self.local_pack_global_block > 0:
             # Raw scalar, NOT a sigmoid: init 0.0 must be EXACT identity so a warm start
             # is bit-identical to the flag being off. Grafting this term ungated onto
@@ -1312,6 +1352,9 @@ class HierarchicalMessagePassing(MessagePassing):
             self.coarse_global_gate = nn.Parameter(
                 torch.full((), float(local_pack_coarse_global_gate_init)))
         self.local_pack_flex_union = bool(local_pack_flex_union)
+        if self.local_pack_far_nope_dims and not self.local_pack_flex_union:
+            raise ValueError("local_pack_far_nope_dims needs local_pack_flex_union: true (the far "
+                             "keys are only separable from the band inside the flex-union call)")
         # Per-level DropNode rates, always length num_local_levels with L0 pinned to 0.0 by
         # DropNode itself (dropping L0 would delete the token content rather than the
         # hierarchy's summary of it) -- local_window_dropout below is the deliberate
@@ -5243,6 +5286,32 @@ class HierarchicalMessagePassing(MessagePassing):
             f"(mask BLOCK_SIZE, kernel BLOCK_M, BLOCK_N)")
         return True
 
+    def _far_keys(self, k: torch.Tensor, lvl: torch.Tensor) -> torch.Tensor:
+        """Far-key treatment for the flex K/V prefix (static block and chunk slots).
+
+        k: gathered keys [B or 1, R, H, D]; lvl: their packed levels, [R] or [B, R].
+        local_pack_far_nope_dims: zero the rotated dims, so q . k uses the unrotated tail
+        only (position-free). local_pack_far_bias == "level": the reserved last dim (q = 1
+        there) carries sqrt(D) * b[head, level], i.e. + b on the logit after flex's 1/sqrt(D)
+        scale. Off -> k unchanged."""
+        _fnd = int(getattr(self, "local_pack_far_nope_dims", 0) or 0)
+        if not _fnd:
+            return k
+        D = int(k.size(-1))
+        k = torch.cat([torch.zeros_like(k[..., :D - _fnd]), k[..., D - _fnd:]], -1)
+        if str(getattr(self, "local_pack_far_bias", "off")) == "level":
+            b = self.far_level_bias.to(k.dtype)                           # [H, nlv]
+            # one-hot matmul, NOT b[:, lvl]: the indexing backward scatters every far key's
+            # grad into a [H, nlv] table -- ~200k atomic adds onto 24 addresses -- measured
+            # 694 vs 220 ms/step compiled. The matmul backward is a tiny dense GEMM.
+            oh = F.one_hot(lvl.clamp(0, int(b.size(1)) - 1), int(b.size(1))).to(k.dtype)
+            bb = oh @ b.t()                                                # [R, H] | [B, R, H]
+            if lvl.dim() == 1:
+                bb = bb.unsqueeze(0)
+            bb = bb.expand(int(k.size(0)), -1, -1)                         # [B, R, H]
+            k = torch.cat([k[..., :-1], (bb * math.sqrt(D)).unsqueeze(-1)], -1)
+        return k
+
     def _flex_union_attn(
         self, qp: torch.Tensor, kp: torch.Tensor, vp: torch.Tensor, spec: Dict,
         causal: bool = True,
@@ -5296,6 +5365,12 @@ class HierarchicalMessagePassing(MessagePassing):
         # _nominate_l0_chunks), so one key for every layer and every re-pick.
         _l0s = bool(gsel is not None and len(gsel) > 2 and gsel[2] is not None
                     and gsel[2].get("per_batch", False))
+        _nope = int(getattr(self, "local_pack_far_nope_dims", 0) or 0) > 0
+        if _nope and not (_l0s or (gsel is None and spec.get("flex_kv_prefix", None) is not None)):
+            raise RuntimeError("local_pack_far_nope_dims supports the static-block prefix "
+                               "(levels) and static + per-sequence chunk slots only")
+        # far NoPE changes the static/band dedup (band-near static rows go through the band)
+        _bm_key = _bm_key + (("far_nope",) if _nope else ())
         if _l0s:
             _bm_key = _bm_key + ("l0chunk", int(gsel[2]["G"]), int(gsel[2]["chunk"]),
                                  int(gsel[2]["n_static"]), int(gsel[0].size(1)),
@@ -5408,12 +5483,31 @@ class HierarchicalMessagePassing(MessagePassing):
                     _sin[_srows] = True
                     _sin = _sin.index_select(0, spec["flex_perm"]).contiguous()
                     _PC = _P2 - _S2
+                    if _nope:
+                        # FAR NoPE DEDUP. The static copy is position-free, so a static row
+                        # inside the query's band must be read through the BAND (rotated, it
+                        # keeps its recency) and dropped from the static clause; the band
+                        # then keeps every row. Same band test on both sides -> exactly one
+                        # key per row. Per-static-key arrays keep each test a single gather.
+                        _s_wt = (ring_wt[ring_lvl[_srows]].contiguous()
+                                 if ring_wt is not None else None)
+                        _s_pos = ring_pos[_srows].contiguous() if ring_wt is not None else None
 
                     def mask_mod(b, h, qi, ki):
                         is_st = ki < _S2
                         is_pre = ki < _P2
-                        st = qi >= _srows[_flex_idx_clamp(ki, hi=_S2 - 1)] if causal_mask \
+                        sk = _flex_idx_clamp(ki, hi=_S2 - 1)
+                        st = qi >= _srows[sk] if causal_mask \
                             else ki >= 0
+                        if _nope:
+                            ds = qi - _srows[sk]
+                            sb = (ds >= 0) & (ds <= w_mix) if causal_mask else (ds.abs() <= w_mix)
+                            if _s_wt is not None:
+                                sr = (_s_wt[sk] > 0) & ((ring_pos[qi] - _s_pos[sk]).abs() <= _s_wt[sk])
+                                if causal_mask:
+                                    sr = sr & (ds >= 0)
+                                sb = sb | sr
+                            st = st & ~sb
                         kc = _flex_idx_clamp(ki - _S2, 0, _PC - 1)
                         pre = ((kc // _G2) == (qi // _C2)) & _ok2[kc]
                         p = _flex_idx_clamp(ki - _P2, 0, _nq2 - 1)
@@ -5425,7 +5519,8 @@ class HierarchicalMessagePassing(MessagePassing):
                             if causal_mask:
                                 ring = ring & (dr >= 0)
                             band = band | ring
-                        band = band & (~_sin[p])
+                        if not _nope:
+                            band = band & (~_sin[p])
                         return torch.where(is_st, st, torch.where(is_pre, pre, band))
 
                 def mask_mod_chunk(b, h, qi, ki):
@@ -5466,6 +5561,11 @@ class HierarchicalMessagePassing(MessagePassing):
                 # forward and one fewer scatter in backward.
                 _G = int(kv_pre.numel())
                 _nq = int(perm.numel())
+                if _nope:
+                    # far NoPE dedup, as in the chunked branch: band-near block rows via the band
+                    _g_wt = (ring_wt[ring_lvl[kv_pre]].contiguous()
+                             if ring_wt is not None else None)
+                    _g_pos = ring_pos[kv_pre].contiguous() if ring_wt is not None else None
 
                 def mask_mod(b, h, qi, ki):
                     is_pre = ki < _G
@@ -5481,12 +5581,23 @@ class HierarchicalMessagePassing(MessagePassing):
                     # Dedup after the union: block rows are duplicated into the K/V prefix,
                     # so they must reach the query through the prefix only, or a row in both
                     # clauses becomes two keys with a +ln2 advantage.
-                    band = band & (~in_glob[p])
+                    if not _nope:
+                        band = band & (~in_glob[p])
+                    gk = _flex_idx_clamp(ki, 0, _G - 1)
                     if causal_mask:
                         # A block row is visible once it has closed (its own packed rank).
-                        glob = qi >= kv_pre[_flex_idx_clamp(ki, 0, _G - 1)]
+                        glob = qi >= kv_pre[gk]
                     else:
                         glob = ki >= 0
+                    if _nope:
+                        dg = qi - kv_pre[gk]
+                        gb = (dg >= 0) & (dg <= w_mix) if causal_mask else (dg.abs() <= w_mix)
+                        if _g_wt is not None:
+                            gr = (_g_wt[gk] > 0) & ((ring_pos[qi] - _g_pos[gk]).abs() <= _g_wt[gk])
+                            if causal_mask:
+                                gr = gr & (dg >= 0)
+                            gb = gb | gr
+                        glob = glob & ~gb
                     return torch.where(is_pre, glob, band)
             elif in_glob is not None:
                 # UNIFIED SOFTMAX with a fixed GLOBAL BLOCK. One normalisation over
@@ -5682,11 +5793,26 @@ class HierarchicalMessagePassing(MessagePassing):
                 _z = torch.where(_okb, gsel[1] - self.nom_gate_bias.to(gsel[1].dtype),
                                  torch.zeros_like(gsel[1]))                       # [B, P]
                 _P = int(_z.size(1)); _H, _D = int(kp.size(2)), int(kp.size(3))
-                _pos = spec["pos"].index_select(0, gsel[0].reshape(-1))            # [B*P]
-                _u = self.nom_boost_u.to(kp.dtype).view(1, _H, _D).expand(_B0 * _P, _H, _D)
-                _ur = self.rotary_pos_enc.apply_rotary_pos_emb(_u, _pos).view(_B0, _P, _H, _D)
+                if _nope:
+                    # far NoPE: u lives in the unrotated dims, unrotated (the slot's rotated
+                    # dims are zeroed by _far_keys anyway), and never in the reserved bias dim
+                    _fnd = int(self.local_pack_far_nope_dims)
+                    _um = torch.zeros(_D, dtype=kp.dtype, device=kp.device)
+                    _um[_D - _fnd:] = 1
+                    if str(getattr(self, "local_pack_far_bias", "off")) != "off":
+                        _um[-1] = 0
+                    _ur = (self.nom_boost_u.to(kp.dtype) * _um).view(1, 1, _H, _D)
+                else:
+                    _pos = spec["pos"].index_select(0, gsel[0].reshape(-1))            # [B*P]
+                    _u = self.nom_boost_u.to(kp.dtype).view(1, _H, _D).expand(_B0 * _P, _H, _D)
+                    _ur = self.rotary_pos_enc.apply_rotary_pos_emb(_u, _pos).view(_B0, _P, _H, _D)
                 _ks = _ks + _z.to(kp.dtype).view(_B0, _P, 1, 1) * _ur
-            k_s = torch.cat([kp.index_select(1, _st), _ks, kp], 1).transpose(1, 2)
+            _kst = kp.index_select(1, _st)
+            if _nope:
+                _lv = spec["levels"]
+                _kst = self._far_keys(_kst, _lv.index_select(0, _st))
+                _ks = self._far_keys(_ks, _lv.index_select(0, gsel[0].reshape(-1)).view(_B0, -1))
+            k_s = torch.cat([_kst, _ks, kp], 1).transpose(1, 2)
             v_s = torch.cat([vp.index_select(1, _st), vp.gather(1, _ix) * _g, vp],
                             1).transpose(1, 2)
         elif _pre is not None:
@@ -5704,7 +5830,10 @@ class HierarchicalMessagePassing(MessagePassing):
                          else gsel[1].index_select(0, _pre))
                 _g = torch.sigmoid(_gsrc).to(_vpre.dtype)
                 _vpre = _vpre * _g.view(1, -1, 1, 1)
-            k_s = torch.cat([kp.index_select(1, _pre), kp], 1).transpose(1, 2)
+            _kpre = kp.index_select(1, _pre)
+            if _nope:
+                _kpre = self._far_keys(_kpre, spec["levels"].index_select(0, _pre))
+            k_s = torch.cat([_kpre, kp], 1).transpose(1, 2)
             v_s = torch.cat([_vpre, vp], 1).transpose(1, 2)
         elif _tier_rows is not None:
             # Permuted layout PLUS a contiguous tier strip in front of K/V. Queries are
@@ -5956,6 +6085,9 @@ class HierarchicalMessagePassing(MessagePassing):
                 kp.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep
             ).view(B, num_nodes, self.num_heads, self.head_dim)
         elif hasattr(self, "rotary_pos_enc") and pos is not None:
+            _fnd = int(getattr(self, "local_pack_far_nope_dims", 0) or 0)
+            if _fnd:
+                qp_un, kp_un = qp, kp
             pos_rep = pos.view(1, num_nodes).expand(B, num_nodes).reshape(-1)
             qp = self.rotary_pos_enc.apply_rotary_pos_emb(
                 qp.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep
@@ -5963,6 +6095,19 @@ class HierarchicalMessagePassing(MessagePassing):
             kp = self.rotary_pos_enc.apply_rotary_pos_emb(
                 kp.reshape(B * num_nodes, self.num_heads, self.head_dim), pos_rep
             ).view(B, num_nodes, self.num_heads, self.head_dim)
+            if _fnd:
+                # PARTIAL RoPE (local_pack_far_nope_dims): the last _fnd dims -- the slowest
+                # pairs -- stay unrotated for every row. RoPE is pairwise, so restoring the
+                # tail is exactly "rotate only the head". Far keys drop the rotated part in
+                # _flex_union_attn (_far_keys).
+                qp = torch.cat([qp[..., :-_fnd], qp_un[..., -_fnd:]], -1)
+                kp = torch.cat([kp[..., :-_fnd], kp_un[..., -_fnd:]], -1)
+                if str(getattr(self, "local_pack_far_bias", "off")) != "off":
+                    # reserved bias dim (the last one): q = 1 for every query, k = 0 for every
+                    # row; _far_keys writes sqrt(d) * b into far keys only, so band keys score
+                    # exactly as without it and each far key gets + b.
+                    qp = torch.cat([qp[..., :-1], torch.ones_like(qp[..., -1:])], -1)
+                    kp = torch.cat([kp[..., :-1], torch.zeros_like(kp[..., -1:])], -1)
         # DropNode (hier_node_dropout), applied after the level tag so a dropped row
         # contributes nothing at all, including its level_v_emb. Built once here and reused
         # by the coarse lane below so the same node is dropped in both paths; vp also feeds
@@ -6038,6 +6183,10 @@ class HierarchicalMessagePassing(MessagePassing):
                             continue
                         # Permanent opt-out only for real-graph failures; a tiny-graph
                         # hiccup (generation prefixes) must not poison the training path.
+                        if int(getattr(self, "local_pack_far_nope_dims", 0) or 0):
+                            # no other path separates far keys from the band: never degrade
+                            raise RuntimeError("local_pack_far_nope_dims: flex-union failed and "
+                                               "there is no fallback for the far NoPE path") from exc
                         if int(spec["flex_perm"].numel()) >= 512:
                             if bool(getattr(self, "local_pack_flex_strict", False)):
                                 raise RuntimeError(
@@ -6055,6 +6204,9 @@ class HierarchicalMessagePassing(MessagePassing):
                                 "fallback for this call only, NOT a permanent opt-out")
                         break
             else:
+                if int(getattr(self, "local_pack_far_nope_dims", 0) or 0):
+                    raise RuntimeError("local_pack_far_nope_dims needs every level queried "
+                                       "(flex-union path)")
                 self._local_pack_log_once("flex union needs all levels queried; merge/additive fallback")
 
         if getattr(self, "hier_level_qkv", "shared") != "shared":
@@ -7086,6 +7238,8 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_gumbel_norm: str = "raw",  # head: raw | chunk (noise scaled per chunk)
         local_pack_global_region_cap: int = 0,  # head: max picks per region (0 = off)
         local_pack_global_region_level: int = 2,  # head: level defining regions
+        local_pack_far_nope_dims: int = 0,  # far keys: unrotated tail dims only (0 = off)
+        local_pack_far_bias: str = "off",  # off | level: true per-level logit bias on far keys
         hier_node_dropout: float = 0.0,  # DropNode on coarse rows (value-side, L0 exempt)
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,  # overrides the scalar
         local_window_dropout: float = 0.0,  # DropNode on L0 rows -- forces use of the hierarchy
@@ -7206,6 +7360,8 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_gumbel_norm=local_pack_global_gumbel_norm,
             local_pack_global_region_cap=local_pack_global_region_cap,
             local_pack_global_region_level=local_pack_global_region_level,
+            local_pack_far_nope_dims=local_pack_far_nope_dims,
+            local_pack_far_bias=local_pack_far_bias,
             hier_node_dropout=hier_node_dropout,
             hier_node_dropout_per_level=hier_node_dropout_per_level,
             local_window_dropout=local_window_dropout,

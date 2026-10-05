@@ -52,17 +52,50 @@ Other changes this cycle: `global_nominate_vec` and `nom_boost_u` routed to Adam
 
 ## 3. Plan (ordered)
 
-### Step 1 — partial RoPE on the far path (borrowed: HSA NoPE)  [highest priority]
-Why: HSA's ablation — NoPE on the long-range path is what lets training-short / running-long
-work. Pinball's static block and slots are RoPE-rotated at token positions, so far matches
-depend on distances unseen in training.
-Design: split each head's dims into `rope_dims` (rotated) and `nope_dims`. Local band keys
-use all dims as now. For static-block and slot keys, zero the rotated part (or project it
-out), so their score is q_nope . k_nope — position-free. u moves into the NoPE dims (no
-rotation needed; drop the RoPE-of-u code in that mode). Knob e.g.
-`local_pack_far_nope_dims: 0` (0 = off, bit-identical). Applies only on the flex prefix layout.
-Check: bit-identity when off; dense reference for mixed rotated/unrotated keys; causality;
-then a length-transfer eval (train 4096, evaluate 8192/16384 PPL per bucket) vs the q arm.
+Order revised 2026-10-04: step 0 (LapPE) first, then block selection (step 2), then decide on
+step 3 from step 2's never/>2k buckets; partial RoPE builds on what LapPE shows.
+
+### Step 0 — graph LapPE (running first)
+`lap_pe_k: 32`, config `pinball_wikitext_pack_glob400_l0coarse_l0sel_q_lappe_d384_4k.yaml`,
+control = the l0coarse q run (to ~ep51). `_hier_lap_pe_cpu` / `_hier_lap_pe_geometry`
+(cached_batch model): eigenvectors of the hierarchy membership graph (L0 chain +
+`_create_next_level`'s parent-child edges), random-walk form, unit RMS, sign-fixed, computed
+ONCE at max_seq_len and sliced by (level, local index) for any shorter graph, so generation
+prefixes see their training codes. Absolute, level-consistent position in the residual stream,
+so far keys keep a "where" under a NoPE far path. With a cos-only basis, q.k on those dims
+contains a cos w(a-b) relative term plus an absolute one.
+It replaced the old PyG path in `enhanced_hierarchical_flow_gat.py`, which WAS live (the
+Enhanced forward) when lap_pe_k > 0. That path had AR-filtered directed edges, unit-norm
+columns, unseeded signs and a per-length basis; no config set it. KV-cache decode is guarded
+off with lap_pe.
+Found on the way, and fixed for all arms: the global block chose its levels from the current
+sizes, so a prefix under ~1830 tokens pulled L1 into the static block. Uncompiled generation
+was off by 0.50; compiled generation pads to max_seq_len and was never affected. Membership is
+now decided at max_seq_len, as `_resolve_global_tier` already did; it is bit-identical at the
+training length. Verified: `scripts/nomination/verify_lappe.py`.
+
+### Step 1 — partial RoPE on the far path + far-key bias (= steps 1 and 4 together)  [BUILT 2026-10-04]
+Result of step 0 first: LapPE alone was neutral. Best 26.43 vs 26.42; ep43-51 ratio ~1.000.
+At eval, removing its position term improved PPL 0.6%, and the projection shrank
+0.068 -> 0.057: redundant while every key is rotated. Stopped at ep56.
+Knobs (layer, all default off, bit-identical vs HEAD when off):
+- `local_pack_far_nope_dims: 32`: the last 32 head dims (the 16 slowest pairs, <= 0.01
+  rad/token) stay unrotated for every packed row. Far keys (static block + slots) get their
+  rotated dims zeroed, so a far score is q_nope . k_nope. Static rows inside the band are read
+  via the band (rotated); the static clause drops them, giving exactly-once keys. u lives in
+  the unrotated dims, unrotated. Supported on the static-block prefix (levels) and on static +
+  per-sequence chunk slots; any other branch raises. There is no additive fallback (it raises).
+- `local_pack_far_bias: level`: reserved last dim (q=1, band k=0, far k=sqrt(d)*b[h, level]).
+  This is a true per-level logit bias on far keys, init 0, AdamW (`far_level_bias`). It is a
+  one-hot matmul: the index lookup's backward (atomics onto a 6x4 table) cost 3x step time.
+  The entropy term (HiLS) is not built: the pooling here gives no attention weights.
+- `lap_pe_bias: false` + RNG-isolated lap_pe_proj: a clean LapPE A/B (0 params differ at init).
+Arms: `..._q_nope_d384_4k.yaml` (nope + bias) vs the q control; `..._q_nope_lappe_d384_4k.yaml`
+(+ clean LapPE) vs the nope arm. Probe: `scripts/nomination/verify_farnope.py ND BIAS`.
+Compiled step time: 7.29 vs 7.06 it/s.
+Open: nope dims vs bias are not separated (one arm has both, as asked). A nope-only arm
+answers which part matters, if needed. Full far NoPE (all 64 dims) needs q in two copies,
+i.e. head dim 128 for the call (about 2x attention FLOPs); not built.
 
 ### Step 2 — block selection (borrowed: NSA/SSA/HSA contiguous chunks)
 Why: copying needs neighbours; the cap experiment showed isolated picks force a trade between
@@ -93,9 +126,24 @@ summaries also competing for slots this matters more.
 Design: per coarse row a content-dependent bias ~ log(#children) + learned entropy term from
 the pooling attention (`hier_pool_mode: attn` already computes child weights). Added to the
 row's key logit via a key-space term (like u) to avoid a score_mod. Knob off by default.
+Revised design (2026-10-04): the level-tag site (`local_pack_level_k_emb`, added pre-RoPE) is
+the place to write it, but today's tag is NOT a bias. Its score term is q.R(d)t_L, which
+depends on q and on the distance, and it is the same for every row of a level. To make it one:
+take one UNROTATED dim (needs step 1's partial RoPE), set q[d*] = const and
+k[d*] = b_L + beta*H_r, with b_L init log(span_L in tokens) and H_r the pooling entropy.
+That gives a true per-key bias at zero kernel cost. Diagnose first: the L1-row mass vs the
+summed mass of its children on existing checkpoints.
 Check: bit-identity off; ablate at eval; LONGCTX.
 
 ### Step 5 — PG19 long-context set (the paper result)
+CONFIGS READY 2026-10-04 (cluster, 4 GPUs), generated by `scripts/nomination/make_pg19_configs.py`
+from the WikiText arms, and checked at 16k by `scripts/nomination/smoke_pg19.py`:
+`pinball_pg19_16k_l0coarse_{nope, q, nope_noslots}.yaml` + `transformer_pg19_16k_d384.yaml`.
+The 2x2 design isolates NoPE (nope vs q) and nomination (nope vs nope_noslots). The hierarchy
+deepens to 5 coarse levels ([16,4,4,4,4]), so the 400 budget again holds 384 static rows
+(L4+L5); 3 levels would need 1536 rows per query. batch_size must be set per GPU (pinball:
+~20 GiB per 16k sequence, eager). The lc.py parser needs the 2k-8k / >8k buckets added before
+reading these logs.
 - 16k context, token-matched (16,384 tokens/step, batch 1), `longctx_diag_long_edges: [8192]`.
 - Arms: transformer d384; shared + nomination (best variant from steps 1-4); its plain parent
   (the missing control); optionally l0_coarse + nomination.
