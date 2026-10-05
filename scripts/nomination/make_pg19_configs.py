@@ -66,6 +66,10 @@ PINBALL_HDR = """# SELECTOR (slot arms): local_pack_global_select_impl stream + 
 #   same picks as the dense selector (bit-equal in eval/raw/prefix, verify_stream.py), linear;
 #   prefix = noise scaled by the spread at each row's activation chunk (was chunk: per chunk).
 #   16k x6 Blackwell: 146k -> 160k tok/s. The WikiText arms these derive from used chunk noise.
+# local_pack_global_nom_compile: true (slot arms): the selector runs as ONE compiled graph shared
+#   by all layers (training only). fp32 == eager ~1e-7; bf16 picks 98.6-99.9% equal (fused
+#   rounding; verify_nom_compile.py). 16k x6: l0_coarse 163.2k, shared 168.1k, transformer
+#   185.8k tok/s. NO eager fallback: a compile failure on a new GPU crashes the run (intended).
 # HIERARCHY AT 16k (pinball arms): compression_ratios [16,4,4,4,4] (was [16,4,4]) -> coarse
 #   levels 2048/1024/512/256/128 rows. local_pack_global_block 400 then holds L5+L4 = 384
 #   rows: the SAME static block size as L3+L2 at 4096, so the far cost per query stays
@@ -101,7 +105,8 @@ for arm, src in SRC.items():
         s = sub(s, "local_pack_global_gumbel_norm", "prefix   # noise scale at each row's activation chunk (stream-exact)")
         s = s.replace("local_pack_global_gumbel_norm: prefix   # noise scale at each row's activation chunk (stream-exact)",
                       "local_pack_global_gumbel_norm: prefix   # noise scale at each row's activation chunk (stream-exact)\n"
-                      "local_pack_global_select_impl: stream   # linear selector + fused nomination gather (+10% @16k)")
+                      "local_pack_global_select_impl: stream   # linear selector + fused nomination gather (+10% @16k)\n"
+                      "local_pack_global_nom_compile: true     # selector as one compiled graph (training); no eager fallback")
     if arm == "nope_noslots":
         # drop every slot/nomination knob (their validations require content selection);
         # the static block (local_pack_global_block) and far NoPE + bias stay
