@@ -22,7 +22,8 @@ WHAT = {
 }
 VER = {
     "nope": "71.6M params; static block 384 rows (L4+L5); 159 chunks x 256 slots; peak 19.9 GiB\n"
-            "#   (b1, eager fwd+bwd); flex 0 failed; causal p=12000 exact 0",
+            "#   (b1, eager fwd+bwd); flex 0 failed; causal p=12000 exact 0; stream selector == dense picks\n"
+            "#   (verify_stream.py @16k)",
     "q": "71.6M params; static block 384 rows; peak 20.3 GiB (b1, eager); flex 0 failed",
     "nope_noslots": "68.6M params; static block 384 rows, 0 slots; peak 17.9 GiB (b1, eager); flex 0\n"
                     "#   failed; causal p=12000 exact 0; levels-prefix far NoPE == dense reference (<= 4.8e-7,\n"
@@ -42,7 +43,11 @@ def sub(s, key, val, count=1):
     assert n == count, (key, n)
     return re.sub(pat, f"{key}: {val}", s, flags=re.M)
 
-COMMON_HDR = """# PG19 SETTINGS (all four arms identical):
+COMMON_HDR = """# WIDTH d384 (as the WikiText arms). Measured 16k x6 on the Blackwell, compiled, steady state:
+#   transformer 185k tok/s (84.9 GB); pinball NoPE + slots (stream selector) 160k (0.87x,
+#   70.7 GB); pinball no-slots 184k (0.99x, 62.3 GB). d768 gave the same ratio (0.82-0.87x at
+#   16k x4), so width does not buy speed here; d384 trains ~2x faster per token.
+# PG19 SETTINGS (all four arms identical):
 #   text_file ./data/pg19_train.txt -- the loader reads the token cache next to it
 #     (./data/pg19_train.pt, 24.5 GB int64, mmap). Copy BOTH, or it re-tokenises 11 GB of text.
 #   block_size 16384; val_split 0.01 (last 1% of train, ~30M tokens; 50 eval batches/epoch).
@@ -50,13 +55,18 @@ COMMON_HDR = """# PG19 SETTINGS (all four arms identical):
 #   num_epochs 200 = 3.3B tokens ~ one PG19 pass. batch_size: SET PER GPU (see below).
 #   longctx_diag_long_edges [8192] -> buckets never, <128, 128-511, 512-2k, 2k-8k, >8k.
 #   Report data/pg19_test.txt at the end.
-# BATCH: one 16k sequence of the pinball arm peaked at 20.9 GiB (eager fwd+bwd, bf16,
-#   Blackwell). Measure on the cluster GPU and set batch_size (and/or
+# BATCH: at d384, 16k, compiled: ~11.6 GB per sequence for pinball, ~13.9 GB for the
+#   transformer (batch 6 = 71 / 85 GB). Batch 1 was LAUNCH-BOUND for pinball (105k vs 146k tok/s
+#   at batch 4): use batch >= 4. Measure on the cluster GPU and set batch_size (and/or
 #   gradient_accumulation_steps) so all arms see the SAME tokens per optimizer step.
 # CHECK on every run: grep -ci "flex.*fail" <log> must be 0 (pinball arms). The far-NoPE
 #   arms raise instead of degrading; the q control could degrade silently to additive.
 """
-PINBALL_HDR = """# HIERARCHY AT 16k (pinball arms): compression_ratios [16,4,4,4,4] (was [16,4,4]) -> coarse
+PINBALL_HDR = """# SELECTOR (slot arms): local_pack_global_select_impl stream + gumbel_norm prefix (2026-10-05):
+#   same picks as the dense selector (bit-equal in eval/raw/prefix, verify_stream.py), linear;
+#   prefix = noise scaled by the spread at each row's activation chunk (was chunk: per chunk).
+#   16k x6 Blackwell: 146k -> 160k tok/s. The WikiText arms these derive from used chunk noise.
+# HIERARCHY AT 16k (pinball arms): compression_ratios [16,4,4,4,4] (was [16,4,4]) -> coarse
 #   levels 2048/1024/512/256/128 rows. local_pack_global_block 400 then holds L5+L4 = 384
 #   rows: the SAME static block size as L3+L2 at 4096, so the far cost per query stays
 #   constant (keeping 3 levels would need 1536 static rows per query -- quadratic in N).
@@ -86,6 +96,12 @@ for arm, src in SRC.items():
         s = sub(s, "local_attn_levels", "[0, 1, 2, 3, 4, 5]")
         s = sub(s, "local_attn_windows", "[16, 16, 16, 16, 16, 16]")
         s = sub(s, "local_attn_causal_levels", "[0, 1, 2, 3, 4, 5]")
+    if arm in ("nope", "q"):
+        # linear selector (2026-10-05): stream needs a per-row noise scale -> prefix
+        s = sub(s, "local_pack_global_gumbel_norm", "prefix   # noise scale at each row's activation chunk (stream-exact)")
+        s = s.replace("local_pack_global_gumbel_norm: prefix   # noise scale at each row's activation chunk (stream-exact)",
+                      "local_pack_global_gumbel_norm: prefix   # noise scale at each row's activation chunk (stream-exact)\n"
+                      "local_pack_global_select_impl: stream   # linear selector + fused nomination gather (+10% @16k)")
     if arm == "nope_noslots":
         # drop every slot/nomination knob (their validations require content selection);
         # the static block (local_pack_global_block) and far NoPE + bias stay
@@ -95,7 +111,7 @@ for arm, src in SRC.items():
                        s, count=1, flags=re.M)
         s = sub(s, "local_pack_global_select", "levels   # NO sparse slots: static block + window (control)")
     hdr = (f"# ============================================================================\n"
-           f"# PG19 @16k, d384 -- {WHAT[arm]} (2026-10-04).\n"
+           f"# PG19 @16k, d384 -- {WHAT[arm]} (2026-10-05).\n"
            f"# Derived from {src} (WikiText 4k: {WIKI[arm]}) by the PG19 rules below; nothing\n"
            f"# else differs.\n" + COMMON_HDR + (PINBALL_HDR if pin else "") +
            f"# VERIFIED @16k on the Blackwell (scripts/nomination/smoke_pg19.py): {VER[arm]}.\n"

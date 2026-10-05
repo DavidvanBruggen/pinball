@@ -225,7 +225,11 @@ class RotaryPositionalEncoding(nn.Module):
                 tuple(int(v) for v in positions.shape),
                 grid_key,
             )
-            if rope_log_key not in self._rope_runtime_logged_keys:
+            # Log-once is host bookkeeping: under torch.compile the logger call and the set
+            # mutation are graph breaks (3 per layer, and one RoPE frame fell back to eager
+            # entirely), so skip it while compiling. No effect on the math.
+            if (not torch.compiler.is_compiling()
+                    and rope_log_key not in self._rope_runtime_logged_keys):
                 if use_nd_rope:
                     logger.debug(
                         "[HMP:ROPE] using %dD axial RoPE mode=%s positions_shape=%s grid_shapes=%s",

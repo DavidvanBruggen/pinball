@@ -1,7 +1,11 @@
 # ============================================================================
-# PG19 @16k, d384 -- DENSE BASELINE: matched GPT-style transformer, d384, 12 layers, RoPE (2026-10-04).
+# PG19 @16k, d384 -- DENSE BASELINE: matched GPT-style transformer, d384, 12 layers, RoPE (2026-10-05).
 # Derived from transformer_wikitext_d384_4k.yaml (WikiText 4k: best 24.53 @ ep109) by the PG19 rules below; nothing
 # else differs.
+# WIDTH d384 (as the WikiText arms). Measured 16k x6 on the Blackwell, compiled, steady state:
+#   transformer 185k tok/s (84.9 GB); pinball NoPE + slots (stream selector) 160k (0.87x,
+#   70.7 GB); pinball no-slots 184k (0.99x, 62.3 GB). d768 gave the same ratio (0.82-0.87x at
+#   16k x4), so width does not buy speed here; d384 trains ~2x faster per token.
 # PG19 SETTINGS (all four arms identical):
 #   text_file ./data/pg19_train.txt -- the loader reads the token cache next to it
 #     (./data/pg19_train.pt, 24.5 GB int64, mmap). Copy BOTH, or it re-tokenises 11 GB of text.
@@ -10,8 +14,9 @@
 #   num_epochs 200 = 3.3B tokens ~ one PG19 pass. batch_size: SET PER GPU (see below).
 #   longctx_diag_long_edges [8192] -> buckets never, <128, 128-511, 512-2k, 2k-8k, >8k.
 #   Report data/pg19_test.txt at the end.
-# BATCH: one 16k sequence of the pinball arm peaked at 20.9 GiB (eager fwd+bwd, bf16,
-#   Blackwell). Measure on the cluster GPU and set batch_size (and/or
+# BATCH: at d384, 16k, compiled: ~11.6 GB per sequence for pinball, ~13.9 GB for the
+#   transformer (batch 6 = 71 / 85 GB). Batch 1 was LAUNCH-BOUND for pinball (105k vs 146k tok/s
+#   at batch 4): use batch >= 4. Measure on the cluster GPU and set batch_size (and/or
 #   gradient_accumulation_steps) so all arms see the SAME tokens per optimizer step.
 # CHECK on every run: grep -ci "flex.*fail" <log> must be 0 (pinball arms). The far-NoPE
 #   arms raise instead of degrading; the q control could degrade silently to additive.

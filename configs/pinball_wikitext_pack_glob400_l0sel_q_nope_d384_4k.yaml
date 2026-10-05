@@ -1,39 +1,28 @@
 # ============================================================================
-# PG19 @16k, d384 -- NOMINATION CONTROL: far NoPE + bias, static block + window only (no sparse slots) (2026-10-05).
-# Derived from pinball_wikitext_pack_glob400_l0coarse_l0sel_q_nope_d384_4k.yaml (WikiText 4k: (new arm)) by the PG19 rules below; nothing
-# else differs.
-# WIDTH d384 (as the WikiText arms). Measured 16k x6 on the Blackwell, compiled, steady state:
-#   transformer 185k tok/s (84.9 GB); pinball NoPE + slots (stream selector) 160k (0.87x,
-#   70.7 GB); pinball no-slots 184k (0.99x, 62.3 GB). d768 gave the same ratio (0.82-0.87x at
-#   16k x4), so width does not buy speed here; d384 trains ~2x faster per token.
-# PG19 SETTINGS (all four arms identical):
-#   text_file ./data/pg19_train.txt -- the loader reads the token cache next to it
-#     (./data/pg19_train.pt, 24.5 GB int64, mmap). Copy BOTH, or it re-tokenises 11 GB of text.
-#   block_size 16384; val_split 0.01 (last 1% of train, ~30M tokens; 50 eval batches/epoch).
-#   samples_per_epoch 1000 = 16.4M tokens/epoch (same tokens/epoch as the WikiText arms);
-#   num_epochs 200 = 3.3B tokens ~ one PG19 pass. batch_size: SET PER GPU (see below).
-#   longctx_diag_long_edges [8192] -> buckets never, <128, 128-511, 512-2k, 2k-8k, >8k.
-#   Report data/pg19_test.txt at the end.
-# BATCH: at d384, 16k, compiled: ~11.6 GB per sequence for pinball, ~13.9 GB for the
-#   transformer (batch 6 = 71 / 85 GB). Batch 1 was LAUNCH-BOUND for pinball (105k vs 146k tok/s
-#   at batch 4): use batch >= 4. Measure on the cluster GPU and set batch_size (and/or
-#   gradient_accumulation_steps) so all arms see the SAME tokens per optimizer step.
-# CHECK on every run: grep -ci "flex.*fail" <log> must be 0 (pinball arms). The far-NoPE
-#   arms raise instead of degrading; the q control could degrade silently to additive.
-# SELECTOR (slot arms): local_pack_global_select_impl stream + gumbel_norm prefix (2026-10-05):
-#   same picks as the dense selector (bit-equal in eval/raw/prefix, verify_stream.py), linear;
-#   prefix = noise scaled by the spread at each row's activation chunk (was chunk: per chunk).
-#   16k x6 Blackwell: 146k -> 160k tok/s. The WikiText arms these derive from used chunk noise.
-# HIERARCHY AT 16k (pinball arms): compression_ratios [16,4,4,4,4] (was [16,4,4]) -> coarse
-#   levels 2048/1024/512/256/128 rows. local_pack_global_block 400 then holds L5+L4 = 384
-#   rows: the SAME static block size as L3+L2 at 4096, so the far cost per query stays
-#   constant (keeping 3 levels would need 1536 static rows per query -- quadratic in N).
-#   Level lists extended to 6 levels: num_layers, internal_cycles, local_pack_query_levels,
-#   local_attn_levels/windows/causal_levels. Slot budget (256 per 128-row chunk) and the
-#   ~128-token window unchanged (HSA, 2510.17196: fixed K, small window).
-# VERIFIED @16k on the Blackwell (scripts/nomination/smoke_pg19.py): 68.6M params; static block 384 rows, 0 slots; peak 17.9 GiB (b1, eager); flex 0
-#   failed; causal p=12000 exact 0; levels-prefix far NoPE == dense reference (<= 4.8e-7,
-#   scripts/nomination/verify_levels_nope.py).
+# TEXT ARM @4096, d384, SHARED WEIGHTS: FAR-PATH PARTIAL RoPE + FAR-KEY BIAS + LINEAR SELECTOR
+# (2026-10-05). UPDATED 2026-10-05 after a 3-epoch dense-selector start (its checkpoints stay in
+# ./pinball/text_glob400_l0sel_q_nope_d384_4k/, log text_glob400_l0sel_q_nope_d384_4k.log):
+#     local_pack_global_select_impl: stream   (linear selector + fused nomination gather)
+#     local_pack_global_gumbel_norm: prefix   (stream-exact noise scale; was chunk)
+#     checkpoint_dir -> ..._l0sel_q_nope_stream_d384_4k
+#   Same picks as the dense selector (bit-equal, verify_stream.py); 16k x6: 146k -> 160k tok/s
+#   (l0_coarse, 16k x6 compiled). (A claimed 1.40x for shared d768 was a parser error: 0.87x.)
+# UPDATED 2026-10-05 (speed; same math up to compiled bf16 rounding): local_pack_global_nom_compile: true. With the code-side
+#   fixes of the same day (foreach BatchedMuon, bit-identical; RoPE log-once graph break removed)
+#   this arm goes 118.9k -> 147.9k tok/s at 4k x4 (+24%; GPU busy 67% -> 73%). 16k x6: shared
+#   168.1k, l0_coarse 163.2k, transformer 185.8k (0.90x / 0.88x).
+# Derived from pinball_wikitext_pack_glob400_l0coarse_l0sel_q_nope_d384_4k.yaml by:
+#     hier_level_qkv: shared   (was l0_coarse)
+#     hier_level_ffn: shared   (was l0_coarse)
+#     checkpoint_dir
+# Nothing else differs. PARAMETER-PARITY ARM: the l0_coarse nope arm has 46.12M live
+# non-embedding params vs the transformer's 22.84M (2.0x; dead 3.36M excluded) -- tokens and
+# coarse rows get separate Q/K/V + FFN. This arm shares them (~25.8M live non-emb, like the
+# shared z/q arms). Controls: the shared q arm (logs/text_glob400_l0sel_q_384.log, same config
+# minus far NoPE + bias) and the transformer (logs/text_transformer_wikitext_d384_4k.log).
+# History to beat: the shared z arm led early, hit parity ~ep95, lost by ep110-119 (1.012).
+# The l0_coarse nope arm: 0.946 overall / 0.922 512-2k / 0.864 >2k vs the transformer
+# (ep100-119), best 19.89 @ ep275.
 # SCORES: (none yet)
 # ============================================================================
 # ---- parent header (history) ----
@@ -315,9 +304,9 @@ modality: text
 tokenizer_name: gpt2
 
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
-text_file: ./data/pg19_train.txt   # + ./data/pg19_train.pt (token cache) alongside
-block_size: 16384
-batch_size: 4                      # SET PER GPU: ~21 GiB per 16k sequence (pinball, eager)
+text_file: /home/david/Projects/hgt_geomet/proj-oc/hierarchical-graph-transformer/wikitext_103_raw/wikitext_combined.txt #./data/pg19_train.txt
+block_size: 4096 #131072 #196704 #8196 #16384 #32768 #65536 #131072 #262144 #196704 #1024
+batch_size: 4
 val_split: 0.01
 
 # Training
@@ -336,8 +325,8 @@ muon_adjust_lr_fn: match_rms_adamw
 # Epochs: an epoch is `samples_per_epoch` samples; validation + a generation follow each.
 # Set num_epochs to drive the run by epochs (it then sets the step budget); otherwise the
 # epoch count is derived from max_steps. (CLI: --epochs / --samples-per-epoch.)
-num_epochs: 200                       # ~3.3B tokens ~ one PG19 pass
-samples_per_epoch: 1000              # 16.4M tokens/epoch
+num_epochs: 300 #20
+samples_per_epoch: 3906 #651 #15625 #3125 #25000 #782 #25000
 gradient_accumulation_steps: 1   # accumulate grads over N batches before an optimizer step
 gradient_checkpointing: false    # trade compute for memory in the refinement stack
 # Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
@@ -357,7 +346,6 @@ chunked_ce_seq_chunk: 64
 # no extra forward. The split that matters: <128 (inside local window) vs >=128 (needs the
 # hierarchy). 0 = off. longctx_diag_max_seqs caps sequences scanned per run (default 64).
 longctx_diag_every: 1
-longctx_diag_long_edges: [8192]   # adds 2k-8k and >8k buckets
 # longctx_diag_max_seqs: 64
 # Periodic generation / checkpointing (in training batches; 0 = per-epoch / end only).
 # (CLI: --generate-every / --save-every / --checkpoint-dir.)
@@ -365,7 +353,7 @@ generate_every: 0
 # Generation prompt/continuation lengths. gen_prompt_tokens defaults to min(64, block_size//2);
 # raise it for long-range PG19 conditioning (must be <= block_size). Leave sample_prompt unset
 # so the prompt is sampled from held-out val text rather than a fixed short string.
-gen_prompt_tokens: 1024
+gen_prompt_tokens: 512
 gen_max_new_tokens: 512
 save_every: 0
 #checkpoint_dir: ./pinball/pooled_proj_test_stemwarm_hqd/checkpoints
@@ -378,7 +366,7 @@ save_every: 0
 # far reads via the midpoint cross-query (L3 memory); coarse objectives via recon aux + predaux.
 # Graph construction stays intact, so dynamic edges (HQD / zipper) remain fully available —
 # they inject ephemeral edges at attention time on top of the (now self-loop-only) static set.
-checkpoint_dir: ./pinball/pg19_16k_nope_noslots/checkpoints
+checkpoint_dir: ./pinball/text_glob400_l0sel_q_nope_stream_d384_4k/checkpoints
 #log_every:             # emit the Step/EFF/Cache log lines every N steps (CLI: --log-every)
 # Resume: restores weights + optimizer + LR schedule + step/epoch counters and continues.
 # resume_from: ./checkpoints/pinball_final.pt   # (CLI: --resume)
@@ -433,15 +421,15 @@ num_heads: 6 #12 (parent); head_dim stays 64
 attn_sparse_qk_mult: 1.0    # try 2.0 to lift cross-level routing rank 64 -> 128
 attn_sparse_v_mult: 1.0     # try 2.0 / 4.0 for fat-V (both sparse paths)
 num_refinement_layers: 12 #12
-num_layers: [0, 0, 0, 0, 0, 0]
-internal_cycles: [0, 0, 0, 0, 0, 0]
+num_layers: [0, 0, 0, 0]
+internal_cycles: [0, 0, 0, 0]
 refinement_style: unified
 unified_refinement_cycles: 1
 l0_cycles: 0
 iterative_refinement_cycles: 0
 local_connectivity_window_size: 0 # set so graph windows are made dense (k=window_size*2+1) for local connectivity. 0 = sparse only.
-compression_ratios: [16, 4, 4, 4, 4]   # 16k: +2 coarse levels (see header)
-overlap_ratios: [0.5, 0.5, 0.5, 0.5, 0.5]
+compression_ratios: [16, 4, 4]
+overlap_ratios: [0.5, 0.5, 0.5]
 # Coarse-node seeding (the ORIGINAL design, restored). mask = coarse nodes start as mask
 # embeddings and content must climb the hierarchy through the refinement layers (measured:
 # L3 only fills at layer 11 of 12 — the summary forms too late to be read back). pooled =
@@ -564,7 +552,7 @@ xq_nominate_read_sink: true
 # Fall back to query_levels [0] to keep coarse laterals untouched (+2% cost instead).
 local_pack_cross_level: true
 local_pack_window: 156            # REGULAR window (~128 L0 tokens), NOT the w16 starve
-local_pack_query_levels: [0, 1, 2, 3, 4, 5]   # MUST cover every level
+local_pack_query_levels: [0, 1, 2, 3]
 # Level tags for the mixed softmax: flash can't take the scatter path's level-pair logit
 # bias, so zero-init per-level per-head embeddings are added to the RoPE'd K (q·e_level =
 # query-dependent level bias) and to V (output carries its source level). Zero init =
@@ -758,8 +746,8 @@ hqd_window_bag_routing: per_position # per_position (causal) | global (non-causa
 # global: the shared bag size per level (0 -> 16).
 hqd_window_bag_topk: 0
 
-local_attn_levels: [0, 1, 2, 3, 4, 5]
-local_attn_windows: [16, 16, 16, 16, 16, 16]
+local_attn_levels: [0, 1, 2, 3]
+local_attn_windows: [16, 16, 16, 16]
 # ^^ MUST match l0_local_window. local_attn_windows OVERRIDES l0_local_window whenever
 # len(local_attn_windows) == len(local_attn_levels) (hierarchical_flow_gat_cached_batch.py
 # :3782). It was [128,128,128,128] here until 2026-09-19, so the WINDOW-ONLY arm silently
@@ -769,7 +757,7 @@ local_attn_windows: [16, 16, 16, 16, 16, 16]
 # Inert in the hierarchy arm (local_pack_query_levels covers every level, so the packed
 # window replaces per-level local attention); active in the window-only arm, which leaves
 # the packed path entirely via local_pack_cross_level: false.
-local_attn_causal_levels: [0, 1, 2, 3, 4, 5]
+local_attn_causal_levels: [0, 1, 2, 3]
 l0_local_window: 16
 
 # Attention-derived edge state.
@@ -958,22 +946,25 @@ hier_pool_blend_init: 1.0          # 1.0 = pure attention pool; blend stays lear
 
 # ---- d384 set (see header) ----
 muon_batched: true             # same update, Newton-Schulz batched per shape
-hier_level_qkv: l0_coarse
-hier_level_ffn: l0_coarse
+hier_level_qkv: shared      # parameter-parity arm (parent: l0_coarse)
+hier_level_ffn: shared      # parameter-parity arm (parent: l0_coarse)
 # CONTENT-SELECTED L0 READS (see header): static L3+L2 block kept, + 256 L0 rows per 128-row
 # query chunk, picked per sequence every call.
-local_pack_global_select: levels   # NO sparse slots: static block + window (control)
-# local_pack_global_coarse: (removed: no slots in this arm)
-# local_pack_global_chunk: (removed: no slots in this arm)
-# local_pack_global_l0_budget: (removed: no slots in this arm)
-# local_pack_global_logit: (removed: no slots in this arm)
-# local_pack_global_score_bias: (removed: no slots in this arm)
-# local_pack_global_nominator: (removed: no slots in this arm)
-# local_pack_global_candidates: (removed: no slots in this arm)
-# local_pack_global_gumbel: (removed: no slots in this arm)
-# local_pack_global_nom_gate: (removed: no slots in this arm)
-# local_pack_global_boost: (removed: no slots in this arm)
-# local_pack_global_gumbel_norm: (removed: no slots in this arm)
+local_pack_global_select: content
+local_pack_global_coarse: levels   # content (default) would REPLACE the static block
+local_pack_global_chunk: 128
+local_pack_global_l0_budget: 256
+local_pack_global_logit: true
+local_pack_global_score_bias: true
+local_pack_global_nominator: head   # hierarchy nominates (see header)
+local_pack_global_candidates: all   # L1 summaries + L0 tokens compete for the slots
+local_pack_global_gumbel: 1.0       # Gumbel top-k exploration, training only
+local_pack_global_nom_gate: zscore  # gate = sigmoid(z + b_layer), decoupled from the ranking
+local_pack_global_boost: key        # query-conditioned boost via the slot keys (no detached logit)
+local_pack_global_gumbel_norm: prefix   # stream-exact noise scale (was chunk)
+local_pack_global_select_impl: stream   # linear selector + fused nomination gather
+local_pack_global_nom_compile: true     # selector as ONE compiled graph (training): 4k x4 141.1k vs
+                                        # 125.3k eager; bf16 picks 98.6-99.9% equal to eager (verify_nom_compile.py)
 local_pack_far_nope_dims: 32   # far keys: unrotated tail only (see header)
 local_pack_far_bias: level     # true per-level logit bias on far keys
 

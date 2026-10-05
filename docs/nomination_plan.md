@@ -153,6 +153,18 @@ reading these logs.
 - Val = last 1% of the train file; report `data/pg19_test.txt` at the end.
 
 ### Scaling fix needed before 32k+
+DONE 2026-10-05 as `local_pack_global_select_impl: stream` (default `dense`, bit-identical):
+activation-chunk geometry; prefix-sum gate stats; running top-K over groups of 16 chunks,
+exact for a fixed per-row key; plus ONE fused gather of the nomination heads' input rows
+(the per-level index_selects cost 151 full-size fp32 grad adds + 141 fills per step). It
+needs `gumbel_norm: raw|prefix`: the new `prefix` scales each row's noise by the spread at
+its activation chunk, which is causal and scale-invariant; `chunk` is not fixed per row.
+Verified (`scripts/nomination/verify_stream.py`): picks bit-equal to dense in eval, raw and
+prefix training at 4k and 16k; gates/grads <= 7e-7; the model diff at 16k sits at dense's
+own noise floor (1.56e-3 vs 1.55e-3 from 7e-7 gate noise); causal exact.
+16k x6 compiled: 146k -> 160k tok/s (+10%; transformer 185k, no slots 184k).
+Remaining slot overhead ~78 ms/step, spread across the flex kernel, gathers and fusions;
+the next lever is storing slots once (not per tile).
 The per-chunk selection tensors are [B, nch, n] (quadratic: ~50 MB/layer at 32k, worse beyond).
 Replace with a tiled/streaming top-K (process chunks in groups; the allowed set is a prefix
 per chunk, so a running top-K over row blocks works) before any >32k run.

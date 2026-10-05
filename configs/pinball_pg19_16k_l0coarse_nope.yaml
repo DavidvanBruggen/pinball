@@ -1,7 +1,11 @@
 # ============================================================================
-# PG19 @16k, d384 -- MAIN ARM: far NoPE + far-key bias + hierarchy-nominated sparse slots (2026-10-04).
+# PG19 @16k, d384 -- MAIN ARM: far NoPE + far-key bias + hierarchy-nominated sparse slots (2026-10-05).
 # Derived from pinball_wikitext_pack_glob400_l0coarse_l0sel_q_nope_d384_4k.yaml (WikiText 4k: 0.947 overall / 0.910 512-2k / 0.860 >2k vs the transformer (ep54-63)) by the PG19 rules below; nothing
 # else differs.
+# WIDTH d384 (as the WikiText arms). Measured 16k x6 on the Blackwell, compiled, steady state:
+#   transformer 185k tok/s (84.9 GB); pinball NoPE + slots (stream selector) 160k (0.87x,
+#   70.7 GB); pinball no-slots 184k (0.99x, 62.3 GB). d768 gave the same ratio (0.82-0.87x at
+#   16k x4), so width does not buy speed here; d384 trains ~2x faster per token.
 # PG19 SETTINGS (all four arms identical):
 #   text_file ./data/pg19_train.txt -- the loader reads the token cache next to it
 #     (./data/pg19_train.pt, 24.5 GB int64, mmap). Copy BOTH, or it re-tokenises 11 GB of text.
@@ -10,11 +14,16 @@
 #   num_epochs 200 = 3.3B tokens ~ one PG19 pass. batch_size: SET PER GPU (see below).
 #   longctx_diag_long_edges [8192] -> buckets never, <128, 128-511, 512-2k, 2k-8k, >8k.
 #   Report data/pg19_test.txt at the end.
-# BATCH: one 16k sequence of the pinball arm peaked at 20.9 GiB (eager fwd+bwd, bf16,
-#   Blackwell). Measure on the cluster GPU and set batch_size (and/or
+# BATCH: at d384, 16k, compiled: ~11.6 GB per sequence for pinball, ~13.9 GB for the
+#   transformer (batch 6 = 71 / 85 GB). Batch 1 was LAUNCH-BOUND for pinball (105k vs 146k tok/s
+#   at batch 4): use batch >= 4. Measure on the cluster GPU and set batch_size (and/or
 #   gradient_accumulation_steps) so all arms see the SAME tokens per optimizer step.
 # CHECK on every run: grep -ci "flex.*fail" <log> must be 0 (pinball arms). The far-NoPE
 #   arms raise instead of degrading; the q control could degrade silently to additive.
+# SELECTOR (slot arms): local_pack_global_select_impl stream + gumbel_norm prefix (2026-10-05):
+#   same picks as the dense selector (bit-equal in eval/raw/prefix, verify_stream.py), linear;
+#   prefix = noise scaled by the spread at each row's activation chunk (was chunk: per chunk).
+#   16k x6 Blackwell: 146k -> 160k tok/s. The WikiText arms these derive from used chunk noise.
 # HIERARCHY AT 16k (pinball arms): compression_ratios [16,4,4,4,4] (was [16,4,4]) -> coarse
 #   levels 2048/1024/512/256/128 rows. local_pack_global_block 400 then holds L5+L4 = 384
 #   rows: the SAME static block size as L3+L2 at 4096, so the far cost per query stays
@@ -23,7 +32,8 @@
 #   local_attn_levels/windows/causal_levels. Slot budget (256 per 128-row chunk) and the
 #   ~128-token window unchanged (HSA, 2510.17196: fixed K, small window).
 # VERIFIED @16k on the Blackwell (scripts/nomination/smoke_pg19.py): 71.6M params; static block 384 rows (L4+L5); 159 chunks x 256 slots; peak 19.9 GiB
-#   (b1, eager fwd+bwd); flex 0 failed; causal p=12000 exact 0.
+#   (b1, eager fwd+bwd); flex 0 failed; causal p=12000 exact 0; stream selector == dense picks
+#   (verify_stream.py @16k).
 # SCORES: (none yet)
 # ============================================================================
 # ---- parent header (history) ----
@@ -963,7 +973,8 @@ local_pack_global_candidates: all   # L1 summaries + L0 tokens compete for the s
 local_pack_global_gumbel: 1.0       # Gumbel top-k exploration, training only
 local_pack_global_nom_gate: zscore  # gate = sigmoid(z + b_layer), decoupled from the ranking
 local_pack_global_boost: key        # query-conditioned boost via the slot keys (no detached logit)
-local_pack_global_gumbel_norm: chunk  # exploration fixed in units of each chunk's weight spread
+local_pack_global_gumbel_norm: prefix   # noise scale at each row's activation chunk (stream-exact)
+local_pack_global_select_impl: stream   # linear selector + fused nomination gather (+10% @16k)
 local_pack_far_nope_dims: 32   # far keys: unrotated tail only (see header)
 local_pack_far_bias: level     # true per-level logit bias on far keys
 

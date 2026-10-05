@@ -383,6 +383,8 @@ def build_pinball_model(
         local_pack_global_nom_gate=str(getattr(args, "local_pack_global_nom_gate", "raw") or "raw"),
         local_pack_global_boost=str(getattr(args, "local_pack_global_boost", "logit") or "logit"),
         local_pack_global_gumbel_norm=str(getattr(args, "local_pack_global_gumbel_norm", "raw") or "raw"),
+        local_pack_global_select_impl=str(getattr(args, "local_pack_global_select_impl", "dense") or "dense"),
+        local_pack_global_nom_compile=bool(getattr(args, "local_pack_global_nom_compile", False)),
         local_pack_far_nope_dims=int(getattr(args, "local_pack_far_nope_dims", 0) or 0),
         local_pack_far_bias=str(getattr(args, "local_pack_far_bias", "off") or "off"),
         lap_pe_bias=bool(getattr(args, "lap_pe_bias", True)),

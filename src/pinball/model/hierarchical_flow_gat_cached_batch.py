@@ -3010,7 +3010,9 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_nom_dim: int = 64,        # head only: bilinear nomination width
         local_pack_global_nom_gate: str = "raw",    # head only: raw | zscore (see the layer)
         local_pack_global_boost: str = "logit",     # head only: logit | key (see the layer)
-        local_pack_global_gumbel_norm: str = "raw", # head only: raw | chunk (see the layer)
+        local_pack_global_gumbel_norm: str = "raw", # head only: raw | chunk | prefix (see the layer)
+        local_pack_global_select_impl: str = "dense",  # head only: dense | stream (see the layer)
+        local_pack_global_nom_compile: bool = False,  # stream only: torch.compile the selector
         local_pack_far_nope_dims: int = 0,  # far keys (global block + slots) unrotated tail only; 0 = off
         local_pack_far_bias: str = "off",   # off | level: per-level logit bias on far keys (see the layer)
         lap_pe_bias: bool = True,           # lap_pe_proj bias; False for a clean A/B (no constant offset)
@@ -3696,6 +3698,8 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_nom_gate = str(local_pack_global_nom_gate or "raw").lower()
         self.local_pack_global_boost = str(local_pack_global_boost or "logit").lower()
         self.local_pack_global_gumbel_norm = str(local_pack_global_gumbel_norm or "raw").lower()
+        self.local_pack_global_select_impl = str(local_pack_global_select_impl or "dense").lower()
+        self.local_pack_global_nom_compile = bool(local_pack_global_nom_compile)
         self.local_pack_far_nope_dims = max(0, int(local_pack_far_nope_dims or 0))
         self.local_pack_far_bias = str(local_pack_far_bias or "off").lower()
         self.lap_pe_bias = bool(lap_pe_bias)
@@ -4553,6 +4557,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
                         local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
+                        local_pack_global_select_impl=str(getattr(self, "local_pack_global_select_impl", "dense")),
+                        local_pack_global_nom_compile=bool(getattr(self, "local_pack_global_nom_compile", False)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
@@ -4677,6 +4683,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
                         local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
+                        local_pack_global_select_impl=str(getattr(self, "local_pack_global_select_impl", "dense")),
+                        local_pack_global_nom_compile=bool(getattr(self, "local_pack_global_nom_compile", False)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
