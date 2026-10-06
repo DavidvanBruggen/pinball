@@ -849,7 +849,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
             for lvl in range(1, len(level_sizes)):
                 n = level_sizes[lvl]
                 if self.input_mode == "tokens" and getattr(self, "upper_init", "mask") in ("mask", "pooled"):
-                    mask_vec = self.token_embedding(torch.tensor([self.mask_token_id], device=tok_emb.device))
+                    mask_vec = self.token_embedding(self._mask_id_tensor(tok_emb.device))
                     xs.append(mask_vec.repeat(n, 1))
                 else:
                     xs.append(torch.zeros(n, self.hidden_dim, device=tok_emb.device))
@@ -2002,7 +2002,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 for lvl in range(1, len(level_sizes)):
                     n = level_sizes[lvl]
                     if self.input_mode == "tokens" and self.upper_init in ("mask", "pooled"):
-                        mask_vec = self.token_embedding(torch.tensor([self.mask_token_id], device=device))
+                        mask_vec = self.token_embedding(self._mask_id_tensor(device))
                         x_cat.append(mask_vec.repeat(n, 1))
                     else:
                         x_cat.append(torch.zeros(n, self.hidden_dim, device=device))
@@ -2011,7 +2011,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
                 if ae_slice != (0, 0) and len(level_sizes) >= 3:
                     for n in (level_sizes[0], level_sizes[1], level_sizes[2]):
                         if self.input_mode == "tokens" and self.upper_init in ("mask", "pooled"):
-                            mask_vec = self.token_embedding(torch.tensor([self.mask_token_id], device=device))
+                            mask_vec = self.token_embedding(self._mask_id_tensor(device))
                             x_cat.append(mask_vec.repeat(int(n), 1))
                         else:
                             x_cat.append(torch.zeros(int(n), self.hidden_dim, device=device))
@@ -3175,7 +3175,7 @@ class EnhancedHierarchicalFlowGAT(HierarchicalFlowGAT):
 
         # Match the normal full-context path for initial higher-level slots when configured.
         if self.input_mode == "tokens" and getattr(self, "upper_init", "mask") in ("mask", "pooled") and level_offsets.numel() > 2:
-            mask_vec = self.token_embedding(torch.tensor([self.mask_token_id], device=device)).to(dtype=dtype)
+            mask_vec = self.token_embedding(self._mask_id_tensor(device)).to(dtype=dtype)
             upper_start = int(level_offsets[1].item())
             if upper_start < num_nodes:
                 x[:, upper_start:, :] = mask_vec.view(1, 1, -1)

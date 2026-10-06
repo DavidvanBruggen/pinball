@@ -14,6 +14,7 @@ def rep(n, ok, d=""):
 def mk(impl, norm):
     cfg = PinballConfig.from_yaml(CFG); cfg.hier_layer_compile = False; cfg.block_size = L
     cfg.local_pack_global_select_impl = impl; cfg.local_pack_global_gumbel_norm = norm
+    cfg.local_pack_global_nom_compile = False   # eager selectors: this probe tests stream == dense exactly
     inp = resolve_model_inputs(cfg, block_size=L); torch.manual_seed(0)
     m = build_model(cfg, tokenizer=inp.tokenizer, vocab_size=inp.vocab_size, input_mode=inp.input_mode,
                     tie_weights=inp.tie_weights, max_seq_len=L).cuda().eval()

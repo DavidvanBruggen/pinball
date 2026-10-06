@@ -2548,6 +2548,7 @@ class HierarchicalFlowGAT(nn.Module):
         input_mode : str = "tokens",
         tie_weights: bool = True,  # Whether to tie weights between token embedding and output projection
         gen_frontier_consistent: bool = True,  # AR gen: pad prefix so coarse windows match training
+        gen_cuda_graph: bool = True,  # AR gen: replay the fixed-shape padded forward as a CUDA graph
         use_final_layer_for_prediction: bool = True,
         norm_type: str = "layer_norm",  # "layer_norm" or "batch_norm"
         norm_eps: float = 1e-6,
@@ -3548,6 +3549,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.overlap_ratios = overlap_ratios
         self.max_seq_len = max_seq_len
         self.gen_frontier_consistent = bool(gen_frontier_consistent)
+        self.gen_cuda_graph = bool(gen_cuda_graph)
         self.use_final_layer_for_prediction = use_final_layer_for_prediction
         self.add_self_loops = add_self_loops
         self.add_long_range_edges = add_long_range_edges
@@ -8198,7 +8200,7 @@ class HierarchicalFlowGAT(nn.Module):
             num_higher_nodes = int(num_higher_h * num_higher_w)
 
             if self.input_mode == "tokens":
-                mask_tensor = torch.tensor([self.mask_token_id], dtype=torch.long, device=device)
+                mask_tensor = self._mask_id_tensor(device)
                 mask_embedding = self.token_embedding(mask_tensor)
                 higher_features = mask_embedding.repeat(num_higher_nodes, 1)
             elif self.input_mode == "features":
@@ -8276,7 +8278,7 @@ class HierarchicalFlowGAT(nn.Module):
         
         if self.input_mode == "tokens":
             # Initialize Higher Features with Mask Embedding 
-            mask_tensor = torch.tensor([self.mask_token_id], dtype=torch.long, device=device)
+            mask_tensor = self._mask_id_tensor(device)
             mask_embedding = self.token_embedding(mask_tensor) # Get embedding [1, hidden_dim]
             # Repeat the mask embedding for all new nodes
             higher_features = mask_embedding.repeat(num_higher_nodes, 1)
@@ -8933,7 +8935,8 @@ class HierarchicalFlowGAT(nn.Module):
         if level_offsets is None or x_bnh.dim() != 3:
             return
         try:
-            lo = [int(v) for v in level_offsets.tolist()]
+            lo = list(self._geom_host_memo("lo", (level_offsets,),
+                                           lambda: tuple(int(v) for v in level_offsets.tolist())))
         except Exception:
             return
         n_total = int(x_bnh.shape[1])
@@ -9245,6 +9248,8 @@ class HierarchicalFlowGAT(nn.Module):
     def _maybe_log_gate_monitor(self) -> None:
         if not bool(getattr(self, "pinball_monitor_gates", False)):
             return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return   # gate_monitor() reads floats (host syncs): never inside a CUDA-graph capture
         self._gate_monitor_calls = int(getattr(self, "_gate_monitor_calls", 0)) + 1
         every = int(getattr(self, "pinball_monitor_gates_every", 100))
         if self._gate_monitor_calls == 1 or (self._gate_monitor_calls % every) == 0:
@@ -16255,7 +16260,7 @@ class HierarchicalFlowGAT(nn.Module):
         g_out.hqd_search_added_total = int(hqd_search_added_total) if hqd_enable else None
         g_out.hqd_reuse_added_total = int(hqd_reuse_added_total) if hqd_enable else None
         g_out.hqd_reused_layers = int(hqd_reused_layers) if hqd_enable else None
-        n_l0 = max(1, int((base_nl == 0).sum().item()))
+        n_l0 = self._geom_host_memo("n_l0", (base_nl,), lambda: max(1, int((base_nl == 0).sum().item())))
         n_active = max(1, hqd_hit_layers) if hqd_enable else 1
         if hqd_enable and hqd_hit_layers > 0:
             g_out.hqd_avg_l0 = float(hqd_added_total) / float(B) / float(n_l0) / float(n_active)
@@ -16266,9 +16271,9 @@ class HierarchicalFlowGAT(nn.Module):
         l0_window = max(1, int(self.l0_local_window))
         l0_mask_bool = (base_nl == 0)
         if refine_ei is not None and refine_ei.numel() > 0:
-            src_l0 = l0_mask_bool[refine_ei[0]]
-            dst_l0 = l0_mask_bool[refine_ei[1]]
-            n_l0_graph_total = int((src_l0 & dst_l0).sum().item())
+            n_l0_graph_total = self._geom_host_memo(
+                "n_l0_graph", (base_nl, refine_ei),
+                lambda: int((l0_mask_bool[refine_ei[0]] & l0_mask_bool[refine_ei[1]]).sum().item()))
         else:
             n_l0_graph_total = 0
         n_l0_graph_per_sample = n_l0_graph_total
@@ -17811,6 +17816,91 @@ class HierarchicalFlowGAT(nn.Module):
             self._kv_last_verify_err = float(max_verify_err)
         return current_ids
 
+    def _gen_graph_runner(self, batch_size: int, cycles, use_level_prediction: bool,
+                          pad_id: int, device: torch.device):
+        """CUDA-graph replay of the frontier-consistent generation forward -> run(ids) -> [B, V].
+
+        With compile_fixed_shape every decode step runs the SAME padded [B, max_seq_len]
+        forward, and at batch 1 that forward is launch-bound: ~3.3k kernels and ~8 ms of GPU
+        work in a ~32 ms call, flat in the prefix length. Since the shape never changes, the
+        whole forward (eager orchestration, compiled layers and refreshes, flex) is captured
+        once per generate() call and replayed per token: copy the prefix into a static id
+        buffer, replay, project the ONE frontier row of the static token features. Same
+        kernels on the same inputs as the uncaptured forward (the caller checks the first
+        token against it). Any capture failure returns None and the caller keeps the
+        uncaptured loop: slower, never wrong. Weights are read in place, so a capture never
+        outlives its generate() call."""
+        if device.type != "cuda" or getattr(self, "_force_decode_head", None) == "ae":
+            return None
+        L = int(self.max_seq_len)
+        B = int(batch_size)
+        static_ids = torch.full((B, L), int(pad_id), dtype=torch.long, device=device)
+        prev_rtf = getattr(self, "return_token_features", False)
+
+        def _feats():
+            return self.forward(static_ids, num_cycles=cycles, use_level_prediction=use_level_prediction)
+
+        graph = torch.cuda.CUDAGraph()
+        try:
+            self.return_token_features = True
+            # cache_enabled=False: an autocast weight-cast cache entry made outside the capture
+            # would be freed at context exit while the graph still reads it.
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+                side = torch.cuda.Stream(device)
+                side.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(side):
+                    for _ in range(2):          # warm every lazy cache / compile at this shape
+                        out = _feats()
+                torch.cuda.current_stream(device).wait_stream(side)
+                if not (torch.is_tensor(out) and out.dim() == 3
+                        and int(out.size(-1)) == int(self.hidden_dim) and int(out.size(1)) == L):
+                    return None                 # this config's forward does not end in token features
+                with torch.cuda.graph(graph):
+                    static_feats = _feats()
+        except Exception as e:
+            logger.warning("[GEN-GRAPH] capture failed (%s: %s); generating without a CUDA graph.",
+                           type(e).__name__, str(e).split("\n")[0][:300])
+            return None
+        finally:
+            self.return_token_features = prev_rtf
+
+        def run(ids_: torch.Tensor) -> torch.Tensor:
+            cur = int(ids_.size(1))
+            static_ids[:, :cur].copy_(ids_)
+            static_ids[:, cur:].fill_(int(pad_id))
+            graph.replay()
+            return self.output_projection(static_feats[:, cur - 1:cur, :]).view(B, -1)
+
+        return run
+
+    def _mask_id_tensor(self, device) -> torch.Tensor:
+        """[1] long tensor holding mask_token_id on `device`, cached. Building it with
+        torch.tensor([...], device=cuda) on every forward is a pageable host->device copy, i.e.
+        a host sync per forward, and it blocks CUDA-graph capture of the generation forward."""
+        memo = self.__dict__.setdefault("_mask_id_memo", {})
+        key = (str(torch.device(device)), int(self.mask_token_id))
+        t = memo.get(key)
+        if t is None:
+            t = torch.tensor([int(self.mask_token_id)], dtype=torch.long, device=device)
+            memo[key] = t
+        return t
+
+    def _geom_host_memo(self, tag: str, tensors: Tuple[torch.Tensor, ...], fn):
+        """Host-side value derived from skeleton-cached geometry tensors (counts, offsets),
+        memoized by tensor IDENTITY so the .item()/.tolist() sync runs once per skeleton
+        instead of every forward. References are kept, so a freed id cannot be reused; the
+        memo is bounded. Only for tensors that are never mutated in place (geometry)."""
+        memo = self.__dict__.setdefault("_geom_host_memo_d", {})
+        key = (tag,) + tuple(id(t) for t in tensors)
+        hit = memo.get(key)
+        if hit is not None and all(a is b for a, b in zip(hit[0], tensors)):
+            return hit[1]
+        if len(memo) > 256:
+            memo.clear()
+        val = fn()
+        memo[key] = (tuple(tensors), val)
+        return val
+
     def _gen_frontier_lookahead(self) -> int:
         """L0 span of a top-level coarse node = how many tokens ahead a coarse window that
         overlaps the frontier needs before it CLOSES. Padding the AR prefix by this much lets
@@ -17929,6 +18019,43 @@ class HierarchicalFlowGAT(nn.Module):
                     torch.autocast("cuda", dtype=torch.bfloat16)
                     if device.type == "cuda" else contextlib.nullcontext()
                 )
+                def _full_logits(ids_: torch.Tensor) -> torch.Tensor:
+                    # one uncaptured rebuild forward -> frontier logits [B, vocab]
+                    cur_len = int(ids_.size(1))
+                    if frontier_consistent and compile_fixed_shape:
+                        pad_n = int(self.max_seq_len) - cur_len
+                    else:
+                        pad_n = min(lookahead, int(self.max_seq_len) - cur_len)
+                    if frontier_consistent and pad_n > 0:
+                        padded = torch.cat(
+                            [ids_, torch.full((ids_.size(0), pad_n), pad_id,
+                                              dtype=ids_.dtype, device=ids_.device)],
+                            dim=1)
+                        logits = self.forward(
+                            padded,
+                            num_cycles=cycles,
+                            use_level_prediction=use_level_prediction,
+                            logits_last_index=cur_len - 1,  # the true frontier, not the padding
+                        )
+                    else:
+                        # Use the forward method directly - like in training
+                        logits = self.forward(
+                            ids_,
+                            num_cycles=cycles,
+                            use_level_prediction=use_level_prediction,
+                            logits_last_only=True,
+                        )
+                    # Get logits for the last token (projection already returned [B,1,vocab])
+                    return logits[:, -1, :]
+
+                # Fixed-shape decode on CUDA: replay the whole padded forward as one CUDA graph
+                # (see _gen_graph_runner); first token checked against the uncaptured forward.
+                runner = None
+                if (frontier_consistent and compile_fixed_shape and device.type == "cuda"
+                        and bool(getattr(self, "gen_cuda_graph", True))):
+                    runner = self._gen_graph_runner(int(current_ids.size(0)), cycles,
+                                                    use_level_prediction, pad_id, device)
+                runner_checked = False
                 for _ in range(max_length):
                     # Check if we've reached maximum sequence length
                     if current_ids.size(1) >= self.max_seq_len:
@@ -17936,32 +18063,24 @@ class HierarchicalFlowGAT(nn.Module):
 
                     # Get next token logits by calling forward, completely rebuilding the graph
                     with torch.no_grad(), _gen_amp:
-                        cur_len = int(current_ids.size(1))
-                        if frontier_consistent and compile_fixed_shape:
-                            pad_n = int(self.max_seq_len) - cur_len
+                        if runner is None:
+                            next_token_logits = _full_logits(current_ids)
                         else:
-                            pad_n = min(lookahead, int(self.max_seq_len) - cur_len)
-                        if frontier_consistent and pad_n > 0:
-                            padded = torch.cat(
-                                [current_ids, torch.full((current_ids.size(0), pad_n), pad_id,
-                                                         dtype=current_ids.dtype, device=current_ids.device)],
-                                dim=1)
-                            logits = self.forward(
-                                padded,
-                                num_cycles=cycles,
-                                use_level_prediction=use_level_prediction,
-                                logits_last_index=cur_len - 1,  # the true frontier, not the padding
-                            )
-                        else:
-                            # Use the forward method directly - like in training
-                            logits = self.forward(
-                                current_ids,
-                                num_cycles=cycles,
-                                use_level_prediction=use_level_prediction,
-                                logits_last_only=True,
-                            )
-                        # Get logits for the last token (projection already returned [B,1,vocab])
-                        next_token_logits = logits[:, -1, :]
+                            next_token_logits = runner(current_ids)
+                            if not runner_checked:
+                                runner_checked = True
+                                ref = _full_logits(current_ids)
+                                d = float((next_token_logits.float() - ref.float()).abs().max().item())
+                                tol = 1e-2 * max(1.0, float(ref.float().abs().max().item()))
+                                if not d <= tol:
+                                    logger.warning("[GEN-GRAPH] replay differs from the uncaptured "
+                                                   "forward (max|diff| %.3e > %.3e); generating "
+                                                   "without a CUDA graph.", d, tol)
+                                    runner = None
+                                    next_token_logits = ref
+                                else:
+                                    logger.info("[GEN-GRAPH] CUDA-graph decode on: replay vs "
+                                                "uncaptured forward max|diff| %.3e", d)
                     
                     # Use safe sampling method
                     next_token = self._safe_sampling(

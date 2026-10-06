@@ -227,6 +227,7 @@ def build_pinball_model(
         input_mode=input_mode,
         tie_weights=bool(tie_weights),
         gen_frontier_consistent=bool(getattr(args, "gen_frontier_consistent", True)),
+        gen_cuda_graph=bool(getattr(args, "gen_cuda_graph", True)),
         hidden_dim=int(getattr(args, "hidden_dim", 384)),
         num_heads=int(getattr(args, "num_heads", 6)),
         num_layers=getattr(args, "num_layers", [4, 4, 4, 4]),

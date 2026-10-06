@@ -1195,9 +1195,11 @@ class HierarchicalMessagePassing(MessagePassing):
         # key is not fixed) and no region cap. Default dense (bit-identical).
         local_pack_global_select_impl: str = "dense",
         # stream only: run the selector (nomination weights + running top-K + gate) as ONE
-        # torch.compile'd graph shared by every layer, in training. Eager it is ~200 small
-        # kernel launches per layer and direction. Same math; compiled reductions round
-        # differently, so not bit-identical when on. Eval/generation stay eager. Default off.
+        # torch.compile'd graph shared by every layer, in training and in CUDA eval (so
+        # validation and generation use the same compiled selector as training; generation runs
+        # at the fixed max_seq_len shape, one compile). Eager it is ~200 small kernel launches
+        # per layer and direction. Same math; compiled reductions round differently, so not
+        # bit-identical when on. CPU eval stays eager. Default off.
         local_pack_global_nom_compile: bool = False,
         # DIVERSITY (head only). At most `region_cap` picks per region, a region being a
         # candidate's ancestor at `region_level` (L2 = 64 tokens at 4096; a row at or above that
@@ -5211,7 +5213,7 @@ class HierarchicalMessagePassing(MessagePassing):
             ranking only, in training, so unpicked rows get tried;
           gate: sigmoid(weight) on the picked VALUES -- the heads' gradient path.
         """
-        if (self.local_pack_global_nom_compile and self.training
+        if (self.local_pack_global_nom_compile and (self.training or x_nodes.is_cuda)
                 and str(getattr(self, "local_pack_global_select_impl", "dense")) == "stream"):
             return self._nominate_by_head_stream_compiled(spec, lvl_packed, x_nodes)
         w = self._nomination_weights(spec, lvl_packed, x_nodes)          # [B, n]
@@ -7556,7 +7558,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_boost: str = "logit",  # head: logit (detached) | key (query-conditioned)
         local_pack_global_gumbel_norm: str = "raw",  # head: raw | chunk | prefix (noise scale)
         local_pack_global_select_impl: str = "dense",  # head: dense | stream (linear selection)
-        local_pack_global_nom_compile: bool = False,  # stream: compile the selector (training)
+        local_pack_global_nom_compile: bool = False,  # stream: compile the selector (train + CUDA eval)
         local_pack_global_region_cap: int = 0,  # head: max picks per region (0 = off)
         local_pack_global_region_level: int = 2,  # head: level defining regions
         local_pack_far_nope_dims: int = 0,  # far keys: unrotated tail dims only (0 = off)
