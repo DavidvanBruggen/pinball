@@ -2710,6 +2710,12 @@ class HierarchicalFlowGAT(nn.Module):
         # probation fallback to eager on first runtime failure (same policy as
         # hier_refresh_compile; both knobs compose — the refreshes live outside the layers).
         hier_layer_compile: bool = False,
+        # CUDA graphs for the compiled layers + refresh cores in TRAINING (torch.compile
+        # mode="reduce-overhead", i.e. cudagraph trees): each layer is one graph (0 breaks),
+        # so a replay replaces its ~600 per-step kernel launches -- the host-bound cost on
+        # small steps / slow CPUs. Eval and generation keep the plain compiled path (gen
+        # captures its own whole-forward graph). Needs hier_layer_compile.
+        hier_layer_cudagraphs: bool = False,
         # Apply self.final_norm on exit from the refinement loop. The stack is pre-norm, so
         # without this nothing renormalizes the residual stream before output_projection and
         # its scale is free to drift over training. The slow path has always done this; the
@@ -3014,6 +3020,7 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_gumbel_norm: str = "raw", # head only: raw | chunk | prefix (see the layer)
         local_pack_global_select_impl: str = "dense",  # head only: dense | stream (see the layer)
         local_pack_global_nom_compile: bool = False,  # stream only: torch.compile the selector
+        local_pack_global_nom_inline: bool = False,  # trace the selector into the layer compile
         local_pack_far_nope_dims: int = 0,  # far keys (global block + slots) unrotated tail only; 0 = off
         local_pack_far_bias: str = "off",   # off | level: per-level logit bias on far keys (see the layer)
         lap_pe_bias: bool = True,           # lap_pe_proj bias; False for a clean A/B (no constant offset)
@@ -3702,6 +3709,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_gumbel_norm = str(local_pack_global_gumbel_norm or "raw").lower()
         self.local_pack_global_select_impl = str(local_pack_global_select_impl or "dense").lower()
         self.local_pack_global_nom_compile = bool(local_pack_global_nom_compile)
+        self.local_pack_global_nom_inline = bool(local_pack_global_nom_inline)
         self.local_pack_far_nope_dims = max(0, int(local_pack_far_nope_dims or 0))
         self.local_pack_far_bias = str(local_pack_far_bias or "off").lower()
         self.lap_pe_bias = bool(lap_pe_bias)
@@ -4561,6 +4569,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
                         local_pack_global_select_impl=str(getattr(self, "local_pack_global_select_impl", "dense")),
                         local_pack_global_nom_compile=bool(getattr(self, "local_pack_global_nom_compile", False)),
+                        local_pack_global_nom_inline=bool(getattr(self, "local_pack_global_nom_inline", False)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
@@ -4687,6 +4696,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
                         local_pack_global_select_impl=str(getattr(self, "local_pack_global_select_impl", "dense")),
                         local_pack_global_nom_compile=bool(getattr(self, "local_pack_global_nom_compile", False)),
+                        local_pack_global_nom_inline=bool(getattr(self, "local_pack_global_nom_inline", False)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
@@ -5323,6 +5333,9 @@ class HierarchicalFlowGAT(nn.Module):
             self._register_load_state_dict_pre_hook(self._legacy_norm_stack_fallback)
         self.hier_refresh_compile = bool(hier_refresh_compile)
         self.hier_layer_compile = bool(hier_layer_compile)
+        self.hier_layer_cudagraphs = bool(hier_layer_cudagraphs)
+        if self.hier_layer_cudagraphs and not self.hier_layer_compile:
+            raise ValueError("hier_layer_cudagraphs needs hier_layer_compile")
         self.final_norm_fast_path = bool(final_norm_fast_path)
         if self.final_norm_fast_path:
             logger.info("Terminal norm active on the fast path (final_norm_fast_path).")
@@ -6723,14 +6736,29 @@ class HierarchicalFlowGAT(nn.Module):
             # Both layouts normalised to [.., comp, H] so one reducer serves the bulk
             # unfold and the clamped tails. transpose on the unfold view is free.
             if n_bulk > 0:
-                win = lower.unfold(1, comp, stride)[:, :n_bulk].transpose(-1, -2)
-                parts.append(self._pool_window_reduce(win, lvl))
+                if getattr(self, "hier_layer_cudagraphs", False) and self.training:
+                    # CUDA graphs refuse a graph whose inputs overlap in memory, and the
+                    # attn/max reducers' backward would save the overlapping unfold VIEW.
+                    # Checkpointing the bulk reduction saves the dense `lower` instead and
+                    # rebuilds the view in backward: same math, a tiny recompute.
+                    parts.append(torch.utils.checkpoint.checkpoint(
+                        self._pool_bulk_reduce, lower, lvl, comp, stride, n_bulk,
+                        use_reentrant=False))
+                else:
+                    win = lower.unfold(1, comp, stride)[:, :n_bulk].transpose(-1, -2)
+                    parts.append(self._pool_window_reduce(win, lvl))
             for i in range(n_bulk, n_parent):
                 start = min(i * stride, n_lower - 1)
                 end = max(min(start + comp, n_lower), start + 1)
                 parts.append(self._pool_window_reduce(
                     lower[:, start:end].unsqueeze(1), lvl))
         return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+
+    def _pool_bulk_reduce(self, lower: torch.Tensor, lvl: int, comp: int, stride: int,
+                          n_bulk: int) -> torch.Tensor:
+        """The regular (unclamped) windows of _pooled_child_window_means, reduced."""
+        win = lower.unfold(1, comp, stride)[:, :n_bulk].transpose(-1, -2)
+        return self._pool_window_reduce(win, lvl)
 
     def _pool_window_reduce(self, win: torch.Tensor, lvl: int) -> torch.Tensor:
         """Reduce child windows [.., comp, H] -> [.., H] under hier_pool_mode.
@@ -6986,10 +7014,14 @@ class HierarchicalFlowGAT(nn.Module):
         compiled_eval = bool(not self.training and next(self.parameters()).is_cuda)
         if not (getattr(self, "hier_refresh_compile", False) and (self.training or compiled_eval)):
             return eager
+        _cg = self._train_cudagraphs()
+        if _cg:
+            cache_attr = cache_attr + "_cg"
         fn = getattr(self, cache_attr, None)
         if fn is None:
             try:
-                compiled = torch.compile(eager, dynamic=False)
+                compiled = torch.compile(eager, dynamic=False,
+                                         **({"mode": "reduce-overhead"} if _cg else {}))
             except Exception as e:
                 logger.warning("hier_refresh_compile: torch.compile unavailable (%s); staying eager.", e)
                 setattr(self, cache_attr, eager)
@@ -7013,6 +7045,26 @@ class HierarchicalFlowGAT(nn.Module):
             setattr(self, cache_attr, fn)
         return fn
 
+    def _train_cudagraphs(self) -> bool:
+        """hier_layer_cudagraphs applies: training, on CUDA, and not inside another capture
+        (a cudagraph-tree replay cannot nest in a manual torch.cuda.graph capture)."""
+        return bool(getattr(self, "hier_layer_cudagraphs", False) and self.training
+                    and not torch.cuda.is_current_stream_capturing())
+
+    def _cudagraph_step_begin(self) -> None:
+        """Start a new cudagraph-tree generation (hier_layer_cudagraphs): the previous step's
+        graph outputs may now be overwritten -- its backward has run.
+
+        The first steps also hand the ordinary allocator's cache back to the driver. Step 0
+        runs the plain compiled layers (see _layer_callable) and the cudagraph pool is a
+        SEPARATE pool, so without this the whole step-0 working set stays reserved next to
+        the graph pool for the rest of the epoch (measured +22 GB at 16k x4)."""
+        torch.compiler.cudagraph_mark_step_begin()
+        n = int(getattr(self, "_cudagraph_steps", 0))
+        if n < 3:
+            torch.cuda.empty_cache()
+        self._cudagraph_steps = n + 1
+
     def _layer_callable(self, transformer):
         """torch.compile'd refinement-layer forward in training or CUDA evaluation
         when hier_layer_compile is on (one compile per layer; fuses the eager orchestration
@@ -7026,7 +7078,34 @@ class HierarchicalFlowGAT(nn.Module):
         compiled_eval = bool(not self.training and next(transformer.parameters()).is_cuda)
         if not (getattr(self, "hier_layer_compile", False) and (self.training or compiled_eval)):
             return transformer
-        fn = getattr(transformer, "_pinball_compiled_forward", None)
+        if not self._train_cudagraphs():
+            return self._layer_compiled_fn(transformer, cg=False)
+        # hier_layer_cudagraphs. A cudagraph's outputs live in its private pool and are
+        # overwritten by the next step's replay, so nothing built INSIDE a graph may be kept:
+        # the lazily built per-skeleton caches (flex BlockMasks in the spec, built on the
+        # first call that sees a new spec) would be. So the first call of each layer on a new
+        # pack spec runs the plain compiled fn (same graph, normal allocations, fills the
+        # caches); every later call replays.
+        if not getattr(self, "_cg_checked", False):
+            if (self.local_pack_global_select == "content"
+                    and self.local_pack_global_nominator != "head"):
+                raise ValueError(
+                    "hier_layer_cudagraphs: content selection with the key nominator rebuilds "
+                    "its BlockMask on re-picks inside the graph; use the head nominator")
+            self._cg_checked = True
+        spec = getattr(getattr(transformer, "message_passing", None), "_local_pack_spec", None)
+        if getattr(transformer, "_cg_warm_spec", None) is not spec:
+            transformer._cg_warm_spec = spec
+            self._cudagraph_steps = 0     # release this plain step's cache again (see below)
+            return self._layer_compiled_fn(transformer, cg=False)
+        return self._layer_compiled_fn(transformer, cg=True)
+
+    def _layer_compiled_fn(self, transformer, cg: bool):
+        """The (lazily built, probation-wrapped) compiled forward of one layer; cg=True is the
+        mode='reduce-overhead' (CUDA graph) variant, a separate compile of the same code."""
+        _cg = bool(cg)
+        _attr = "_pinball_compiled_forward_cg" if _cg else "_pinball_compiled_forward"
+        fn = getattr(transformer, _attr, None)
         if fn is None:
             try:
                 import torch._dynamo as _dynamo
@@ -7046,13 +7125,14 @@ class HierarchicalFlowGAT(nn.Module):
                         _mod.prepare_flex_flash(_dev)
                     if hasattr(_mod, "prepare_flex_tiles"):
                         _mod.prepare_flex_tiles(_dev)
-                compiled = torch.compile(transformer.forward, dynamic=False)
+                compiled = torch.compile(transformer.forward, dynamic=False,
+                                         **({"mode": "reduce-overhead"} if _cg else {}))
             except Exception as e:
                 logger.warning("hier_layer_compile: torch.compile unavailable (%s); staying eager.", e)
-                transformer._pinball_compiled_forward = transformer.forward
+                setattr(transformer, _attr, transformer.forward)
                 return transformer.forward
 
-            def _probation(*args, _c=compiled, _t=transformer, **kwargs):
+            def _probation(*args, _c=compiled, _t=transformer, _a=_attr, **kwargs):
                 try:
                     out = _c(*args, **kwargs)
                 except Exception as err:
@@ -7061,13 +7141,13 @@ class HierarchicalFlowGAT(nn.Module):
                         "falling back to eager permanently.",
                         type(err).__name__, err,
                     )
-                    _t._pinball_compiled_forward = _t.forward
+                    setattr(_t, _a, _t.forward)
                     return _t.forward(*args, **kwargs)
-                _t._pinball_compiled_forward = _c  # first success -> cache the raw compiled fn
+                setattr(_t, _a, _c)  # first success -> cache the raw compiled fn
                 return out
 
             fn = _probation
-            transformer._pinball_compiled_forward = fn
+            setattr(transformer, _attr, fn)
         return fn
 
     def _downward_gather_plan(self, level_offsets: torch.Tensor, node_ar_time: torch.Tensor) -> Dict[str, tuple]:
@@ -7757,6 +7837,13 @@ class HierarchicalFlowGAT(nn.Module):
                                 torch.arange(int(spec["num_nodes"]), device=_tgt.device,
                                              dtype=_tgt.dtype))):
                 spec["pack_gather"] = _selq.index_select(0, _order).contiguous()
+        # Nomination selector geometry, built here (eager) rather than lazily by the first
+        # layer: its nonzero/bincount/.tolist() would otherwise be graph breaks inside the
+        # compiled layer. Every layer shares the nomination config, so layer 0 builds it.
+        _mp0 = (getattr(self.refinement_transformers[0], "message_passing", None)
+                if self.refinement_transformers else None)
+        if _mp0 is not None and hasattr(_mp0, "prime_nomination_geometry"):
+            _mp0.prime_nomination_geometry(spec)
         self._local_pack_spec_cache = (key, spec)
         return spec
 
@@ -17223,6 +17310,8 @@ class HierarchicalFlowGAT(nn.Module):
         batch_size, seq_len = input_ids.shape
         # Exposed in runtime metrics and useful when diagnosing shape specializations.
         self._uf_cache_last_seq_len = int(seq_len)
+        if self._train_cudagraphs():
+            self._cudagraph_step_begin()
 
         # Handle batching - process each example separately for now
         # A more advanced implementation could process the whole batch at once

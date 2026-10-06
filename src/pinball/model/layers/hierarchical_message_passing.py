@@ -883,6 +883,21 @@ def _level_group_qkv(qs, ks, vs, x: torch.Tensor, segs) -> torch.Tensor:
     return torch.cat(out, dim=1)
 
 
+def _block_mask_sweep(create_block_mask, mask_mod, q_len: int, kv_len: int, device, kw: Dict):
+    """create_block_mask as a compiled sweep (no dense Q_LEN x KV_LEN materialisation).
+
+    Eager: the _compile=True flag, unchanged. INSIDE a compiled region (hier_layer_compile)
+    the flag is redundant -- the call is traced into the enclosing graph, which is the same
+    compiled sweep -- and harmful: it first raises a DeprecationWarning, which dynamo
+    cannot trace, and the break lands inside the flex retry `try`, where dynamo cannot
+    resume. The rest of _apply_local_pack_out then ran EAGER for the life of the trace."""
+    if torch.compiler.is_compiling():
+        return create_block_mask(mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len,
+                                 device=str(device), **kw)
+    return create_block_mask(mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len,
+                             device=str(device), _compile=True, **kw)
+
+
 # ---- stream nomination selector (local_pack_global_select_impl='stream') ---------------
 # Module-level and stateless on purpose: every layer passes its own weights as tensors, so one
 # torch.compile'd graph serves all of them (a bound method would guard on each module and
@@ -1201,6 +1216,7 @@ class HierarchicalMessagePassing(MessagePassing):
         # per layer and direction. Same math; compiled reductions round differently, so not
         # bit-identical when on. CPU eval stays eager. Default off.
         local_pack_global_nom_compile: bool = False,
+        local_pack_global_nom_inline: bool = False,
         # DIVERSITY (head only). At most `region_cap` picks per region, a region being a
         # candidate's ancestor at `region_level` (L2 = 64 tokens at 4096; a row at or above that
         # level is its own region). Measured 2026-09-30 on the q arms: the deterministic top-k
@@ -1431,6 +1447,11 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_global_nom_compile = bool(local_pack_global_nom_compile)
         if self.local_pack_global_nom_compile and self.local_pack_global_select_impl != "stream":
             raise ValueError("local_pack_global_nom_compile needs local_pack_global_select_impl='stream'")
+        self.local_pack_global_nom_inline = bool(local_pack_global_nom_inline)
+        if self.local_pack_global_nom_inline and not (
+                self.local_pack_global_nom_compile and self.local_pack_global_nominator == "head"):
+            raise ValueError("local_pack_global_nom_inline needs local_pack_global_nom_compile "
+                             "and local_pack_global_nominator='head'")
         if self.local_pack_global_select_impl == "stream":
             if self.local_pack_global_gumbel_norm == "chunk":
                 raise ValueError("local_pack_global_select_impl='stream' needs gumbel_norm 'raw' or "
@@ -4806,8 +4827,7 @@ class HierarchicalMessagePassing(MessagePassing):
                 if (qr.is_cuda and min(nq, nk) >= self._CC_MIN_COMPILED) else None
             _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
             try:
-                bm = create_block_mask(cc_mask, B=None, H=None, Q_LEN=nq, KV_LEN=nk,
-                                       device=str(qr.device), _compile=True, **_kw)
+                bm = _block_mask_sweep(create_block_mask, cc_mask, nq, nk, qr.device, _kw)
             except TypeError:
                 bm = create_block_mask(cc_mask, B=None, H=None, Q_LEN=nq, KV_LEN=nk,
                                        device=str(qr.device), **_kw)
@@ -4901,8 +4921,7 @@ class HierarchicalMessagePassing(MessagePassing):
                 if (rp.is_cuda and n >= 512) else None
             _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
             try:
-                bm = create_block_mask(ring_mask, B=None, H=None, Q_LEN=n, KV_LEN=n,
-                                       device=str(rp.device), _compile=True, **_kw)
+                bm = _block_mask_sweep(create_block_mask, ring_mask, n, n, rp.device, _kw)
             except TypeError:
                 bm = create_block_mask(ring_mask, B=None, H=None, Q_LEN=n, KV_LEN=n,
                                        device=str(rp.device), **_kw)
@@ -5019,8 +5038,14 @@ class HierarchicalMessagePassing(MessagePassing):
                   len(self._FLEX_TILE_LADDER) - 1)
         return self._FLEX_TILE_LADDER[lvl]
 
-    @torch._dynamo.disable
-    def _nominate_global_rows(self, kp: torch.Tensor, spec: Dict,
+    def _nominate_rows(self, kp: torch.Tensor, spec: Dict, lvl_packed: Optional[torch.Tensor],
+                       budget: int, x_nodes: Optional[torch.Tensor] = None):
+        """Call-site dispatch: traced inline (local_pack_global_nom_inline) or opaque."""
+        if self.local_pack_global_nom_inline:
+            return self._nominate_global_rows_impl(kp, spec, lvl_packed, budget, x_nodes=x_nodes)
+        return self._nominate_global_rows(kp, spec, lvl_packed, budget, x_nodes=x_nodes)
+
+    def _nominate_global_rows_impl(self, kp: torch.Tensor, spec: Dict,
                               lvl_packed: Optional[torch.Tensor], budget: int,
                               x_nodes: Optional[torch.Tensor] = None):
         """Content-selected global block -> (packed rows [K], per-row score [N] or None).
@@ -5128,6 +5153,10 @@ class HierarchicalMessagePassing(MessagePassing):
         # the flex score_mod must index it with a SINGLE gather (a nested/2-D gather inside a
         # compiled mask is what produced the illegal memory access documented on tier_pk).
         return rows, s_shared, None
+
+    # The opaque form (default): see the DYNAMO-DISABLED note above. The _impl is traced
+    # directly only under local_pack_global_nom_inline, whose path is break-free.
+    _nominate_global_rows = torch._dynamo.disable(_nominate_global_rows_impl)
 
     def _nomination_weights(self, spec: Dict, lvl_packed: torch.Tensor,
                             x_nodes: torch.Tensor) -> torch.Tensor:
@@ -5406,11 +5435,36 @@ class HierarchicalMessagePassing(MessagePassing):
         return rows, g, {"chunk": C, "G": K, "nch": int(nch), "ok": geo["ok"].reshape(-1).contiguous(),
                          "n_static": int(st.numel()), "static_rows": st, "per_batch": True}
 
+    def prime_nomination_geometry(self, spec: Dict) -> None:
+        """Build the stream selector's geometry caches in the spec EAGERLY, at spec build.
+
+        They are pure geometry (shared by every layer), but building them takes nonzero /
+        bincount / .tolist(), which are graph breaks: built lazily inside a compiled layer,
+        the first trace splits around them and the split trace is what stays cached. Same
+        tensors either way; consumers just hit the cache."""
+        if (str(getattr(self, "local_pack_global_nominator", "key")) != "head"
+                or str(getattr(self, "local_pack_global_select_impl", "dense")) != "stream"
+                or "nom_avail" not in spec or not hasattr(self, "nom_child_k")):
+            return
+        lvl_packed = spec["levels"]
+        n = int(spec["perm"].numel())
+        if spec.get("nom_level_nodes", None) is None:
+            self._nom_level_cache(spec, lvl_packed, int(spec["num_nodes"]))
+        self._nom_stream_weight_args(spec)
+        C = int(self.local_pack_global_chunk)
+        W = int(spec.get("window", 0) or 0)
+        K = max(1, min(int(self.local_pack_global_l0_budget), n))
+        self._nom_stream_geom(spec, lvl_packed, C, W, K, (n + C - 1) // C, n)
+
     def _nominate_by_head_stream_compiled(self, spec: Dict, lvl_packed: torch.Tensor,
                                           x_nodes: torch.Tensor):
         """local_pack_global_nom_compile: weights + stream selection as ONE compiled graph
         (_nom_stream_fn), shared by every layer. Same contract and RNG use as the eager
-        _nomination_weights + _nominate_by_head_stream."""
+        _nomination_weights + _nominate_by_head_stream.
+
+        Under local_pack_global_nom_inline this runs INSIDE the compiled layer: the raw
+        _nom_stream_fn is traced into the layer graph (no graph break, no second compiled
+        region) and the Gumbel noise is drawn in-graph (inductor RNG, not the eager stream)."""
         if spec.get("nom_level_nodes", None) is None:
             self._nom_level_cache(spec, lvl_packed, int(x_nodes.size(1)))
         B = int(x_nodes.size(0))
@@ -5421,7 +5475,8 @@ class HierarchicalMessagePassing(MessagePassing):
         K = max(1, min(int(self.local_pack_global_l0_budget), n))
         geo = self._nom_stream_geom(spec, lvl_packed, C, W, K, nch, n)
         u = self._nom_stream_noise(torch.empty(B, n, dtype=torch.float32, device=x_nodes.device))
-        rows, g, stats = _nom_stream_compiled()(
+        _fn = _nom_stream_fn if torch.compiler.is_compiling() else _nom_stream_compiled()
+        rows, g, stats = _fn(
             x_nodes, *self._nom_stream_weight_args(spec), u, lvl_packed,
             *self._nom_stream_select_args(geo, nch, K))
         return self._nom_stream_finish(spec, rows, g, stats, geo, C, nch, K)
@@ -6048,8 +6103,7 @@ class HierarchicalMessagePassing(MessagePassing):
             _nkv = n + (int(kv_pre.numel()) if kv_pre is not None else 0) \
                      + (int(_tier_rows.numel()) if _tier_rows is not None else 0)
             try:
-                bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=_nkv,
-                                       device=str(perm.device), _compile=True, **_kw)
+                bm = _block_mask_sweep(create_block_mask, mask_mod, n, _nkv, perm.device, _kw)
             except TypeError:
                 bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=_nkv,
                                        device=str(perm.device), **_kw)
@@ -6455,7 +6509,7 @@ class HierarchicalMessagePassing(MessagePassing):
                 _gsel = None
                 if (str(getattr(self, "local_pack_global_select", "levels")) == "content"
                         and spec.get("global_block", None) is not None):
-                    _gr, _gs, _gm = self._nominate_global_rows(
+                    _gr, _gs, _gm = self._nominate_rows(
                         kp, spec, lvl_packed,
                         int(spec["global_block"].get(
                             "budget", spec["global_block"]["rows"].numel())),
@@ -6858,7 +6912,7 @@ class HierarchicalMessagePassing(MessagePassing):
             g_score = None
             g_meta = None
             if str(getattr(self, "local_pack_global_select", "levels")) == "content":
-                k_rows, g_score, g_meta = self._nominate_global_rows(
+                k_rows, g_score, g_meta = self._nominate_rows(
                     kp, spec, lvl_packed, int(_gblk.get("budget", k_rows.numel())))
                 if g_meta is not None and int(g_meta.get("n_static", 0)):
                     raise RuntimeError(
@@ -7559,6 +7613,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_gumbel_norm: str = "raw",  # head: raw | chunk | prefix (noise scale)
         local_pack_global_select_impl: str = "dense",  # head: dense | stream (linear selection)
         local_pack_global_nom_compile: bool = False,  # stream: compile the selector (train + CUDA eval)
+        local_pack_global_nom_inline: bool = False,  # trace the selector INTO the layer graph (no break)
         local_pack_global_region_cap: int = 0,  # head: max picks per region (0 = off)
         local_pack_global_region_level: int = 2,  # head: level defining regions
         local_pack_far_nope_dims: int = 0,  # far keys: unrotated tail dims only (0 = off)
@@ -7683,6 +7738,7 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_gumbel_norm=local_pack_global_gumbel_norm,
             local_pack_global_select_impl=local_pack_global_select_impl,
             local_pack_global_nom_compile=local_pack_global_nom_compile,
+            local_pack_global_nom_inline=local_pack_global_nom_inline,
             local_pack_global_region_cap=local_pack_global_region_cap,
             local_pack_global_region_level=local_pack_global_region_level,
             local_pack_far_nope_dims=local_pack_far_nope_dims,
