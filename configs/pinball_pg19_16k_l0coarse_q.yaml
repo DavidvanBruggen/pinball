@@ -287,7 +287,7 @@ tokenizer_name: gpt2
 # Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
 text_file: ./data/pg19_train.txt   # + ./data/pg19_train.pt (token cache) alongside
 block_size: 16384
-batch_size: 8                      # 120 GB cluster GPU; SAME for all arms (see BATCH in header)
+batch_size: 4                      # GH200: 95 GB usable; transformer OOMs at 8 (full logits). SAME for all arms
 val_split: 0.01
 
 # Training
