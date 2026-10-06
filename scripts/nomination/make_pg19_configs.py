@@ -55,10 +55,11 @@ COMMON_HDR = """# WIDTH d384 (as the WikiText arms). Measured 16k x6 on the Blac
 #   num_epochs 200 = 3.3B tokens ~ one PG19 pass. batch_size: SET PER GPU (see below).
 #   longctx_diag_long_edges [8192] -> buckets never, <128, 128-511, 512-2k, 2k-8k, >8k.
 #   Report data/pg19_test.txt at the end.
-# BATCH: at d384, 16k, compiled: ~11.6 GB per sequence for pinball, ~13.9 GB for the
-#   transformer (batch 6 = 71 / 85 GB). Batch 1 was LAUNCH-BOUND for pinball (105k vs 146k tok/s
-#   at batch 4): use batch >= 4. Measure on the cluster GPU and set batch_size (and/or
-#   gradient_accumulation_steps) so all arms see the SAME tokens per optimizer step.
+# BATCH: 8 on the 120 GB cluster GPU, identical for all four arms (same tokens per optimizer
+#   step). Per-process peak at 16k on the Blackwell (compiled): transformer 57.1 GB @b4 / 84.9 GB
+#   @b6 = 13.9 GB per sequence -> ~113 GB @b8 (the binding arm); pinball l0_coarse 48.6 / 71.7 GB
+#   = 11.6 GB per sequence -> ~95 GB @b8. If the transformer OOMs at 8, set ALL arms to 7 (~99 GB).
+#   125 optimizer steps/epoch (1000 samples), 25k steps over 200 epochs; warmup 1000 = 8 epochs.
 # CHECK on every run: grep -ci "flex.*fail" <log> must be 0 (pinball arms). The far-NoPE
 #   arms raise instead of degrading; the q control could degrade silently to additive.
 """
@@ -84,7 +85,7 @@ for arm, src in SRC.items():
     pin = arm != "transformer"
     s = sub(s, "text_file", "./data/pg19_train.txt   # + ./data/pg19_train.pt (token cache) alongside")
     s = sub(s, "block_size", "16384")
-    s = sub(s, "batch_size", "4                      # SET PER GPU: ~21 GiB per 16k sequence (pinball, eager)")
+    s = sub(s, "batch_size", "8                      # 120 GB cluster GPU; SAME for all arms (see BATCH in header)")
     s = sub(s, "samples_per_epoch", "1000              # 16.4M tokens/epoch")
     s = sub(s, "num_epochs", "200                       # ~3.3B tokens ~ one PG19 pass")
     s = sub(s, "longctx_diag_every", "1\nlongctx_diag_long_edges: [8192]   # adds 2k-8k and >8k buckets")
