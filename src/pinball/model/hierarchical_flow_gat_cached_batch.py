@@ -2828,6 +2828,24 @@ class HierarchicalFlowGAT(nn.Module):
         # measured 165->110 tok/s cost); packed is uniform [B,Q,K] — same math, fraction of the
         # memory. Requires topk_l0 > 0 (fixed K).
         xq_nominate_packed_read: bool = False,
+        # xq DESCENT (replaces stages 1-3 when on; needs xq_nominate_enable + packed_read):
+        # every L0 query beam-searches the WHOLE hierarchy from the lowest static-block level
+        # down to L0 with a small dedicated INDEXER (detached features, own q/k per level,
+        # Gumbel top-k in training), and the read gets the beam nodes of every level below
+        # the static block -- coarse summaries and L0 tokens, level-tagged. The indexer is
+        # trained only by lambda_xq_index * KL(read attention mass per subtree || indexer
+        # softmax over each level's beam) -- a lightning-indexer distillation, sparse form.
+        # Per query ~ sum_l beam_l * children_l scores: linear in N. See _xq_descent_nominate.
+        xq_descent_enable: bool = False,
+        xq_descent_topk: Optional[Sequence[int]] = None,   # beam per level, start level -> L1
+        xq_descent_topk_l0: int = 32,
+        xq_descent_start_level: int = -1,                  # -1 = lowest static-block level
+        xq_descent_read_levels: Optional[Sequence[int]] = None,  # None = every level below start
+        xq_descent_local_exclude: int = 128,               # L0 picks must be >= this far back
+        xq_index_dim: int = 64,
+        xq_index_gumbel: float = 1.0,
+        lambda_xq_index: float = 1.0,
+        xq_index_loss_queries: int = 1024,               # queries sampled per round for the KL (0 = all)
         # Per-query differentiable relevance gate: hqd read output scaled by
         # sigmoid(w * stage1_top_score + b). Gives queries a no-op option (the ungated read
         # HURT never-recurring tokens by ~1.6% on the 100ep run) AND routes a task gradient
@@ -3021,6 +3039,10 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_select_impl: str = "dense",  # head only: dense | stream (see the layer)
         local_pack_global_nom_compile: bool = False,  # stream only: torch.compile the selector
         local_pack_global_nom_inline: bool = False,  # trace the selector into the layer compile
+        local_pack_global_nom_query: bool = False,  # dense selector: per-chunk query-conditioned ranking
+        local_pack_global_nom_kl: bool = False,  # head: lightning-style KL of slot weights to flex slot mass
+        local_pack_global_nom_kl_chunks: int = 8,  # query chunks sampled per layer call for that KL
+        lambda_nom_kl: float = 1.0,  # weight of the mean-over-layers nomination KL in the objective
         local_pack_far_nope_dims: int = 0,  # far keys (global block + slots) unrotated tail only; 0 = off
         local_pack_far_bias: str = "off",   # off | level: per-level logit bias on far keys (see the layer)
         lap_pe_bias: bool = True,           # lap_pe_proj bias; False for a clean A/B (no constant offset)
@@ -3710,6 +3732,11 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_select_impl = str(local_pack_global_select_impl or "dense").lower()
         self.local_pack_global_nom_compile = bool(local_pack_global_nom_compile)
         self.local_pack_global_nom_inline = bool(local_pack_global_nom_inline)
+        self.local_pack_global_nom_query = bool(local_pack_global_nom_query)
+        self.local_pack_global_nom_kl = bool(local_pack_global_nom_kl)
+        self.local_pack_global_nom_kl_chunks = max(1, int(local_pack_global_nom_kl_chunks or 8))
+        self.lambda_nom_kl = float(lambda_nom_kl)
+        self._last_nom_kl_loss: Optional[torch.Tensor] = None
         self.local_pack_far_nope_dims = max(0, int(local_pack_far_nope_dims or 0))
         self.local_pack_far_bias = str(local_pack_far_bias or "off").lower()
         self.lap_pe_bias = bool(lap_pe_bias)
@@ -4570,6 +4597,9 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_select_impl=str(getattr(self, "local_pack_global_select_impl", "dense")),
                         local_pack_global_nom_compile=bool(getattr(self, "local_pack_global_nom_compile", False)),
                         local_pack_global_nom_inline=bool(getattr(self, "local_pack_global_nom_inline", False)),
+                        local_pack_global_nom_query=bool(getattr(self, "local_pack_global_nom_query", False)),
+                        local_pack_global_nom_kl=bool(getattr(self, "local_pack_global_nom_kl", False)),
+                        local_pack_global_nom_kl_chunks=int(getattr(self, "local_pack_global_nom_kl_chunks", 8)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
@@ -4697,6 +4727,9 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_select_impl=str(getattr(self, "local_pack_global_select_impl", "dense")),
                         local_pack_global_nom_compile=bool(getattr(self, "local_pack_global_nom_compile", False)),
                         local_pack_global_nom_inline=bool(getattr(self, "local_pack_global_nom_inline", False)),
+                        local_pack_global_nom_query=bool(getattr(self, "local_pack_global_nom_query", False)),
+                        local_pack_global_nom_kl=bool(getattr(self, "local_pack_global_nom_kl", False)),
+                        local_pack_global_nom_kl_chunks=int(getattr(self, "local_pack_global_nom_kl_chunks", 8)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
@@ -5369,6 +5402,27 @@ class HierarchicalFlowGAT(nn.Module):
             # path dead until w drifts off zero.
             self.xq_gate_w = nn.Parameter(torch.full((), 0.5))
             self.xq_gate_b = nn.Parameter(torch.full((), 2.2))
+        self.xq_descent_enable = bool(xq_descent_enable)
+        self.xq_descent_topk = None if xq_descent_topk is None else [max(1, int(k)) for k in xq_descent_topk]
+        self.xq_descent_topk_l0 = max(1, int(xq_descent_topk_l0))
+        self.xq_descent_start_level = int(xq_descent_start_level)
+        self.xq_descent_read_levels = (None if xq_descent_read_levels is None
+                                       else sorted({int(l) for l in xq_descent_read_levels}))
+        self.xq_descent_local_exclude = max(0, int(xq_descent_local_exclude))
+        self.xq_index_dim = max(8, int(xq_index_dim))
+        self.xq_index_gumbel = float(xq_index_gumbel)
+        self.lambda_xq_index = float(lambda_xq_index)
+        self.xq_index_loss_queries = max(0, int(xq_index_loss_queries))
+        self._last_xq_index_loss: Optional[torch.Tensor] = None
+        self._xq_desc_record = None
+        self._xq_tree_cache: Optional[tuple] = None
+        if self.xq_descent_enable:
+            if not (self.xq_nominate_enable and self.xq_nominate_packed_read):
+                raise ValueError("xq_descent_enable needs xq_nominate_enable and xq_nominate_packed_read")
+            _Hd = int(self.hidden_dim)
+            self.xq_index_q = nn.Linear(_Hd, self.xq_index_dim, bias=False)
+            self.xq_index_k = nn.ModuleList(
+                nn.Linear(_Hd, self.xq_index_dim, bias=False) for _ in range(int(num_levels)))
         self._xq_nom_edges: Optional[tuple] = None
         self._xq_query_gate_full: Optional[torch.Tensor] = None  # [B,N,1], per nomination round
         self._xq_children_cache: Optional[tuple] = None
@@ -8033,6 +8087,226 @@ class HierarchicalFlowGAT(nn.Module):
         tables = (pad(l3_l1), pad([list(r) for r in w10]))
         self._xq_children_cache = (key, tables)
         return tables
+
+    def _xq_tree_tables(self, level_sizes: List[int], device: torch.device) -> List:
+        """children[l] [n_l, Kc_l] (-1 padded): each level-l node's level-(l-1) children by the
+        1-D window rule (same as _xq_children_tables / _pooled_seed_indices). Index 0 is None.
+        Built once per graph shape on the host and cached."""
+        key = (tuple(int(v) for v in level_sizes), str(device))
+        cached = self._xq_tree_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        tabs: List = [None]
+        for lvl in range(1, len(level_sizes)):
+            n_child, n_par = int(level_sizes[lvl - 1]), int(level_sizes[lvl])
+            comp = int(self.compression_ratios[lvl - 1])
+            stride = max(1, int(comp * (1 - self.overlap_ratios[lvl - 1])))
+            start = torch.clamp(torch.arange(n_par) * stride, max=max(0, n_child - 1))
+            end = torch.maximum(torch.clamp(start + comp, max=n_child), start + 1)
+            width = int((end - start).max()) if n_par > 0 else 1
+            cols = start.view(-1, 1) + torch.arange(width).view(1, -1)
+            tabs.append(torch.where(cols < end.view(-1, 1), cols, torch.full_like(cols, -1)).to(device))
+        self._xq_tree_cache = (key, tabs)
+        return tabs
+
+    def _xq_descent_levels(self, n_levels: int) -> Tuple[int, List[int], List[int]]:
+        """(start level, beam per level start..1, read levels) for xq_descent."""
+        start = int(self.xq_descent_start_level)
+        if start < 0:
+            # lowest level of the static global block: whole levels top-down while they fit
+            # local_pack_global_block at the TRAINING length (the block's own rule), so every
+            # query already attends to all of them and scoring them costs nothing new
+            budget = int(getattr(self, "local_pack_global_block", 0) or 0)
+            ref = list(self._predict_level_sizes(int(self.max_seq_len)))[:n_levels]
+            start, used = n_levels - 1, 0
+            for l in range(n_levels - 1, 0, -1):
+                if budget > 0 and used + int(ref[l]) <= budget:
+                    used += int(ref[l]); start = l
+                else:
+                    break
+        start = max(1, min(int(start), n_levels - 1))
+        beam = list(self.xq_descent_topk) if self.xq_descent_topk is not None else [8] * start
+        if len(beam) < start:
+            beam = beam + [beam[-1]] * (start - len(beam))
+        beam = beam[:start]                                   # beam[i] is level (start - i)
+        read = (list(range(start)) if self.xq_descent_read_levels is None
+                else [l for l in self.xq_descent_read_levels if 0 <= l < n_levels])
+        return start, beam, read
+
+    def _xq_descent_nominate(self, x: torch.Tensor, level_offsets: torch.Tensor,
+                             node_ar_time: torch.Tensor) -> Optional[tuple]:
+        """xq descent (xq_descent_enable): per-L0-query beam search through the hierarchy.
+
+        Level `start` (lowest static-block level): score every node with the indexer, keep
+        beam[0]. Each lower level: the kept nodes' children (window rule, deduped) are scored
+        and the top beam[i] kept; at L0 the top xq_descent_topk_l0. A node is a candidate only
+        if CLOSED before the query (ar_time rule of the pack) and, at L0, at least
+        xq_descent_local_exclude tokens back. Children of a closed parent close earlier, so the
+        whole beam is causal by construction. Selection is no-grad (chunked over queries);
+        the kept slots are re-scored WITH grad for the indexer loss.
+
+        Returns the packed-read marker (zeros(1), candidates [B, n0, K] absolute node ids or
+        -1, dst_nodes [n0]) and stores self._xq_desc_record for _xq_index_loss."""
+        o = self._level_offsets_list(level_offsets)
+        nl = len(o) - 1
+        if nl < 2:
+            return None
+        sizes = [o[i + 1] - o[i] for i in range(nl)]
+        n0 = sizes[0]
+        B, _, H = x.shape
+        dev = x.device
+        start, beam, read_levels = self._xq_descent_levels(nl)
+        tabs = self._xq_tree_tables(sizes, dev)
+        t = node_ar_time.to(device=dev, dtype=torch.long)
+        q_t = t[o[0]:o[1]]
+        allow_same = bool(getattr(self, "hier_ar_allow_same_time", True))
+        q_pos = torch.arange(n0, device=dev)
+        tau = float(self.xq_index_gumbel) if self.training else 0.0
+        d = int(self.xq_index_dim)
+        scale = float(d) ** -0.5
+        xd = F.layer_norm(x.detach().float(), (H,))                    # indexer input: detached
+        q_all = self.xq_index_q(xd[:, o[0]:o[1]])                      # [B, n0, d] (grad)
+        k_lv = {l: self.xq_index_k[l](xd[:, o[l]:o[l + 1]]) for l in range(start + 1)}
+
+        levels_rec = []        # per level, top-down: (lvl, kept local ids [B,n0,k] (-1), parent slot [B,n0,k] | None)
+        CH = 4096              # query chunk: bounds the [B, CH, n_l] score transient (bf16, ~0.5 GB at L0 16k)
+        with torch.no_grad():
+            par = None
+            for i, lvl in enumerate(range(start, -1, -1)):
+                k_keep = beam[i] if lvl > 0 else int(self.xq_descent_topk_l0)
+                tl = t[o[lvl]:o[lvl + 1]]
+                if par is None:
+                    cand = torch.arange(sizes[lvl], device=dev).view(1, 1, -1).expand(B, n0, -1)
+                    pslot = None
+                else:
+                    kp = int(par.size(-1))
+                    ch = tabs[lvl + 1]                                   # [n_{l+1}, Kc]
+                    cand = ch.index_select(0, par.clamp(min=0).reshape(-1)).view(B, n0, kp, -1)
+                    cand = torch.where((par >= 0).unsqueeze(-1), cand, torch.full_like(cand, -1))
+                    pslot = torch.arange(kp, device=dev).view(1, 1, kp, 1).expand_as(cand).reshape(B, n0, -1)
+                    cand = cand.reshape(B, n0, -1)
+                    cand, order = cand.sort(dim=-1, descending=True)     # -1 sinks; dups adjacent
+                    pslot = pslot.gather(-1, order)
+                    dup = torch.zeros_like(cand, dtype=torch.bool)
+                    dup[..., 1:] = cand[..., 1:] == cand[..., :-1]
+                    cand = torch.where(dup, torch.full_like(cand, -1), cand)
+                m = int(cand.size(-1))
+                kk = min(k_keep, m)
+                keep_idx = torch.empty(B, n0, kk, dtype=torch.long, device=dev)
+                keep_ok = torch.empty(B, n0, kk, dtype=torch.bool, device=dev)
+                kl = k_lv[lvl].float()
+                # score-gather: one [c, d] x [d, n_l] GEMM per chunk, then gather the candidate
+                # columns -- far cheaper than gathering [c, m, d] keys (measured 8.5 of 15 ms
+                # per round). O(n0 * n_l * d) FLOPs, so past xq_stage3_gemm_max_n0 the
+                # linear key-gather path is kept.
+                _gemm = int(sizes[lvl]) <= int(getattr(self, "xq_stage3_gemm_max_n0", 16384))
+                klT = kl.to(torch.bfloat16).transpose(1, 2).contiguous() if _gemm else None
+                for s0 in range(0, n0, CH):
+                    e0 = min(n0, s0 + CH)
+                    c = cand[:, s0:e0]
+                    ok = c >= 0
+                    safe = c.clamp(min=0)
+                    tc = tl.index_select(0, safe.reshape(-1)).view_as(safe)
+                    qt = q_t[s0:e0].view(1, -1, 1)
+                    ok &= (tc <= qt) if allow_same else (tc < qt)
+                    if lvl == 0:
+                        ok &= safe <= (q_pos[s0:e0].view(1, -1, 1) - int(self.xq_descent_local_exclude))
+                    if par is None:
+                        sc = torch.matmul(q_all[:, s0:e0].float(), kl.transpose(1, 2))    # [B, c, n_l]
+                    elif _gemm:
+                        sc = torch.matmul(q_all[:, s0:e0].to(torch.bfloat16), klT).gather(-1, safe).float()
+                    else:
+                        kg = kl.gather(1, safe.reshape(B, -1, 1).expand(-1, -1, d)).view(B, e0 - s0, m, d)
+                        sc = (q_all[:, s0:e0].float().unsqueeze(2) * kg).sum(-1)
+                    sc = sc * scale
+                    if tau > 0.0:
+                        u = torch.rand_like(sc).clamp_(1e-6, 1.0 - 1e-6)
+                        sc = sc - tau * torch.log(-torch.log(u))         # Gumbel top-k == sampling
+                    sc = sc.masked_fill(~ok, float("-inf"))
+                    top = sc.topk(kk, dim=-1)
+                    keep_idx[:, s0:e0] = c.gather(-1, top.indices) if par is not None else top.indices
+                    keep_ok[:, s0:e0] = torch.isfinite(top.values)
+                    if pslot is not None:
+                        if s0 == 0:
+                            keep_par = torch.empty(B, n0, kk, dtype=torch.long, device=dev)
+                        keep_par[:, s0:e0] = pslot[:, s0:e0].gather(-1, top.indices)
+                kept = torch.where(keep_ok, keep_idx, torch.full_like(keep_idx, -1))
+                levels_rec.append((lvl, kept, keep_par if pslot is not None else None))
+                par = kept
+
+            cols, col_map = [], []
+            for lvl, kept, _ in levels_rec:
+                if lvl in read_levels:
+                    cols.append(torch.where(kept >= 0, kept + o[lvl], kept))
+                    col_map.append(lvl)
+            if not cols:
+                return None
+            cand_abs = torch.cat(cols, dim=-1)                           # [B, n0, K]
+            if self.training:
+                # stats are host ints (a sync): training only -- the eval / generation forward
+                # must stay sync-free so it can be captured as a CUDA graph
+                has_any = cand_abs >= 0
+                self._last_xq_nom_count = int(has_any.sum())
+                self._last_xq_nom_queries = int(has_any.any(-1).any(0).sum())
+        self._xq_desc_record = {"levels": levels_rec, "read_levels": col_map,
+                                "q": q_all, "k": k_lv, "scale": scale, "o": o}
+        self._xq_query_gate_full = None
+        dst_nodes = o[0] + torch.arange(n0, device=dev, dtype=torch.long)
+        return torch.zeros(1, device=dev, dtype=torch.long), cand_abs.long(), dst_nodes
+
+    def _xq_index_loss(self, read_mass: torch.Tensor) -> Optional[torch.Tensor]:
+        """Indexer distillation for the last xq descent round (lightning-indexer style, sparse).
+
+        read_mass [B, n0, K]: the consuming read's head-averaged attention per candidate
+        (detached). Each beam node's target is the mass of its SUBTREE in the read: its own
+        column (if its level is read) plus its kept descendants', propagated bottom-up through
+        the recorded parent slots. Per level: KL(target / sum || softmax(indexer score)) over
+        the KEPT nodes of each query (queries whose subtree mass is ~0 are skipped). Trains only
+        the indexer (its inputs and the target are detached)."""
+        rec = self._xq_desc_record
+        if rec is None or read_mass is None:
+            return None
+        levels, read_levels, q, k, scale = rec["levels"], rec["read_levels"], rec["q"], rec["k"], rec["scale"]
+        B, n0, _ = read_mass.shape
+        nq = int(self.xq_index_loss_queries)
+        if 0 < nq < n0:
+            # a random subset of query positions (shared across the batch): a distillation
+            # target needs no full coverage, and the coarse keys' gather backward is a
+            # contended scatter (measured 48 ms/step at 16k x4 with every query)
+            sel = torch.randperm(n0, device=read_mass.device)[:nq].sort().values
+            read_mass, q = read_mass.index_select(1, sel), q.index_select(1, sel)
+            levels = [(l, kept.index_select(1, sel), None if ps is None else ps.index_select(1, sel))
+                      for l, kept, ps in levels]
+            n0 = nq
+        own = {}
+        c0 = 0
+        for lvl in read_levels:
+            kept = next(r[1] for r in levels if r[0] == lvl)
+            kk = int(kept.size(-1))
+            own[lvl] = read_mass[:, :, c0:c0 + kk]
+            c0 += kk
+        sub = None              # subtree mass of the level below, per its kept slot
+        below_par = None
+        losses = []
+        for lvl, kept, par_slot in reversed(levels):                     # bottom-up
+            kk = int(kept.size(-1))
+            mass = own.get(lvl, torch.zeros(B, n0, kk, device=read_mass.device)).float().clone()
+            if sub is not None:
+                mass = mass.scatter_add(-1, below_par.clamp(min=0), torch.where(below_par >= 0, sub, torch.zeros_like(sub)))
+            valid = kept >= 0
+            mass = torch.where(valid, mass, torch.zeros_like(mass))
+            tot = mass.sum(-1, keepdim=True)
+            use = (tot.squeeze(-1) > 1e-6) & (valid.sum(-1) > 1)
+            if bool(use.any()):
+                safe = kept.clamp(min=0)
+                kg = k[lvl].gather(1, safe.reshape(B, -1, 1).expand(-1, -1, k[lvl].size(-1))).view(B, n0, kk, -1)
+                sc = (q.unsqueeze(2).float() * kg.float()).sum(-1) * scale
+                logq = torch.log_softmax(sc.masked_fill(~valid, float("-inf")), dim=-1)
+                p = mass / tot.clamp(min=1e-12)
+                kl = (p * (torch.log(p.clamp(min=1e-12)) - logq)).masked_fill(~valid | (p <= 0), 0.0).sum(-1)
+                losses.append(kl[use].mean())
+            sub, below_par = mass, par_slot
+        return torch.stack(losses).sum() if losses else None
 
     def _cross_query_nominate(
         self,
@@ -15498,6 +15772,10 @@ class HierarchicalFlowGAT(nn.Module):
         hqd_cached_step = -1
         layer_step = 0
         self._xq_nom_edges = None  # per-forward; filled once layer_step reaches _xq_nom_after
+        self._last_xq_index_loss = None   # xq descent indexer loss, summed over rounds
+        self._last_nom_kl_loss = None     # nomination KL, mean over the layers that computed it
+        self._nom_kl_acc = None
+        self._xq_desc_record = None
         self._xq_query_gate_full = None  # per-forward; the per-query relevance gate (with grad)
         # Clear LAST forward's gate hooks now, UNCONDITIONALLY (not per-layer in the loop:
         # gradient checkpointing re-reads the attr during backward, so it must outlive the
@@ -16000,11 +16278,22 @@ class HierarchicalFlowGAT(nn.Module):
                 # the xq_nominate_max_layers budget (the sparse path costs per layer).
                 # v1 HQD, when enabled, takes precedence on layers where it selected.
                 _xq_gate_cur = None
+                _xq_fed_mp = None
                 if hqd_b_idx is None and getattr(self, "_xq_nom_edges", None) is not None:
                     _xq_budget = int(getattr(self, "xq_nominate_max_layers", 0))
                     if _xq_budget <= 0 or _xq_nom_layers_used < _xq_budget:
                         hqd_b_idx, hqd_src_idx, hqd_dst_idx = self._xq_nom_edges
                         _xq_nom_layers_used += 1
+                        if self.xq_descent_enable and self._xq_desc_record is not None:
+                            # read hints for the consuming layer (host ints / flags, stable per
+                            # layer, so the compiled layer's guards do not churn)
+                            _xq_fed_mp = getattr(transformer, "message_passing", None)
+                            if _xq_fed_mp is not None:
+                                _o = self._xq_desc_record["o"]
+                                _xq_fed_mp._xq_dst_range = (int(_o[0]), int(_o[1] - _o[0]))
+                                _xq_fed_mp._xq_store_read_mass = bool(self.training)
+                                _xq_fed_mp._xq_read_ckpt = True
+                                _xq_fed_mp._xq_level_tags = True
                         # per-query relevance gate: carried as an EXPLICIT tensor argument
                         # through the checkpoint boundary (see _forward_with_hqd — the inner
                         # reentrant checkpoint double-backwards through attr-captured live
@@ -16151,6 +16440,38 @@ class HierarchicalFlowGAT(nn.Module):
                 if new_edge_attr is not None:
                     edge_attr_work = new_edge_attr
 
+                # nomination KL (local_pack_global_nom_kl): the layer stored its slot-mass KL
+                if self.training and self.local_pack_global_nom_kl:
+                    _mpk = getattr(transformer, "message_passing", None)
+                    _lk = getattr(_mpk, "_nom_kl_loss", None) if _mpk is not None else None
+                    if _lk is not None:
+                        _st = _mpk._nom_kl_stat
+                        _mpk._nom_kl_loss = None
+                        _mpk._nom_kl_stat = None
+                        _a = self._nom_kl_acc
+                        self._nom_kl_acc = ((_lk, _st, 1) if _a is None
+                                            else (_a[0] + _lk, _a[1] + _st, _a[2] + 1))
+                        self._last_nom_kl_loss = self._nom_kl_acc[0] / self._nom_kl_acc[2]
+
+                # xq descent: distil the indexer on this layer's read (training only)
+                if _xq_fed_mp is not None:
+                    _mass = getattr(_xq_fed_mp, "_xq_read_mass", None)
+                    _xq_fed_mp._xq_read_mass = None
+                    if self.training and _mass is not None:
+                        _l = self._xq_index_loss(_mass)
+                        if _l is not None:
+                            self._last_xq_index_loss = (_l if self._last_xq_index_loss is None
+                                                        else self._last_xq_index_loss + _l)
+                            # visibility: indexer KL + read stats, one sync every 250 rounds
+                            self._xq_log_n = int(getattr(self, "_xq_log_n", 0)) + 1
+                            if self._xq_log_n % 250 == 1:
+                                _B, _Q, _K = (int(v) for v in _mass.shape)
+                                logger.info(
+                                    "[XQ-DESC] round %d: indexer KL %.4f | read mass on candidates "
+                                    "%.3f (rest -> sink) | live candidates/query %.1f of %d",
+                                    self._xq_log_n, float(_l.detach()), float(_mass.sum(-1).mean()),
+                                    float(self._last_xq_nom_count) / max(1, _B * _Q), _K)
+
                 # ~~~~ Zipper (unchanged, runs after transformer) ~~~~
                 if run_zip_step:
                     x_before_zip = x
@@ -16266,8 +16587,10 @@ class HierarchicalFlowGAT(nn.Module):
                         or (_xq_every > 0 and (layer_step - _xq_last_nom_step) >= _xq_every)
                     )
                 ):
-                    self._xq_nom_edges = self._cross_query_nominate(
-                        x, base_lo, base_ar_time, block=transformer)
+                    self._xq_nom_edges = (
+                        self._xq_descent_nominate(x, base_lo, base_ar_time)
+                        if self.xq_descent_enable else
+                        self._cross_query_nominate(x, base_lo, base_ar_time, block=transformer))
                     _xq_nom_calls += 1
                     _xq_last_nom_step = layer_step
                     _xq_nom_layers_used = 0
@@ -17940,6 +18263,20 @@ class HierarchicalFlowGAT(nn.Module):
                 with torch.cuda.stream(side):
                     for _ in range(2):          # warm every lazy cache / compile at this shape
                         out = _feats()
+                    # PREFLIGHT: a host sync inside the capture fails it AND leaves the CUDA RNG
+                    # in capture mode, so the next training step's dropout dies ("Offset
+                    # increment outside graph capture"). Run the forward once with sync
+                    # detection raising, and never start a capture that cannot succeed.
+                    _prev_sync = torch.cuda.get_sync_debug_mode()
+                    torch.cuda.set_sync_debug_mode("error")
+                    try:
+                        _feats()
+                    except RuntimeError as _e:
+                        logger.warning("[GEN-GRAPH] host sync in the generation forward (%s); "
+                                       "generating without a CUDA graph.", str(_e).split("\n")[0][:200])
+                        return None
+                    finally:
+                        torch.cuda.set_sync_debug_mode(_prev_sync)
                 torch.cuda.current_stream(device).wait_stream(side)
                 if not (torch.is_tensor(out) and out.dim() == 3
                         and int(out.size(-1)) == int(self.hidden_dim) and int(out.size(1)) == L):

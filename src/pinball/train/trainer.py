@@ -1139,6 +1139,21 @@ def train_with_hybrid_masking(model, batch, criterion, optimizer, tokenizer,
             if predaux is not None:
                 loss = loss + model.lambda_hier_predaux * predaux.mean()
 
+            # xq descent indexer distillation (trains only the indexer: detached inputs/targets)
+            xq_index = getattr(model, "_last_xq_index_loss", None)
+            if xq_index is not None:
+                loss = loss + model.lambda_xq_index * xq_index
+            # nomination KL (local_pack_global_nom_kl): head weights -> flex slot mass
+            nom_kl = getattr(model, "_last_nom_kl_loss", None)
+            if nom_kl is not None:
+                loss = loss + model.lambda_nom_kl * nom_kl
+                model._nom_kl_log_n = int(getattr(model, "_nom_kl_log_n", 0)) + 1
+                if model._nom_kl_log_n % 250 == 1:
+                    _acc = model._nom_kl_acc
+                    logger.info("[NOM-KL] step %d: KL %.4f (mean over %d layers) | slot mass "
+                                "per query %.3f", model._nom_kl_log_n, float(nom_kl.detach()),
+                                int(_acc[2]), float(_acc[1][1]) / max(1, int(_acc[2])))
+
             # SIGReg: a latent-distribution constraint on the hierarchy. It was computed on every
             # forward and DISCARDED -- no trainer read `_last_sigreg_loss` -- so sigreg_enable:
             # true cost compute and changed nothing. Wired 2026-09-14 because predictive coding

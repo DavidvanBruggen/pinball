@@ -944,10 +944,11 @@ def _nom_stream_select_fn(w: torch.Tensor, u: Optional[torch.Tensor], lvl_packed
                           a: torch.Tensor, cnt: torch.Tensor, ok: torch.Tensor,
                           order: torch.Tensor, a_sorted: torch.Tensor, groups: List[Tuple[int, int, int, int]],
                           nch: int, K: int, tau: float, prefix: bool,
-                          gate_bias: Optional[torch.Tensor]):
+                          gate_bias: Optional[torch.Tensor], want_w: bool = False):
     """Running per-chunk top-K over the activation-sorted rows (see _nominate_by_head_stream)
     -> (rows [B, nch*K], gate [B, nch*K], stats dict). u = raw uniform noise [B, n] or None
-    (eval / no Gumbel); gate_bias None = raw gate, else zscore + bias."""
+    (eval / no Gumbel); gate_bias None = raw gate, else zscore + bias. want_w: also return the
+    raw per-slot weight (with grad) as stats["w_slot"] [B, nch*K] (local_pack_global_nom_kl)."""
     B = int(w.size(0))
     dev = w.device
     rank = w.detach()
@@ -985,6 +986,7 @@ def _nom_stream_select_fn(w: torch.Tensor, u: Optional[torch.Tensor], lvl_packed
     rows = top.reshape(B, nch * K).contiguous()
     okf = ok.reshape(-1).contiguous()
     g = w.gather(1, rows)
+    w_slot = g if want_w else None
     if gate_bias is not None:
         mu, var = _nom_prefix_stats_fn(w, a, cnt, nch)                              # differentiable
         sd = (var + 1e-6).sqrt()
@@ -1004,17 +1006,19 @@ def _nom_stream_select_fn(w: torch.Tensor, u: Optional[torch.Tensor], lvl_packed
             "gate_std": ((((_sg - _m) ** 2) * _live).sum() / _nl).sqrt(),
             "illegal_picks": (~legal & ok.unsqueeze(0)).sum(),
         }
+    if w_slot is not None:
+        stats["w_slot"] = w_slot
     return rows, g, stats
 
 
 def _nom_stream_fn(x_nodes, wq, wk, level_off, seg_idx, seg_sizes, cs, pslots, par, node_lvl,
                    perm, scale, u, lvl_packed, a, cnt, ok, order, a_sorted, groups, nch, K, tau,
-                   prefix, gate_bias):
+                   prefix, gate_bias, want_w=False):
     """Weights + selection in one function: the unit local_pack_global_nom_compile compiles."""
     w = _nom_weights_stream_fn(x_nodes, wq, wk, level_off, seg_idx, seg_sizes, cs, pslots,
                                par, node_lvl, perm, scale)
     return _nom_stream_select_fn(w, u, lvl_packed, a, cnt, ok, order, a_sorted, groups, nch, K,
-                                 tau, prefix, gate_bias)
+                                 tau, prefix, gate_bias, want_w)
 
 
 _NOM_STREAM_COMPILED = None
@@ -1217,6 +1221,13 @@ class HierarchicalMessagePassing(MessagePassing):
         # bit-identical when on. CPU eval stays eager. Default off.
         local_pack_global_nom_compile: bool = False,
         local_pack_global_nom_inline: bool = False,
+        local_pack_global_nom_query: bool = False,
+        # LIGHTNING-STYLE NOMINATION KL (head + stream + flex chunk slots, training only): the
+        # head's raw per-row weight, softmaxed over each chunk's picked slots, is pulled by KL
+        # toward the flex softmax's (detached, head-mean) attention mass on those slots, for
+        # the queries of nom_kl_chunks sampled chunks. Added to the existing gate gradient.
+        local_pack_global_nom_kl: bool = False,
+        local_pack_global_nom_kl_chunks: int = 8,
         # DIVERSITY (head only). At most `region_cap` picks per region, a region being a
         # candidate's ancestor at `region_level` (L2 = 64 tokens at 4096; a row at or above that
         # level is its own region). Measured 2026-09-30 on the q arms: the deterministic top-k
@@ -1452,6 +1463,22 @@ class HierarchicalMessagePassing(MessagePassing):
                 self.local_pack_global_nom_compile and self.local_pack_global_nominator == "head"):
             raise ValueError("local_pack_global_nom_inline needs local_pack_global_nom_compile "
                              "and local_pack_global_nominator='head'")
+        self.local_pack_global_nom_query = bool(local_pack_global_nom_query)
+        self.local_pack_global_nom_kl = bool(local_pack_global_nom_kl)
+        self.local_pack_global_nom_kl_chunks = max(1, int(local_pack_global_nom_kl_chunks or 8))
+        if self.local_pack_global_nom_kl and not (
+                self.local_pack_global_nominator == "head"
+                and self.local_pack_global_select_impl == "stream"):
+            raise ValueError("local_pack_global_nom_kl needs local_pack_global_nominator='head' "
+                             "and local_pack_global_select_impl='stream'")
+        self._nom_kl_loss = None
+        self._nom_kl_stat = None
+        if self.local_pack_global_nom_query and not (
+                self.local_pack_global_nominator == "head"
+                and self.local_pack_global_select_impl == "dense"):
+            raise ValueError("local_pack_global_nom_query needs local_pack_global_nominator='head' "
+                             "and local_pack_global_select_impl='dense' (its per-chunk keys are "
+                             "not nested, so the linear stream selector cannot rank them)")
         if self.local_pack_global_select_impl == "stream":
             if self.local_pack_global_gumbel_norm == "chunk":
                 raise ValueError("local_pack_global_select_impl='stream' needs gumbel_norm 'raw' or "
@@ -1511,6 +1538,14 @@ class HierarchicalMessagePassing(MessagePassing):
                 self.nom_parent_q = nn.ModuleList(nn.Linear(_H, _d, bias=False) for _ in range(_nlv - 1))
                 self.nom_child_k = nn.ModuleList(nn.Linear(_H, _d, bias=False) for _ in range(_nlv - 1))
                 self.nom_level_offset = nn.Parameter(torch.zeros(_nlv))
+                if self.local_pack_global_nom_query:
+                    # per-chunk query (mean of the PREVIOUS chunk's rows) x candidate key.
+                    # q ZERO-init: the selector starts as exactly the query-free ranking and
+                    # the query term grows through the gate (k random, so dq != 0).
+                    # A raw [d, H] Parameter, not an nn.Linear: the model's global init
+                    # re-initialises every Linear after construction and would undo the zero.
+                    self.nom_query_q = nn.Parameter(torch.zeros(_d, _H))
+                    self.nom_query_k = nn.Linear(_H, _d, bias=False)
                 if self.local_pack_global_nom_gate == "zscore":
                     # per-layer open/close for the slots; 0-d -> AdamW; 0 = gate 0.5 at z = 0
                     self.nom_gate_bias = nn.Parameter(torch.zeros(()))
@@ -3446,7 +3481,8 @@ class HierarchicalMessagePassing(MessagePassing):
         # never reach here. Reuse the SAME embeddings so "which level is this" means the
         # same thing on both paths. Parameter-free; no-op when the fetch is L0-only.
         if (
-            bool(getattr(self, "hqd_keep_stage_survivors", False))
+            (bool(getattr(self, "hqd_keep_stage_survivors", False))
+             or bool(getattr(self, "_xq_level_tags", False)))       # xq descent: multi-level reads
             and bool(getattr(self, "local_pack_level_bias", False))
             and node_level is not None
             and int(node_level.numel()) == int(num_nodes)
@@ -4123,10 +4159,25 @@ class HierarchicalMessagePassing(MessagePassing):
         # and write messages by slice (one CopySlices backward) instead of index_select +
         # index_add_ over [B*N] rows, whose scatter-style backward dominated the read cost.
         # Non-contiguous dst (HQD witness sets) keeps the index path.
-        d0 = int(dst_nodes[0].item()) if Q > 0 else 0
-        contig = Q > 1 and bool(
-            (dst_nodes == torch.arange(d0, d0 + Q, device=device, dtype=torch.long)).all().item()
-        )
+        _rng = getattr(self, "_xq_dst_range", None)
+        if _rng is not None and int(_rng[1]) == Q:
+            # xq descent: the model passes the contiguous L0 range as host ints -- no
+            # .item() syncs (two graph breaks inside the compiled layer otherwise)
+            d0, contig = int(_rng[0]), Q > 1
+        else:
+            d0 = int(dst_nodes[0].item()) if Q > 0 else 0
+            contig = Q > 1 and bool(
+                (dst_nodes == torch.arange(d0, d0 + Q, device=device, dtype=torch.long)).all().item()
+            )
+        _store_mass = bool(getattr(self, "_xq_store_read_mass", False))
+        _ckpt = bool(getattr(self, "_xq_read_ckpt", False)) and self.training and torch.is_grad_enabled()
+        masses: list = []
+        if bool(getattr(self, "_xq_read_ckpt", False)):
+            # xq descent: gather K/V in fp32. Many queries pick the SAME coarse rows, so the
+            # gather's backward is a heavily contended index_add -- and bf16 has no native
+            # atomic add (CAS loops): measured 58 ms/step of 643 at 16k x4. fp32 atomics are
+            # native; the read's math is promoted, the message cast back below.
+            flat_k, flat_v = flat_k.float(), flat_v.float()
         msgs: list = []
         out_flat = None
         if not contig:
@@ -4140,28 +4191,21 @@ class HierarchicalMessagePassing(MessagePassing):
                 continue
             safe = cand.clamp(min=0)
             gather_idx = (safe + batch_offsets).reshape(-1)
-            k_c = flat_k.index_select(0, gather_idx).view(int(B), end - start, K, num_heads, head_dim)
-            v_c = flat_v.index_select(0, gather_idx).view(int(B), end - start, K, num_heads, v_dim)
             if contig:
                 q_c = q[:, d0 + start : d0 + end]  # [B,Qc,H,D]
             else:
                 q_c = q.index_select(1, dst_nodes[start:end])  # [B,Qc,H,D]
-            scores = (q_c.unsqueeze(2) * k_c).sum(dim=-1) / math.sqrt(float(head_dim))  # [B,Qc,K,H]
-            scores = scores.masked_fill(~valid.unsqueeze(-1), neg)
-            sink_k = getattr(self, "hqd_read_sink_k", None)
-            if sink_k is not None:
-                # Zero-value sink slot: lets a query dump softmax mass when no candidate is
-                # relevant (a forced read over junk fetches is pure noise otherwise). The
-                # sink logit competes per query/head; its value contribution is zero, so
-                # mass on the sink shrinks the message instead of averaging irrelevant v's.
-                sink_logit = (q_c * sink_k.view(1, 1, num_heads, head_dim).to(dtype=q_c.dtype)).sum(-1)
-                scores = torch.cat([scores, (sink_logit / math.sqrt(float(head_dim))).unsqueeze(2)], dim=2)
-            weights = torch.softmax(scores, dim=2)
-            if sink_k is not None:
-                weights = weights[:, :, :K, :]
-            weights = torch.where(valid.unsqueeze(-1), weights, torch.zeros_like(weights))
-            msg = (weights.unsqueeze(-1) * v_c).sum(dim=2)  # [B,Qc,H,Dv]
-            msg = msg.to(dtype=q.dtype)
+            if _ckpt:
+                # xq descent: recompute the gathered K/V in backward instead of keeping
+                # [B, Qc, K, H, D] per chunk alive (the read's whole memory cost)
+                msg, wmass = torch.utils.checkpoint.checkpoint(
+                    self._hqd_packed_chunk, q_c, flat_k, flat_v, gather_idx, valid,
+                    num_heads, head_dim, v_dim, K, use_reentrant=False)
+            else:
+                msg, wmass = self._hqd_packed_chunk(q_c, flat_k, flat_v, gather_idx, valid,
+                                                    num_heads, head_dim, v_dim, K)
+            if _store_mass:
+                masses.append(wmass.detach())
             if contig:
                 msgs.append(msg)
             else:
@@ -4176,8 +4220,39 @@ class HierarchicalMessagePassing(MessagePassing):
         else:
             out = out_flat.view(int(B), int(num_nodes), num_heads, v_dim).reshape(int(B), int(num_nodes), num_heads * v_dim)
         out = self.sparse_out_proj(out)
+        if _store_mass:
+            # head-averaged read attention over the K candidates [B, Q, K] (detached): the
+            # xq descent's indexer-distillation target (see the model's _xq_index_loss)
+            self._xq_read_mass = torch.cat(masses, dim=1) if len(masses) > 1 else masses[0]
         self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
         return out
+
+    def _hqd_packed_chunk(self, q_c, flat_k, flat_v, gather_idx, valid, num_heads: int,
+                          head_dim: int, v_dim: int, K: int):
+        """One query chunk of _compute_hqd_packed_l0_attn -> (msg [B,Qc,H,Dv], head-mean
+        weights [B,Qc,K] fp32). Factored out so the xq descent can checkpoint it; the math
+        is the previous inline body, unchanged."""
+        B, Qc = int(q_c.size(0)), int(q_c.size(1))
+        neg = torch.finfo(q_c.dtype).min
+        k_c = flat_k.index_select(0, gather_idx).view(B, Qc, K, num_heads, head_dim)
+        v_c = flat_v.index_select(0, gather_idx).view(B, Qc, K, num_heads, v_dim)
+        scores = (q_c.unsqueeze(2) * k_c).sum(dim=-1) / math.sqrt(float(head_dim))  # [B,Qc,K,H]
+        scores = scores.masked_fill(~valid.unsqueeze(-1), neg)
+        sink_k = getattr(self, "hqd_read_sink_k", None)
+        if sink_k is not None:
+            # Zero-value sink slot: lets a query dump softmax mass when no candidate is
+            # relevant (a forced read over junk fetches is pure noise otherwise). The
+            # sink logit competes per query/head; its value contribution is zero, so
+            # mass on the sink shrinks the message instead of averaging irrelevant v's.
+            sink_logit = (q_c * sink_k.view(1, 1, num_heads, head_dim).to(dtype=q_c.dtype)).sum(-1)
+            scores = torch.cat([scores, (sink_logit / math.sqrt(float(head_dim))).unsqueeze(2)], dim=2)
+        weights = torch.softmax(scores, dim=2)
+        if sink_k is not None:
+            weights = weights[:, :, :K, :]
+        weights = torch.where(valid.unsqueeze(-1), weights, torch.zeros_like(weights))
+        msg = (weights.unsqueeze(-1) * v_c).sum(dim=2)  # [B,Qc,H,Dv]
+        return msg.to(dtype=q_c.dtype), weights.float().mean(-1)
+
 
     def _compute_hqd_dense_attn(
         self,
@@ -5158,6 +5233,26 @@ class HierarchicalMessagePassing(MessagePassing):
     # directly only under local_pack_global_nom_inline, whose path is break-free.
     _nominate_global_rows = torch._dynamo.disable(_nominate_global_rows_impl)
 
+    def _nom_query_scores(self, spec: Dict, x_nodes: torch.Tensor, C: int, nch: int) -> torch.Tensor:
+        """local_pack_global_nom_query: <q_c, k_r> / sqrt(d) -> [B, nch, n] fp32, differentiable.
+
+        q_c projects the MEAN of the previous chunk's packed rows (chunk 0: zero). Those rows
+        end at c*C, before every query of chunk c, so the slot set of a row never depends on
+        a row at or after it -- the leak a chunk's OWN queries would cause (row 0's slots
+        would read row C-1). k_r projects every packed row; the allowed mask applies later.
+        O(nch * n): quadratic with a 1/C constant (~50 MB at 16k x4); a quality test, not
+        the linear path."""
+        xp = x_nodes.index_select(1, spec["perm"])                           # [B, n, H]
+        B, n, H = int(xp.size(0)), int(xp.size(1)), int(xp.size(2))
+        full = min(nch - 1, n // C)                                          # complete chunks used
+        qsrc = xp.new_zeros(B, nch, H)
+        if full > 0:
+            qsrc[:, 1:full + 1] = xp[:, :full * C].reshape(B, full, C, H).mean(2)
+        q = F.linear(qsrc, self.nom_query_q.to(qsrc.dtype))                  # [B, nch, d]
+        k = self.nom_query_k(xp)                                             # [B, n, d]
+        return torch.matmul(q.float(), k.float().transpose(1, 2)) * (
+            float(self.local_pack_global_nom_dim) ** -0.5)
+
     def _nomination_weights(self, spec: Dict, lvl_packed: torch.Tensor,
                             x_nodes: torch.Tensor) -> torch.Tensor:
         """Hierarchy nomination weight per PACKED row -> [B, n] (differentiable).
@@ -5283,13 +5378,23 @@ class HierarchicalMessagePassing(MessagePassing):
             _geo = (allowed, ok)
             spec[_gk] = _geo
         allowed, ok = _geo
+        w0 = w                                                               # [B, n]
+        if self.local_pack_global_nom_query:
+            # per-chunk ranking key [B, nch, n] = w + <q_c, k_r> (see _nom_query_scores)
+            w = w.unsqueeze(1) + self._nom_query_scores(spec, x_nodes, C, nch)
         rank = w.detach()
         tau = float(getattr(self, "local_pack_global_gumbel", 0.0))
         neg = torch.finfo(rank.dtype).min
         if self.training and tau > 0.0:
-            u = torch.rand_like(rank).clamp_(1e-6, 1.0 - 1e-6)
+            u = torch.rand_like(w0.detach()).clamp_(1e-6, 1.0 - 1e-6)
             gn = -torch.log(-torch.log(u))                                   # [B, n]
-            if self.local_pack_global_gumbel_norm == "chunk":
+            if rank.dim() == 3:
+                # nom_query: noise per ROW (one draw, as the query-free path), scaled by the
+                # query-free spread at the row's activation chunk under 'prefix'
+                _s = (self._nom_prefix_noise_scale(spec, lvl_packed, w0.detach(), C, W, K, nch)
+                      if self.local_pack_global_gumbel_norm == "prefix" else 1.0)
+                sc = rank + (tau * _s * gn).unsqueeze(1)
+            elif self.local_pack_global_gumbel_norm == "chunk":
                 # noise in units of each chunk's weight spread: ranking == z + tau*Gumbel
                 am = allowed.to(rank.dtype); cnt = am.sum(1).clamp(min=1.0)
                 mu = (rank.unsqueeze(1) * am).sum(-1) / cnt
@@ -5304,7 +5409,8 @@ class HierarchicalMessagePassing(MessagePassing):
                 sc = (rank + tau * gn).unsqueeze(1).expand(-1, nch, -1)
             sc = sc.masked_fill(~allowed.unsqueeze(0), neg)
         else:
-            sc = rank.unsqueeze(1).masked_fill(~allowed.unsqueeze(0), neg)  # [B, nch, n]
+            sc = (rank if rank.dim() == 3 else rank.unsqueeze(1)).masked_fill(
+                ~allowed.unsqueeze(0), neg)                                  # [B, nch, n]
         if _cap > 0:
             sc = self._region_cap(sc, reg, _cap, neg)
         top = torch.topk(sc, K, dim=-1).indices                              # [B, nch, K]
@@ -5313,14 +5419,16 @@ class HierarchicalMessagePassing(MessagePassing):
         top = torch.where(legal, top, torch.zeros_like(top))
         rows = top.reshape(B, nch * K).contiguous()
         okf = ok.reshape(-1).contiguous()
-        g = w.gather(1, rows)
+        _w3 = w if w.dim() == 3 else w.unsqueeze(1)                          # [B, 1|nch, n]
+        g = (w.gather(1, rows) if w.dim() == 2
+             else w.gather(2, top).reshape(B, nch * K))                       # per-chunk key
         if self.local_pack_global_nom_gate == "zscore":
             # standardise over each chunk's ALLOWED set (causal), differentiable stats, so a
             # uniform shift of w is invisible to the gate; bias decides open/close per layer
             am = allowed.to(w.dtype)                                          # [nch, n]
             cnt = am.sum(1).clamp(min=1.0)                                    # [nch]
-            mu = (w.unsqueeze(1) * am).sum(-1) / cnt                          # [B, nch]
-            var = (((w.unsqueeze(1) - mu.unsqueeze(-1)) ** 2) * am).sum(-1) / cnt
+            mu = (_w3 * am).sum(-1) / cnt                                     # [B, nch]
+            var = (((_w3 - mu.unsqueeze(-1)) ** 2) * am).sum(-1) / cnt
             sd = (var + 1e-6).sqrt()
             g = ((g.view(B, nch, K) - mu.unsqueeze(-1)) / sd.unsqueeze(-1)).reshape(B, nch * K)
             g = g + self.nom_gate_bias.to(g.dtype)
@@ -5427,13 +5535,18 @@ class HierarchicalMessagePassing(MessagePassing):
         gb = self.nom_gate_bias if self.local_pack_global_nom_gate == "zscore" else None
         return (geo["a"], geo["cnt"], geo["ok"], geo["order"], geo["a_sorted"], geo["groups"],
                 int(nch), int(K), float(getattr(self, "local_pack_global_gumbel", 0.0)),
-                self.local_pack_global_gumbel_norm == "prefix", gb)
+                self.local_pack_global_gumbel_norm == "prefix", gb,
+                bool(self.local_pack_global_nom_kl and self.training))
 
     def _nom_stream_finish(self, spec: Dict, rows, g, stats, geo, C: int, nch: int, K: int):
+        w_slot = stats.pop("w_slot", None)
         self._nom_stats = stats
         st = spec["global_block"]["rows"]
-        return rows, g, {"chunk": C, "G": K, "nch": int(nch), "ok": geo["ok"].reshape(-1).contiguous(),
-                         "n_static": int(st.numel()), "static_rows": st, "per_batch": True}
+        meta = {"chunk": C, "G": K, "nch": int(nch), "ok": geo["ok"].reshape(-1).contiguous(),
+                "n_static": int(st.numel()), "static_rows": st, "per_batch": True}
+        if w_slot is not None:
+            meta["w_slot"] = w_slot
+        return rows, g, meta
 
     def prime_nomination_geometry(self, spec: Dict) -> None:
         """Build the stream selector's geometry caches in the spec EAGERLY, at spec build.
@@ -6264,6 +6377,14 @@ class HierarchicalMessagePassing(MessagePassing):
         # the model refuses the knobs without a levels-mode global block and without rings.
         _cc = spec.get("flex_cc", None) if (_pre is not None and gsel is None and not _ring) else None
         _lse = (_ring and _rmode == "lse") or (_cc is not None)
+        # nomination KL (training): the main call's LSE gives the slot mass exactly, provided
+        # the slots' scores are plain q.k (no score_mod) and no ring shares the softmax
+        _kl = bool(_l0s and self.training and self.local_pack_global_nom_kl
+                   and "w_slot" in gsel[2])
+        if _kl and (_ring or _smod is not None):
+            raise NotImplementedError("local_pack_global_nom_kl: slot mass needs a plain-score "
+                                      "main call (no ring merge, logit boost or dropkey)")
+        _want_lse = _lse or _kl
         if q_s.is_cuda and int(perm.numel()) >= 512:
             fn = _flex_compiled_singleton()
             # Default tiles exceed the workstation Blackwell's 101KB shared memory, so the
@@ -6272,12 +6393,14 @@ class HierarchicalMessagePassing(MessagePassing):
             _ko = {} if _km is None else {"BLOCK_M": _km, "BLOCK_N": _kn}
             if self._flex_flash_active():
                 _ko = {"BACKEND": "FLASH"}
-            out = fn(q_s, k_s, v_s, block_mask=bm, return_lse=_lse, kernel_options=_ko,
+            out = fn(q_s, k_s, v_s, block_mask=bm, return_lse=_want_lse, kernel_options=_ko,
                      **({"score_mod": _smod} if _smod is not None else {}))
         else:
-            out = flex_attention(q_s, k_s, v_s, block_mask=bm, return_lse=_lse,
+            out = flex_attention(q_s, k_s, v_s, block_mask=bm, return_lse=_want_lse,
                                  **({"score_mod": _smod} if _smod is not None else {}))
-        out, lse_main = out if _lse else (out, None)
+        out, lse_main = out if _want_lse else (out, None)
+        if _kl:
+            self._nom_kl_from_flex(q_s, k_s, lse_main, gsel)
         if _cc is not None:
             out = self._flex_coarse_call_merge(qp, kp, vp, spec, _cc, bool(causal), out, lse_main)
         out = out.transpose(1, 2)  # [B, N, H, D]
@@ -6301,6 +6424,54 @@ class HierarchicalMessagePassing(MessagePassing):
         return (((out.float() * w1 + o_r.float() * w2)
                  / (w1 + w2).clamp_min(1e-20))).to(out.dtype)
 
+
+    def _nom_kl_from_flex(self, q_s: torch.Tensor, k_s: torch.Tensor, lse: torch.Tensor,
+                          gsel: Tuple) -> None:
+        """local_pack_global_nom_kl: lightning-style distillation of the nomination head.
+
+        Layout of the flex call (chunk-slot prefix): K = [static S | nch*G chunk slots | rows],
+        query row r reads chunk r // C's G slots. For nom_kl_chunks sampled chunks, the slot
+        attention mass of each of their queries is exp(q.k / sqrt(D) - lse) (exact: the slots
+        carry no score_mod), head-averaged and renormalised over the chunk's live slots -- the
+        DETACHED target. The prediction is softmax over those slots of the head's RAW weight
+        w (the ranking score; the z-scored gate is affine in w per chunk, so pure rescaling of
+        w by this loss leaves the gate untouched). Stores self._nom_kl_loss (mean KL per live
+        query, grad into the head) and self._nom_kl_stat ([KL, mean slot mass], detached)."""
+        meta = gsel[2]
+        w_slot = meta["w_slot"]
+        G, C = int(meta["G"]), int(meta["chunk"])
+        nch, S = int(meta["nch"]), int(meta["n_static"])
+        B, H, N, D = (int(v) for v in q_s.shape)
+        m = min(int(self.local_pack_global_nom_kl_chunks), nch)
+        dev = q_s.device
+        ok = meta["ok"].view(nch, G)
+        with torch.no_grad():
+            ch = torch.randint(0, nch, (m,), device=dev)                      # sampled chunks
+            qr = ch.view(-1, 1) * C + torch.arange(C, device=dev).view(1, -1)   # [m, C] rows
+            qv = qr < N
+            qr = qr.clamp(max=N - 1).reshape(-1)
+            kr = (S + ch.view(-1, 1) * G + torch.arange(G, device=dev).view(1, -1)).reshape(-1)
+            qg = q_s.index_select(2, qr).view(B, H, m, C, D).float()
+            kg = k_s.index_select(2, kr).view(B, H, m, G, D).float()
+            s = torch.einsum("bhmcd,bhmgd->bhmcg", qg, kg) * (float(D) ** -0.5)
+            ls = lse.index_select(2, qr).view(B, H, m, C, 1).float()
+            okg = ok.index_select(0, ch)                                      # [m, G]
+            p = (s - ls).exp() * okg.view(1, 1, m, 1, G).float()
+            p = p.mean(1)                                                     # [B, m, C, G]
+            tot = p.sum(-1)                                                   # slot mass / query
+            live = qv.view(1, m, C) & (tot > 1e-6)
+            t = p / tot.clamp_min(1e-20).unsqueeze(-1)
+            ent = (t * t.clamp_min(1e-20).log()).sum(-1)
+        lw = w_slot.view(B, nch, G).index_select(1, ch).float()                # [B, m, G], grad
+        # finite fill (not -inf): an all-dead chunk must not put NaN into the backward
+        lw = lw.masked_fill(~okg.view(1, m, G), -1e4)
+        logq = torch.log_softmax(lw, -1)
+        xent = -(t * logq.unsqueeze(2)).sum(-1)                               # [B, m, C]
+        livef = live.float()
+        n = livef.sum().clamp(min=1.0)
+        kl = ((xent + ent) * livef).sum() / n
+        self._nom_kl_loss = kl
+        self._nom_kl_stat = torch.stack([kl.detach(), (tot * livef).sum() / n])
 
     def _l0_bands_block(self, qp, kp, vp, l0rows, lvlrows, w0, dp, causal, flash_fn):
         """L0 window UNION per-level coarse fields, as ONE softmax. Returns [B,n0,D].
@@ -7614,6 +7785,9 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_select_impl: str = "dense",  # head: dense | stream (linear selection)
         local_pack_global_nom_compile: bool = False,  # stream: compile the selector (train + CUDA eval)
         local_pack_global_nom_inline: bool = False,  # trace the selector INTO the layer graph (no break)
+        local_pack_global_nom_query: bool = False,  # dense selector: per-chunk QUERY-conditioned ranking
+        local_pack_global_nom_kl: bool = False,  # head: KL of the slot weights to the flex slot mass
+        local_pack_global_nom_kl_chunks: int = 8,  # query chunks sampled per call for that KL
         local_pack_global_region_cap: int = 0,  # head: max picks per region (0 = off)
         local_pack_global_region_level: int = 2,  # head: level defining regions
         local_pack_far_nope_dims: int = 0,  # far keys: unrotated tail dims only (0 = off)
@@ -7739,6 +7913,9 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_select_impl=local_pack_global_select_impl,
             local_pack_global_nom_compile=local_pack_global_nom_compile,
             local_pack_global_nom_inline=local_pack_global_nom_inline,
+            local_pack_global_nom_query=local_pack_global_nom_query,
+            local_pack_global_nom_kl=local_pack_global_nom_kl,
+            local_pack_global_nom_kl_chunks=local_pack_global_nom_kl_chunks,
             local_pack_global_region_cap=local_pack_global_region_cap,
             local_pack_global_region_level=local_pack_global_region_level,
             local_pack_far_nope_dims=local_pack_far_nope_dims,
