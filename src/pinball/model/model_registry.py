@@ -401,6 +401,7 @@ def build_pinball_model(
         local_pack_global_nom_query=bool(getattr(args, "local_pack_global_nom_query", False)),
         local_pack_global_nom_kl=bool(getattr(args, "local_pack_global_nom_kl", False)),
         local_pack_global_nom_kl_chunks=int(getattr(args, "local_pack_global_nom_kl_chunks", 8) or 8),
+        local_pack_global_nom_kl_detach=bool(getattr(args, "local_pack_global_nom_kl_detach", False)),
         lambda_nom_kl=float(getattr(args, "lambda_nom_kl", 1.0)),
         local_pack_far_nope_dims=int(getattr(args, "local_pack_far_nope_dims", 0) or 0),
         local_pack_far_bias=str(getattr(args, "local_pack_far_bias", "off") or "off"),

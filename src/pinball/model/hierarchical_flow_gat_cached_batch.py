@@ -3042,6 +3042,7 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_nom_query: bool = False,  # dense selector: per-chunk query-conditioned ranking
         local_pack_global_nom_kl: bool = False,  # head: lightning-style KL of slot weights to flex slot mass
         local_pack_global_nom_kl_chunks: int = 8,  # query chunks sampled per layer call for that KL
+        local_pack_global_nom_kl_detach: bool = False,  # KL trains a separate scorer on detached inputs
         lambda_nom_kl: float = 1.0,  # weight of the mean-over-layers nomination KL in the objective
         local_pack_far_nope_dims: int = 0,  # far keys (global block + slots) unrotated tail only; 0 = off
         local_pack_far_bias: str = "off",   # off | level: per-level logit bias on far keys (see the layer)
@@ -3735,6 +3736,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_nom_query = bool(local_pack_global_nom_query)
         self.local_pack_global_nom_kl = bool(local_pack_global_nom_kl)
         self.local_pack_global_nom_kl_chunks = max(1, int(local_pack_global_nom_kl_chunks or 8))
+        self.local_pack_global_nom_kl_detach = bool(local_pack_global_nom_kl_detach)
         self.lambda_nom_kl = float(lambda_nom_kl)
         self._last_nom_kl_loss: Optional[torch.Tensor] = None
         self.local_pack_far_nope_dims = max(0, int(local_pack_far_nope_dims or 0))
@@ -4600,6 +4602,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_query=bool(getattr(self, "local_pack_global_nom_query", False)),
                         local_pack_global_nom_kl=bool(getattr(self, "local_pack_global_nom_kl", False)),
                         local_pack_global_nom_kl_chunks=int(getattr(self, "local_pack_global_nom_kl_chunks", 8)),
+                        local_pack_global_nom_kl_detach=bool(getattr(self, "local_pack_global_nom_kl_detach", False)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
@@ -4730,6 +4733,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_query=bool(getattr(self, "local_pack_global_nom_query", False)),
                         local_pack_global_nom_kl=bool(getattr(self, "local_pack_global_nom_kl", False)),
                         local_pack_global_nom_kl_chunks=int(getattr(self, "local_pack_global_nom_kl_chunks", 8)),
+                        local_pack_global_nom_kl_detach=bool(getattr(self, "local_pack_global_nom_kl_detach", False)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),

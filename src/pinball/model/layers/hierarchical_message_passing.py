@@ -944,14 +944,17 @@ def _nom_stream_select_fn(w: torch.Tensor, u: Optional[torch.Tensor], lvl_packed
                           a: torch.Tensor, cnt: torch.Tensor, ok: torch.Tensor,
                           order: torch.Tensor, a_sorted: torch.Tensor, groups: List[Tuple[int, int, int, int]],
                           nch: int, K: int, tau: float, prefix: bool,
-                          gate_bias: Optional[torch.Tensor], want_w: bool = False):
+                          gate_bias: Optional[torch.Tensor], want_w: bool = False,
+                          rank_w: Optional[torch.Tensor] = None):
     """Running per-chunk top-K over the activation-sorted rows (see _nominate_by_head_stream)
     -> (rows [B, nch*K], gate [B, nch*K], stats dict). u = raw uniform noise [B, n] or None
     (eval / no Gumbel); gate_bias None = raw gate, else zscore + bias. want_w: also return the
-    raw per-slot weight (with grad) as stats["w_slot"] [B, nch*K] (local_pack_global_nom_kl)."""
+    raw per-slot weight (with grad) as stats["w_slot"] [B, nch*K] (local_pack_global_nom_kl).
+    rank_w: a separate ranking weight [B, n] (local_pack_global_nom_kl_detach); the picks and
+    w_slot then come from it while the gate stays w's."""
     B = int(w.size(0))
     dev = w.device
-    rank = w.detach()
+    rank = (w if rank_w is None else rank_w).detach()
     neg = torch.finfo(rank.dtype).min
     if u is not None:
         gn = -torch.log(-torch.log(u.clamp(1e-6, 1.0 - 1e-6)))
@@ -986,7 +989,7 @@ def _nom_stream_select_fn(w: torch.Tensor, u: Optional[torch.Tensor], lvl_packed
     rows = top.reshape(B, nch * K).contiguous()
     okf = ok.reshape(-1).contiguous()
     g = w.gather(1, rows)
-    w_slot = g if want_w else None
+    w_slot = (g if rank_w is None else rank_w.gather(1, rows)) if want_w else None
     if gate_bias is not None:
         mu, var = _nom_prefix_stats_fn(w, a, cnt, nch)                              # differentiable
         sd = (var + 1e-6).sqrt()
@@ -1013,12 +1016,18 @@ def _nom_stream_select_fn(w: torch.Tensor, u: Optional[torch.Tensor], lvl_packed
 
 def _nom_stream_fn(x_nodes, wq, wk, level_off, seg_idx, seg_sizes, cs, pslots, par, node_lvl,
                    perm, scale, u, lvl_packed, a, cnt, ok, order, a_sorted, groups, nch, K, tau,
-                   prefix, gate_bias, want_w=False):
-    """Weights + selection in one function: the unit local_pack_global_nom_compile compiles."""
+                   prefix, gate_bias, want_w=False, kl_args=None):
+    """Weights + selection in one function: the unit local_pack_global_nom_compile compiles.
+    kl_args (local_pack_global_nom_kl_detach) = (wq, wk, level_off) of the detached ranking
+    scorer, evaluated on x_nodes.detach() with the head's geometry."""
     w = _nom_weights_stream_fn(x_nodes, wq, wk, level_off, seg_idx, seg_sizes, cs, pslots,
                                par, node_lvl, perm, scale)
+    rank_w = None
+    if kl_args is not None:
+        rank_w = _nom_weights_stream_fn(x_nodes.detach(), kl_args[0], kl_args[1], kl_args[2],
+                                        seg_idx, seg_sizes, cs, pslots, par, node_lvl, perm, scale)
     return _nom_stream_select_fn(w, u, lvl_packed, a, cnt, ok, order, a_sorted, groups, nch, K,
-                                 tau, prefix, gate_bias, want_w)
+                                 tau, prefix, gate_bias, want_w, rank_w)
 
 
 _NOM_STREAM_COMPILED = None
@@ -1228,6 +1237,11 @@ class HierarchicalMessagePassing(MessagePassing):
         # the queries of nom_kl_chunks sampled chunks. Added to the existing gate gradient.
         local_pack_global_nom_kl: bool = False,
         local_pack_global_nom_kl_chunks: int = 8,
+        # DETACHED variant (the lightning indexer proper): a SEPARATE scorer of the head's
+        # shape on DETACHED layer inputs ranks the slots and is trained ONLY by that KL; the
+        # head keeps the gate and learns from the task loss alone. The main model never
+        # feels the KL.
+        local_pack_global_nom_kl_detach: bool = False,
         # DIVERSITY (head only). At most `region_cap` picks per region, a region being a
         # candidate's ancestor at `region_level` (L2 = 64 tokens at 4096; a row at or above that
         # level is its own region). Measured 2026-09-30 on the q arms: the deterministic top-k
@@ -1466,6 +1480,9 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_global_nom_query = bool(local_pack_global_nom_query)
         self.local_pack_global_nom_kl = bool(local_pack_global_nom_kl)
         self.local_pack_global_nom_kl_chunks = max(1, int(local_pack_global_nom_kl_chunks or 8))
+        self.local_pack_global_nom_kl_detach = bool(local_pack_global_nom_kl_detach)
+        if self.local_pack_global_nom_kl_detach and not self.local_pack_global_nom_kl:
+            raise ValueError("local_pack_global_nom_kl_detach needs local_pack_global_nom_kl")
         if self.local_pack_global_nom_kl and not (
                 self.local_pack_global_nominator == "head"
                 and self.local_pack_global_select_impl == "stream"):
@@ -1538,6 +1555,11 @@ class HierarchicalMessagePassing(MessagePassing):
                 self.nom_parent_q = nn.ModuleList(nn.Linear(_H, _d, bias=False) for _ in range(_nlv - 1))
                 self.nom_child_k = nn.ModuleList(nn.Linear(_H, _d, bias=False) for _ in range(_nlv - 1))
                 self.nom_level_offset = nn.Parameter(torch.zeros(_nlv))
+                if bool(local_pack_global_nom_kl_detach):
+                    # the detached ranking scorer: same shape as the head, own weights
+                    self.nom_kl_q = nn.ModuleList(nn.Linear(_H, _d, bias=False) for _ in range(_nlv - 1))
+                    self.nom_kl_k = nn.ModuleList(nn.Linear(_H, _d, bias=False) for _ in range(_nlv - 1))
+                    self.nom_kl_level_offset = nn.Parameter(torch.zeros(_nlv))
                 if self.local_pack_global_nom_query:
                     # per-chunk query (mean of the PREVIOUS chunk's rows) x candidate key.
                     # q ZERO-init: the selector starts as exactly the query-free ranking and
@@ -5341,6 +5363,11 @@ class HierarchicalMessagePassing(MessagePassing):
                 and str(getattr(self, "local_pack_global_select_impl", "dense")) == "stream"):
             return self._nominate_by_head_stream_compiled(spec, lvl_packed, x_nodes)
         w = self._nomination_weights(spec, lvl_packed, x_nodes)          # [B, n]
+        _rank_w = None
+        if getattr(self, "local_pack_global_nom_kl_detach", False):
+            _wa = self._nom_stream_weight_args(spec)
+            _klw = self._nom_kl_scorer_args(spec)
+            _rank_w = _nom_weights_stream_fn(x_nodes.detach(), _klw[0], _klw[1], _klw[2], *_wa[3:])
         B, n = int(w.size(0)), int(w.size(1))
         dev = w.device
         C = int(self.local_pack_global_chunk)
@@ -5349,7 +5376,7 @@ class HierarchicalMessagePassing(MessagePassing):
         K = max(1, min(int(self.local_pack_global_l0_budget), n))
         _cap = int(getattr(self, "local_pack_global_region_cap", 0) or 0)
         if str(getattr(self, "local_pack_global_select_impl", "dense")) == "stream":
-            return self._nominate_by_head_stream(spec, lvl_packed, w, C, W, nch, K)
+            return self._nominate_by_head_stream(spec, lvl_packed, w, C, W, nch, K, rank_w=_rank_w)
         reg = self._nom_region_ids(spec, lvl_packed) if _cap > 0 else None
         # Candidate set, per-chunk allowed mask and live-slot count are pure geometry:
         # built once per skeleton (cached in the spec, shared by every layer).
@@ -5508,7 +5535,8 @@ class HierarchicalMessagePassing(MessagePassing):
         return sd.gather(1, ia)
 
     def _nominate_by_head_stream(self, spec: Dict, lvl_packed: torch.Tensor, w: torch.Tensor,
-                                 C: int, W: int, nch: int, K: int):
+                                 C: int, W: int, nch: int, K: int,
+                                 rank_w: Optional[torch.Tensor] = None):
         """local_pack_global_select_impl='stream': the dense selector's picks in linear work.
 
         Rows sorted by activation chunk; chunks processed in groups of _NOM_STREAM_GROUP. Each
@@ -5520,7 +5548,8 @@ class HierarchicalMessagePassing(MessagePassing):
         B, n = int(w.size(0)), int(w.size(1))
         geo = self._nom_stream_geom(spec, lvl_packed, C, W, K, nch, n)
         u = self._nom_stream_noise(w.detach())
-        rows, g, stats = _nom_stream_select_fn(w, u, lvl_packed, *self._nom_stream_select_args(geo, nch, K))
+        rows, g, stats = _nom_stream_select_fn(w, u, lvl_packed, *self._nom_stream_select_args(geo, nch, K),
+                                               rank_w=rank_w)
         return self._nom_stream_finish(spec, rows, g, stats, geo, C, nch, K)
 
     def _nom_stream_noise(self, rank: torch.Tensor) -> Optional[torch.Tensor]:
@@ -5529,6 +5558,16 @@ class HierarchicalMessagePassing(MessagePassing):
         if self.training and float(getattr(self, "local_pack_global_gumbel", 0.0)) > 0.0:
             return torch.rand_like(rank)
         return None
+
+    def _nom_kl_scorer_args(self, spec: Dict) -> Optional[Tuple]:
+        """(wq, wk, level_offset) of the detached ranking scorer for the same level segments
+        as _nom_stream_weight_args (call that first: it builds spec['nom_stream_segs']), or
+        None (the head ranks)."""
+        if not getattr(self, "local_pack_global_nom_kl_detach", False):
+            return None
+        levels = spec["nom_stream_segs"][0]
+        return ([self.nom_kl_q[l].weight for l in levels], [self.nom_kl_k[l].weight for l in levels],
+                self.nom_kl_level_offset)
 
     def _nom_stream_select_args(self, geo: Dict[str, Any], nch: int, K: int) -> Tuple:
         """_nom_stream_select_fn's arguments after (w, u, lvl_packed)."""
@@ -5591,7 +5630,7 @@ class HierarchicalMessagePassing(MessagePassing):
         _fn = _nom_stream_fn if torch.compiler.is_compiling() else _nom_stream_compiled()
         rows, g, stats = _fn(
             x_nodes, *self._nom_stream_weight_args(spec), u, lvl_packed,
-            *self._nom_stream_select_args(geo, nch, K))
+            *self._nom_stream_select_args(geo, nch, K), kl_args=self._nom_kl_scorer_args(spec))
         return self._nom_stream_finish(spec, rows, g, stats, geo, C, nch, K)
 
     def _nom_region_ids(self, spec: Dict, lvl_packed: torch.Tensor) -> torch.Tensor:
@@ -7788,6 +7827,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_nom_query: bool = False,  # dense selector: per-chunk QUERY-conditioned ranking
         local_pack_global_nom_kl: bool = False,  # head: KL of the slot weights to the flex slot mass
         local_pack_global_nom_kl_chunks: int = 8,  # query chunks sampled per call for that KL
+        local_pack_global_nom_kl_detach: bool = False,  # KL trains a separate detached ranking scorer
         local_pack_global_region_cap: int = 0,  # head: max picks per region (0 = off)
         local_pack_global_region_level: int = 2,  # head: level defining regions
         local_pack_far_nope_dims: int = 0,  # far keys: unrotated tail dims only (0 = off)
@@ -7916,6 +7956,7 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_nom_query=local_pack_global_nom_query,
             local_pack_global_nom_kl=local_pack_global_nom_kl,
             local_pack_global_nom_kl_chunks=local_pack_global_nom_kl_chunks,
+            local_pack_global_nom_kl_detach=local_pack_global_nom_kl_detach,
             local_pack_global_region_cap=local_pack_global_region_cap,
             local_pack_global_region_level=local_pack_global_region_level,
             local_pack_far_nope_dims=local_pack_far_nope_dims,
