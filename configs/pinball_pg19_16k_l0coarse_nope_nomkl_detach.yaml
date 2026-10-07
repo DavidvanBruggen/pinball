@@ -1,9 +1,12 @@
 # ============================================================================
 # PG19 @16k, d384 -- DETACHED LIGHTNING-STYLE SLOT SCORER (local_pack_global_nom_kl_detach) (2026-10-07).
 # Parent: pinball_pg19_16k_l0coarse_nope.yaml (the cluster 256-slot arm). Diff: checkpoint_dir
-#   + local_pack_global_nom_kl / _chunks / _detach / lambda_nom_kl. NO speed knobs: they were on
-#   in the failed nomkl arm and are being cleared separately (local run 1), so this arm stays
-#   RNG-exact to the parent apart from the scorer.
+#   + local_pack_global_nom_kl / _chunks / _detach / lambda_nom_kl, + the two speed knobs
+#   (hier_layer_cudagraphs, local_pack_global_nom_inline; no math change). They were also on in
+#   the failed nomkl arm; cleared 2026-10-07: with dropout off, the in-graph Gumbel noise is fresh
+#   every step (0.927 of slots change step to step, same as the eager reference; 0.000 with
+#   tau 0), and local run 1 (parent + knobs, 20 epochs) checks the long run. They change only
+#   the RNG streams vs the parent.
 # WHY. The non-detached arm (pinball_pg19_16k_l0coarse_nope_nomkl.yaml, cluster, stopped ~ep80)
 #   was the weakest pinball run: 0.998 vs transformer at ep70-79 (nope 0.945), 128-511 1.235 vs
 #   nope 0.993; KL plateaued at 0.27-0.30. Its KL flowed through the head into the shared
@@ -1009,3 +1012,6 @@ local_pack_global_nom_kl: true
 local_pack_global_nom_kl_detach: true
 local_pack_global_nom_kl_chunks: 8     # 8 x 128 = 1024 queries per layer call
 lambda_nom_kl: 1.0
+# ---- speed knobs (no math change; see header) ----
+hier_layer_cudagraphs: true
+local_pack_global_nom_inline: true
