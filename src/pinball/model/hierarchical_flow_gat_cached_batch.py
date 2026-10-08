@@ -3053,6 +3053,8 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_tdesc_recent: int = 4,
         local_pack_global_tdesc_dim: int = 64,
         local_pack_global_tdesc_gumbel: float = 1.0,
+        local_pack_global_slot_read: str = "union",  # union (slots in the main softmax) | separate
+        local_pack_global_tdesc_read_coarse: Optional[List[int]] = None,  # tdesc: levels whose kept reps are read
         lambda_nom_kl: float = 1.0,  # weight of the mean-over-layers nomination KL in the objective
         local_pack_far_nope_dims: int = 0,  # far keys (global block + slots) unrotated tail only; 0 = off
         local_pack_far_bias: str = "off",   # off | level: per-level logit bias on far keys (see the layer)
@@ -3757,6 +3759,8 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_tdesc_recent = int(local_pack_global_tdesc_recent)
         self.local_pack_global_tdesc_dim = int(local_pack_global_tdesc_dim)
         self.local_pack_global_tdesc_gumbel = float(local_pack_global_tdesc_gumbel)
+        self.local_pack_global_slot_read = str(local_pack_global_slot_read or "union").lower()
+        self.local_pack_global_tdesc_read_coarse = [int(v) for v in (local_pack_global_tdesc_read_coarse or [])]
         self.lambda_nom_kl = float(lambda_nom_kl)
         self._last_nom_kl_loss: Optional[torch.Tensor] = None
         self.local_pack_far_nope_dims = max(0, int(local_pack_far_nope_dims or 0))
@@ -4633,6 +4637,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_tdesc_recent=int(getattr(self, "local_pack_global_tdesc_recent", 4)),
                         local_pack_global_tdesc_dim=int(getattr(self, "local_pack_global_tdesc_dim", 64)),
                         local_pack_global_tdesc_gumbel=float(getattr(self, "local_pack_global_tdesc_gumbel", 1.0)),
+                        local_pack_global_slot_read=str(getattr(self, "local_pack_global_slot_read", "union")),
+                        local_pack_global_tdesc_read_coarse=list(getattr(self, "local_pack_global_tdesc_read_coarse", [])),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
@@ -4774,6 +4780,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_tdesc_recent=int(getattr(self, "local_pack_global_tdesc_recent", 4)),
                         local_pack_global_tdesc_dim=int(getattr(self, "local_pack_global_tdesc_dim", 64)),
                         local_pack_global_tdesc_gumbel=float(getattr(self, "local_pack_global_tdesc_gumbel", 1.0)),
+                        local_pack_global_slot_read=str(getattr(self, "local_pack_global_slot_read", "union")),
+                        local_pack_global_tdesc_read_coarse=list(getattr(self, "local_pack_global_tdesc_read_coarse", [])),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),

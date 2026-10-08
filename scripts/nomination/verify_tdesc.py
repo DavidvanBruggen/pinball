@@ -33,6 +33,7 @@ def seed(s):
 
 cfg = PinballConfig.from_yaml(CFG)
 cfg.block_size = L
+cfg.local_pack_global_nom_kl_chunks = 10 ** 6     # KL over (nearly) every chunk: dead tiles included
 for k in ("hier_layer_compile", "hier_refresh_compile", "hier_layer_cudagraphs"):
     setattr(cfg, k, False)
 inp = resolve_model_inputs(cfg, block_size=L)
@@ -91,17 +92,17 @@ def reference(mp, spec, xn, n, chunks):
             s0 = b * S
             j = next((i for i, tt in enumerate(t) if tt >= s0 + S - 1), None)
             if j is None or t[j] - cov + 1 > s0:
-                reps.append((None, 10 ** 18)); continue
+                reps.append((None, 10 ** 18, None)); continue
             close = max(rows[j], lr0[min(t[j], n_tok - 1)])
             if l == fl:
                 close = max(close, lr0[s0 + S - 1])
-            reps.append((int(perm[rows[j]]), close))
+            reps.append((int(perm[rows[j]]), close, rows[j]))
         lv[l] = {"S": S, "reps": reps}
     for l in range(fl + 1, tl + 1):                          # effective close: max over subtree
         r = lv[l]["S"] // lv[l - 1]["S"]; lv[l]["r"] = r
         lo = lv[l - 1]["reps"]
-        lv[l]["reps"] = [(nd, max([c] + [lo[b * r + i][1] if b * r + i < len(lo) else 10 ** 18 for i in range(r)]))
-                         for b, (nd, c) in enumerate(lv[l]["reps"])]
+        lv[l]["reps"] = [(nd, max([c] + [lo[b * r + i][1] if b * r + i < len(lo) else 10 ** 18 for i in range(r)]), rw)
+                         for b, (nd, c, rw) in enumerate(lv[l]["reps"])]
     xd = F.layer_norm(xn.float(), (xn.size(-1),))[0]
     d = mp.local_pack_global_tdesc_dim
     out = {}
@@ -138,10 +139,14 @@ def reference(mp, spec, xn, n, chunks):
             kept_lv.append(prev)
         S_f = lv[fl]["S"]
         rec = [a_c - 1 - i for i in range(min(R, a_c))]
-        out[c] = (kept_lv, {lr0[b * S_f + i] for b in prev + rec for i in range(S_f)})
+        lvl_list = list(range(tl, fl - 1, -1))
+        coarse = {int(lv[l]["reps"][b][2]) for l in mp.local_pack_global_tdesc_read_coarse
+                  for b in kept_lv[lvl_list.index(l)]}
+        out[c] = (kept_lv, {lr0[b * S_f + i] for b in prev + rec for i in range(S_f)}, coarse)
     return out
 
 nchk = exact = lvl_exact = 0
+CO = []
 REC1 = list(REC[:3])
 CAP["on"] = True; REC.clear(); fwd(x); CAP["on"] = False       # bf16 record for checks 2+
 for (mp, spec, xn, n, rows, meta, kept) in REC1:
@@ -150,14 +155,20 @@ for (mp, spec, xn, n, rows, meta, kept) in REC1:
     chunks = [c for c in np.linspace(2, nch - 1, 5).astype(int).tolist() if bool(ok[c].any())]
     ref = reference(mp, spec, xn, n, chunks)
     for c in chunks:
-        got = set(rows[0].view(nch, G)[c][ok[c]].tolist())
-        kl_ref, want = ref[c]
-        nchk += 1; exact += int(got == want)
+        T0 = int(meta["tdesc"]["T0"])
+        rr_, okc = rows[0].view(nch, G)[c], ok[c]
+        got = set(rr_[:T0][okc[:T0]].tolist())
+        gotc = set(rr_[T0:][okc[T0:]].tolist())
+        kl_ref, want, wantc = ref[c]
+        exact_c = getattr(sys.modules[__name__], "exact_c", 0)
+        nchk += 1; exact += int(got == want); CO.append(gotc == wantc)
         live = meta["tdesc"]["live"]
         lvl_exact += int(all(set(kept[i][0, c, :int(live[i][c])].tolist()) == set(kl_ref[i])
                              for i in range(len(kept))))
 rep("final slots == reference", exact == nchk, f"{exact}/{nchk} chunks")
 rep("per-level beams == reference", lvl_exact == nchk, f"{lvl_exact}/{nchk} chunks")
+rep("coarse read slots == reference reps", all(CO), f"{sum(CO)}/{len(CO)} chunks "
+    f"(read levels {REC1[0][0].local_pack_global_tdesc_read_coarse})")
 
 print("2. slot invariants")
 bad = dup = nl0 = 0
@@ -166,12 +177,17 @@ for (mp, spec, xn, n, rows, meta, kept) in REC:
     ok = meta["ok"].view(nch, G); r = rows.view(-1, nch, G)
     lim = (torch.arange(nch, device=r.device) * C - W).view(1, -1, 1)
     bad += int(((r >= lim) & ok.unsqueeze(0)).sum())
-    nl0 += int(((spec["levels"][r] != 0) & ok.unsqueeze(0)).sum())
+    T0 = int(meta["tdesc"]["T0"]) if "tdesc" in meta else G
+    lvr = spec["levels"][r]
+    nl0 += int(((lvr[..., :T0] != 0) & ok[:, :T0].unsqueeze(0)).sum())
+    rcl = set(mp.local_pack_global_tdesc_read_coarse)
+    nl0 += int(((~torch.isin(lvr[..., T0:], torch.tensor(sorted(rcl) or [-1], device=r.device)))
+                & ok[:, T0:].unsqueeze(0)).sum())
     for b in range(r.size(0)):
         for c in range(0, nch, 5):
             vv = r[b, c][ok[c]]; dup += int(vv.numel() - vv.unique().numel())
 rep("live slots below the chunk limit", bad == 0, f"{bad} violations")
-rep("live slots are L0 rows", nl0 == 0, f"{nl0} non-L0")
+rep("live token slots are L0, coarse slots at read levels", nl0 == 0, f"{nl0} wrong-level")
 rep("no duplicate slots per chunk", dup == 0, f"{dup} duplicates")
 print(f"  live-slot fraction {float(np.mean([float(r_[5]['ok'].float().mean()) for r_ in REC])):.3f}")
 

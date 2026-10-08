@@ -412,6 +412,8 @@ def build_pinball_model(
         local_pack_global_tdesc_recent=int(getattr(args, "local_pack_global_tdesc_recent", 4)),
         local_pack_global_tdesc_dim=int(getattr(args, "local_pack_global_tdesc_dim", 64)),
         local_pack_global_tdesc_gumbel=float(getattr(args, "local_pack_global_tdesc_gumbel", 1.0)),
+        local_pack_global_slot_read=str(getattr(args, "local_pack_global_slot_read", "union") or "union"),
+        local_pack_global_tdesc_read_coarse=[int(v) for v in (getattr(args, "local_pack_global_tdesc_read_coarse", None) or [])],
         lambda_nom_kl=float(getattr(args, "lambda_nom_kl", 1.0)),
         local_pack_far_nope_dims=int(getattr(args, "local_pack_far_nope_dims", 0) or 0),
         local_pack_far_bias=str(getattr(args, "local_pack_far_bias", "off") or "off"),

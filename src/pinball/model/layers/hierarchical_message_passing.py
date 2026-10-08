@@ -1277,6 +1277,18 @@ class HierarchicalMessagePassing(MessagePassing):
         local_pack_global_tdesc_recent: int = 4,
         local_pack_global_tdesc_dim: int = 64,
         local_pack_global_tdesc_gumbel: float = 1.0,
+        # SLOT READ (nominator attn / tdesc). union: the slots are a K/V prefix of the main
+        # flex softmax (default, unchanged). separate: the main call keeps only band + static
+        # block, and the slots get their OWN softmax -- a second flex call with a pure-
+        # geometry block-diagonal mask (tile c reads only its G slots), full-width PRE-RoPE
+        # q.k (position-free content match, as the xq descent's read), a per-head LSE sink
+        # (out * sigmoid(lse - s0): a query that finds nothing reads ~nothing) and a
+        # per-head gate, added to the main output. The tdesc KL then reads this softmax.
+        local_pack_global_slot_read: str = "union",
+        # tdesc + separate read: levels whose KEPT blocks' representative nodes are read too
+        # (coarse summaries next to the tokens, as the xq descent reads its L3..L1 beams);
+        # their own read mass joins the subtree KL target of their level and the levels above
+        local_pack_global_tdesc_read_coarse: Optional[List[int]] = None,
         # DIVERSITY (head only). At most `region_cap` picks per region, a region being a
         # candidate's ancestor at `region_level` (L2 = 64 tokens at 4096; a row at or above that
         # level is its own region). Measured 2026-09-30 on the q arms: the deterministic top-k
@@ -1474,6 +1486,26 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_global_tdesc_recent = max(0, int(local_pack_global_tdesc_recent))
         self.local_pack_global_tdesc_dim = max(8, int(local_pack_global_tdesc_dim))
         self.local_pack_global_tdesc_gumbel = max(0.0, float(local_pack_global_tdesc_gumbel))
+        self.local_pack_global_slot_read = str(local_pack_global_slot_read or "union").lower()
+        if self.local_pack_global_slot_read not in {"union", "separate"}:
+            raise ValueError("local_pack_global_slot_read must be 'union' or 'separate', got "
+                             f"{local_pack_global_slot_read!r}")
+        if self.local_pack_global_slot_read == "separate":
+            if self.local_pack_global_nominator not in ("attn", "tdesc"):
+                raise ValueError("local_pack_global_slot_read='separate' needs nominator 'attn' or "
+                                 "'tdesc' (the head nominator's gate/boost live in the main softmax)")
+            # per-head sink logit (0-d per head, AdamW) and read gate; init: sink 0, gate 1
+            self.slot_read_sink = nn.Parameter(torch.zeros(int(self.num_heads)))
+            self.slot_read_gate = nn.Parameter(torch.ones(int(self.num_heads)))
+        self.local_pack_global_tdesc_read_coarse = sorted(
+            {int(v) for v in (local_pack_global_tdesc_read_coarse or [])}, reverse=True)
+        if self.local_pack_global_tdesc_read_coarse:
+            _tl, _fl = int(local_pack_global_tile_level or 0), self.local_pack_global_tdesc_final_level
+            if (self.local_pack_global_nominator != "tdesc" or self.local_pack_global_slot_read != "separate"
+                    or not all(_fl <= l <= _tl for l in self.local_pack_global_tdesc_read_coarse)):
+                raise ValueError("local_pack_global_tdesc_read_coarse needs nominator 'tdesc', slot_read "
+                                 "'separate' (a static level would be read twice in one softmax) and "
+                                 "levels in [tdesc_final_level, tile_level]")
         if self.local_pack_global_nominator == "tdesc":
             _tl, _fl = int(local_pack_global_tile_level or 0), self.local_pack_global_tdesc_final_level
             if not (1 <= _fl <= _tl) or len(self.local_pack_global_tdesc_beams) != _tl - _fl + 1:
@@ -5611,6 +5643,66 @@ class HierarchicalMessagePassing(MessagePassing):
             self._nom_stats = {"tile_live_frac": ok.float().mean()}
         return rows.contiguous(), None, meta
 
+    def _slot_read(self, q_raw: torch.Tensor, k_raw: torch.Tensor, vp: torch.Tensor,
+                   spec: Dict, gsel: Tuple) -> torch.Tensor:
+        """local_pack_global_slot_read='separate': the chunk slots in their OWN softmax.
+
+        q_raw / k_raw: packed PRE-RoPE q / k [B, N, H, D] (level tag included); vp: packed v
+        (node_keep applied). Keys = the gathered slot rows [B, nch*G]; tile c's queries read
+        only tile c's live slots -- a block-diagonal, pure-geometry BlockMask cached per
+        skeleton -- so every loaded tile is work. Returns per-head outputs [B, N, H, D] in
+        packed order (the identity layout of the main call), already sunk and gated."""
+        from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+        meta = gsel[2]
+        G, C, nch = int(meta["G"]), int(meta["chunk"]), int(meta["nch"])
+        B, N, H, D = (int(v) for v in q_raw.shape)
+        P = nch * G
+        ok = meta["ok"]
+        _key = ("slot_read_bm", N, P, G, C, int(self._flex_tile_choice()[0] or 0))
+        bm = spec.get("slot_read_bm", None) if spec.get("slot_read_bm_key", None) == _key else None
+        if bm is None:
+            def mask_mod(b, h, qi, ki):
+                kc = _flex_idx_clamp(ki, 0, P - 1)
+                return ((kc // G) == (qi // C)) & ok[kc]
+            _bs = self._flex_tile_choice()[0]
+            if self._flex_flash_active():
+                _bs = self._FLEX_FLASH_BLOCK
+            if not (q_raw.is_cuda and N >= 512):
+                _bs = None
+            _kw = {} if _bs is None else {"BLOCK_SIZE": (_bs, _bs)}
+            try:
+                bm = _block_mask_sweep(create_block_mask, mask_mod, N, P, q_raw.device, _kw)
+            except TypeError:
+                bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=N, KV_LEN=P,
+                                       device=str(q_raw.device), **_kw)
+            spec["slot_read_bm"], spec["slot_read_bm_key"] = bm, _key
+        ix = gsel[0].view(B, P, 1, 1).expand(-1, -1, H, D)
+        q_s = q_raw.transpose(1, 2)
+        k_s = k_raw.gather(1, ix).transpose(1, 2)
+        v_s = vp.gather(1, ix).transpose(1, 2)
+        _p = float(self.dropout.p) if self.training else 0.0
+        if _p > 0.0:                      # token-wise V dropout, as the main call
+            _keep = torch.rand(v_s.shape[0], v_s.shape[1], v_s.shape[2], 1,
+                               device=v_s.device, dtype=torch.float32) >= _p
+            v_s = v_s * (_keep.to(v_s.dtype) / (1.0 - _p))
+        if q_s.is_cuda and N >= 512:
+            fn = _flex_compiled_singleton()
+            _, _km, _kn = self._flex_tile_choice()
+            _ko = {} if _km is None else {"BLOCK_M": _km, "BLOCK_N": _kn}
+            if self._flex_flash_active():
+                _ko = {"BACKEND": "FLASH"}
+            out, lse = fn(q_s, k_s, v_s, block_mask=bm, return_lse=True, kernel_options=_ko)
+        else:
+            out, lse = flex_attention(q_s, k_s, v_s, block_mask=bm, return_lse=True)
+        if self.training and "tdesc" in meta:
+            # the indexer KL reads THIS softmax: slots only, no static prefix
+            self._tdesc_kl_from_flex(q_s, k_s, lse, (gsel[0], None, dict(meta, n_static=0)))
+        # LSE sink: out * exp(lse) / (exp(lse) + exp(s0)); rows with no live slot (lse -inf) -> 0
+        w = torch.sigmoid(lse.float() - self.slot_read_sink.float().view(1, H, 1))
+        w = w * self.slot_read_gate.float().view(1, H, 1)
+        out = out * w.unsqueeze(-1).to(out.dtype)
+        return out.transpose(1, 2)
+
     def _tdesc_geom(self, spec: Dict, C: int, W: int, nch: int) -> Dict:
         """Geometry of the tiled descent (cached per skeleton in the spec).
 
@@ -5657,6 +5749,7 @@ class HierarchicalMessagePassing(MessagePassing):
                 last = lr0.index_select(0, (bst + S - 1).clamp(max=n_tok - 1))
                 close = torch.maximum(close, last)
             lv[l] = {"S": S, "nb": nb, "close": close, "node": perm.index_select(0, rrow) if nl else bst,
+                     "row": rrow,
                      "last_tok": lr0.index_select(0, (bst + S - 1).clamp(max=n_tok - 1)) if l == fl else None}
         for l in range(fl + 1, tl + 1):                                        # nesting, bottom-up
             r = lv[l]["S"] // lv[l - 1]["S"]
@@ -5725,7 +5818,9 @@ class HierarchicalMessagePassing(MessagePassing):
             k = min(int(beams[i]), int(lv[l]["nb"])) if i == 0 else min(int(beams[i]), k * int(lv[l + 1]["r"]))
             ks.append(k)
         kf = ks[-1]
-        G = max(1, (kf + R) * S_f)
+        rc = [(levels.index(l), l) for l in self.local_pack_global_tdesc_read_coarse]
+        Gc = sum(ks[i] for i, _ in rc)                                 # coarse reps read
+        G = max(1, (kf + R) * S_f + Gc)
         B = int(x_nodes.size(0))
         dev = x_nodes.device
         # live counts per chunk (geometry): top = allowed, below = children of the live parents;
@@ -5740,8 +5835,14 @@ class HierarchicalMessagePassing(MessagePassing):
             live[0] = (live[0] - geo["live_R"]).clamp(min=0)
         live_f, live_R = live[-1], geo["live_R"]
         sl = torch.arange(G, device=dev).view(1, -1)
+        T0 = (kf + R) * S_f
         ok = torch.where(sl < kf * S_f, sl < (live_f * S_f).view(-1, 1),
                          (sl - kf * S_f) < (live_R * S_f).view(-1, 1))           # [nch, G]
+        _off = T0
+        for i, l in rc:                                                  # coarse part: live reps
+            seg = (sl >= _off) & (sl < _off + ks[i])
+            ok = torch.where(seg, (sl - _off) < live[i].view(-1, 1), ok)
+            _off += ks[i]
         st = spec["global_block"]["rows"]
         meta = {"chunk": C, "G": G, "nch": int(nch), "ok": ok.reshape(-1).contiguous(),
                 "n_static": int(st.numel()), "static_rows": st, "per_batch": True}
@@ -5757,7 +5858,9 @@ class HierarchicalMessagePassing(MessagePassing):
         if kf == 0 or nch < 2:
             rr = lr0[(rec_ids.unsqueeze(-1) * S_f + torch.arange(S_f, device=dev)).clamp(max=n_tok - 1)]
             rows = rr.reshape(1, nch, -1).expand(B, -1, -1)
-            rows = torch.cat([torch.zeros(B, nch, G - int(rows.size(-1)), dtype=torch.long, device=dev), rows], -1)
+            rows = torch.cat([torch.zeros(B, nch, kf * S_f, dtype=torch.long, device=dev), rows,
+                              torch.zeros(B, nch, G - kf * S_f - int(rows.size(-1)), dtype=torch.long,
+                                          device=dev)], -1)
             rows = torch.where(ok.unsqueeze(0), rows, torch.zeros_like(rows)).reshape(B, nch * G)
             return rows.contiguous(), None, meta
         kept = []
@@ -5800,10 +5903,14 @@ class HierarchicalMessagePassing(MessagePassing):
             fb = kept[-1].clamp(max=int(lv[fl]["nb"]) - 1)                         # [B, nch, kf]
             toks = torch.cat([fb, rec_ids.unsqueeze(0).expand(B, -1, -1)], -1)    # [B, nch, kf+R]
             tok = toks.unsqueeze(-1) * S_f + torch.arange(S_f, device=dev).view(1, 1, 1, -1)
-            rows = lr0[tok.clamp(max=n_tok - 1)].reshape(B, nch, G)
+            rows = lr0[tok.clamp(max=n_tok - 1)].reshape(B, nch, T0)
+            if rc:
+                crow = [lv[l]["row"][kept[i].clamp(max=int(lv[l]["nb"]) - 1)] for i, l in rc]
+                rows = torch.cat([rows] + crow, -1)                                # [B, nch, G]
             rows = torch.where(ok.unsqueeze(0), rows, torch.zeros_like(rows)).reshape(B, nch * G)
         meta["tdesc"] = {"q": q_all, "k": k_lv, "kept": kept, "live": live, "levels": levels,
-                         "S": [int(lv[l]["S"]) for l in levels], "kf": kf, "S_f": S_f}
+                         "S": [int(lv[l]["S"]) for l in levels], "kf": kf, "S_f": S_f,
+                         "rc": rc, "T0": T0}
         self._nom_stats = {"tdesc_live_frac": ok.float().mean()}
         return rows.contiguous(), None, meta
 
@@ -5811,19 +5918,23 @@ class HierarchicalMessagePassing(MessagePassing):
                             gsel: Tuple) -> None:
         """Tiled-descent indexer distillation (the xq descent's loss, per tile).
 
-        For nom_kl_chunks sampled chunks, each query's attention mass on the chunk's DESCENT
-        slots (not the recency blocks) is exp(q.k / sqrt(D) - lse), head-averaged (exact: the
-        slots carry no score_mod) and summed per final block. Per level, a kept block's
-        target is the mass of its kept final descendants (subtree), renormalised over the
+        For nom_kl_chunks sampled chunks, each query's attention mass on every slot is
+        exp(q.k / sqrt(D) - lse), head-averaged (exact: the slots carry no score_mod). READ
+        ITEMS: the descent's final token blocks (mass summed over the block; the recency
+        blocks are not descent picks and are left out) and, with tdesc_read_coarse, the kept
+        coarse representatives of the read levels (their own mass). Per level, a kept block's
+        target is the mass of every read item inside its token range at its level or below --
+        its own representative plus its subtree, the xq descent's rule -- renormalised over the
         level's kept blocks; the prediction is softmax of the indexer score q_i . k_block over
-        them. KL summed over levels, mean over live queries. Detached target and inputs:
-        grad only into the indexer. Stores self._nom_kl_loss / _nom_kl_stat."""
+        them. KL summed over levels, mean over live queries. Detached target and inputs: grad
+        only into the indexer. Stores self._nom_kl_loss / _nom_kl_stat."""
         meta = gsel[2]
         td = meta["tdesc"]
         G, C = int(meta["G"]), int(meta["chunk"])
         nch, S = int(meta["nch"]), int(meta["n_static"])
         B, H, N, D = (int(v) for v in q_s.shape)
-        kf, S_f = int(td["kf"]), int(td["S_f"])
+        kf, S_f, T0 = int(td["kf"]), int(td["S_f"]), int(td.get("T0", 0) or 0)
+        rc = td.get("rc", [])
         m = min(int(self.local_pack_global_nom_kl_chunks), max(1, nch - 1))
         dev = q_s.device
         ok = meta["ok"].view(nch, G)
@@ -5832,18 +5943,34 @@ class HierarchicalMessagePassing(MessagePassing):
             qr = ch.view(-1, 1) * C + torch.arange(C, device=dev).view(1, -1)
             qv = qr < N
             qr = qr.clamp(max=N - 1).reshape(-1)
-            Gd = kf * S_f
-            kr = (S + ch.view(-1, 1) * G + torch.arange(Gd, device=dev).view(1, -1)).reshape(-1)
+            kr = (S + ch.view(-1, 1) * G + torch.arange(G, device=dev).view(1, -1)).reshape(-1)
             qg = q_s.index_select(2, qr).view(B, H, m, C, D).float()
-            kg = k_s.index_select(2, kr).view(B, H, m, Gd, D).float()
+            kg = k_s.index_select(2, kr).view(B, H, m, G, D).float()
             s = torch.einsum("bhmcd,bhmgd->bhmcg", qg, kg) * (float(D) ** -0.5)
             ls = lse.index_select(2, qr).view(B, H, m, C, 1).float()
-            okg = ok.index_select(0, ch)[:, :Gd]                                    # [m, Gd]
-            p = ((s - ls).exp() * okg.view(1, 1, m, 1, Gd).float()).mean(1)        # [B, m, C, Gd]
-            mf = p.view(B, m, C, kf, S_f).sum(-1)                                  # per final block
-            tot = mf.sum(-1)
-            fst = td["kept"][-1].index_select(1, ch) * S_f                         # [B, m, kf] starts
-            fok = okg.view(m, kf, S_f)[..., 0].view(1, m, kf)
+            # a row with no live key has lse -inf (the separate slot read: tiles before the
+            # first closed block) -> exp(+inf) * 0 = NaN; such rows get mass 0 (and drop out)
+            ls = torch.where(torch.isfinite(ls), ls, torch.full_like(ls, 1e30))
+            okg = ok.index_select(0, ch)                                            # [m, G]
+            p = torch.where(okg.view(1, 1, m, 1, G), (s - ls).exp(),
+                            torch.zeros_like(s)).mean(1)                            # [B, m, C, G]
+            Gd = kf * S_f
+            # read items: token blocks (level -1 = below every block level) + coarse reps
+            imass = [p[..., :Gd].reshape(B, m, C, kf, S_f).sum(-1)]
+            istart = [td["kept"][-1].index_select(1, ch) * S_f]
+            ilvl = [torch.full((kf,), -1, dtype=torch.long, device=dev)]
+            ival = [okg[:, :Gd].reshape(m, kf, S_f)[..., 0].view(1, m, kf).expand(B, -1, -1)]
+            _off = T0
+            for i, l in rc:
+                k_i = int(td["kept"][i].size(-1))
+                imass.append(p[..., _off:_off + k_i])
+                istart.append(td["kept"][i].index_select(1, ch) * int(td["S"][i]))
+                ilvl.append(torch.full((k_i,), int(l), dtype=torch.long, device=dev))
+                ival.append(okg[:, _off:_off + k_i].view(1, m, k_i).expand(B, -1, -1))
+                _off += k_i
+            imass, istart = torch.cat(imass, -1), torch.cat(istart, -1)          # [B,m,C,I], [B,m,I]
+            ilvl, ival = torch.cat(ilvl, -1), torch.cat(ival, -1)                # [I], [B,m,I]
+            tot = (imass * ival.unsqueeze(2).float()).sum(-1)                    # descent read mass
         losses = []
         for i, l in enumerate(td["levels"]):
             kept = td["kept"][i].index_select(1, ch)                                # [B, m, k]
@@ -5853,9 +5980,11 @@ class HierarchicalMessagePassing(MessagePassing):
             with torch.no_grad():
                 S_l = int(td["S"][i])
                 kst = kept * S_l
-                mem = ((fst.unsqueeze(2) >= kst.unsqueeze(-1)) & (fst.unsqueeze(2) < (kst + S_l).unsqueeze(-1))
-                       & fok.unsqueeze(2) & vk.unsqueeze(-1))                       # [B, m, k, kf]
-                tgt = torch.einsum("bmcf,bmkf->bmck", mf, mem.float())
+                mem = ((istart.unsqueeze(2) >= kst.unsqueeze(-1))
+                       & (istart.unsqueeze(2) < (kst + S_l).unsqueeze(-1))
+                       & (ilvl <= int(l)).view(1, 1, 1, -1)
+                       & ival.unsqueeze(2) & vk.unsqueeze(-1))                      # [B, m, k, I]
+                tgt = torch.einsum("bmci,bmki->bmck", imass, mem.float())
                 tt = tgt.sum(-1)
                 live = qv.view(1, m, C) & (tt > 1e-6) & (vk.sum(-1) > 1).view(1, m, 1)
                 t = tgt / tt.clamp_min(1e-20).unsqueeze(-1)
@@ -7194,6 +7323,9 @@ class HierarchicalMessagePassing(MessagePassing):
         if getattr(self, "local_pack_level_bias", False) and lvl_packed is not None:
             kp = kp + self.local_pack_level_k_emb.index_select(0, lvl_packed).unsqueeze(0).to(kp.dtype)
             vp = vp + self.local_pack_level_v_emb.index_select(0, lvl_packed).unsqueeze(0).to(vp.dtype)
+        # separate slot read: the slots' own softmax scores PRE-RoPE q.k (level tag included)
+        _qk_raw = ((qp, kp) if getattr(self, "local_pack_global_slot_read", "union") == "separate"
+                   else None)
         pos_nd = spec.get("pos_nd", None) if bool(getattr(self, "local_pack_rope_axial", False)) else None
         if hasattr(self, "rotary_pos_enc") and pos_nd is not None:
             # Axial ND RoPE (curve mode): rotate with TRUE spatial coords — exact (dy, dx)
@@ -7269,8 +7401,13 @@ class HierarchicalMessagePassing(MessagePassing):
                 # additive arm it was built to be compared against.
                 while True:
                     try:
+                        _sep = (_qk_raw is not None and _gsel is not None and _gsel[2] is not None
+                                and _gsel[2].get("per_batch", False))
                         out_flex = self._flex_union_attn(qp, kp, vp, spec, pack_causal,
-                                                         gsel=_gsel)
+                                                         gsel=None if _sep else _gsel)
+                        if _sep:
+                            out_flex = out_flex + self._slot_read(
+                                _qk_raw[0], _qk_raw[1], vp, spec, _gsel).to(out_flex.dtype)
                         if getattr(self, "hier_level_qkv", "shared") != "shared":
                             # level-specific out_proj: scatter to node order (level-contiguous),
                             # project per level group, gather the query rows back
@@ -8376,6 +8513,18 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_tdesc_recent: int = 4,
         local_pack_global_tdesc_dim: int = 64,
         local_pack_global_tdesc_gumbel: float = 1.0,
+        # SLOT READ (nominator attn / tdesc). union: the slots are a K/V prefix of the main
+        # flex softmax (default, unchanged). separate: the main call keeps only band + static
+        # block, and the slots get their OWN softmax -- a second flex call with a pure-
+        # geometry block-diagonal mask (tile c reads only its G slots), full-width PRE-RoPE
+        # q.k (position-free content match, as the xq descent's read), a per-head LSE sink
+        # (out * sigmoid(lse - s0): a query that finds nothing reads ~nothing) and a
+        # per-head gate, added to the main output. The tdesc KL then reads this softmax.
+        local_pack_global_slot_read: str = "union",
+        # tdesc + separate read: levels whose KEPT blocks' representative nodes are read too
+        # (coarse summaries next to the tokens, as the xq descent reads its L3..L1 beams);
+        # their own read mass joins the subtree KL target of their level and the levels above
+        local_pack_global_tdesc_read_coarse: Optional[List[int]] = None,
         local_pack_global_region_cap: int = 0,  # head: max picks per region (0 = off)
         local_pack_global_region_level: int = 2,  # head: level defining regions
         local_pack_far_nope_dims: int = 0,  # far keys: unrotated tail dims only (0 = off)
@@ -8515,6 +8664,8 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_tdesc_recent=local_pack_global_tdesc_recent,
             local_pack_global_tdesc_dim=local_pack_global_tdesc_dim,
             local_pack_global_tdesc_gumbel=local_pack_global_tdesc_gumbel,
+            local_pack_global_slot_read=local_pack_global_slot_read,
+            local_pack_global_tdesc_read_coarse=local_pack_global_tdesc_read_coarse,
             local_pack_global_region_cap=local_pack_global_region_cap,
             local_pack_global_region_level=local_pack_global_region_level,
             local_pack_far_nope_dims=local_pack_far_nope_dims,
