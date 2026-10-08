@@ -35,6 +35,12 @@ class TransformerConfig:
     gradient_checkpointing: bool = False
     tie_weights: bool = True
     ffn_type: str = "swiglu"
+    # Separate q/k/v projections instead of one fused c_attn [3*n_embd, n_embd]. Same function
+    # and parameter count; it matters for Muon, which orthogonalises each matrix as a whole: on
+    # the fused matrix Q, K and V share one update budget split by gradient size, and V's
+    # gradient dominates (measured at init: Q/K steps 10-20x smaller than when split). Pinball's
+    # q_proj/k_proj/v_proj are separate, so this is the optimizer-parity knob. Off = fused.
+    split_qkv: bool = False
     causal: bool = True
     class_cond_enable: bool = False
     num_classes: int = 0
@@ -160,7 +166,13 @@ class CausalSelfAttention(nn.Module):
         self.attn_backend = str(config.attn_backend).lower()
         if self.attn_backend not in {"auto", "flash", "sdpa", "eager"}:
             self.attn_backend = "auto"
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.split_qkv = bool(config.split_qkv)
+        if self.split_qkv:
+            self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+            self.k_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+            self.v_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        else:
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -187,7 +199,10 @@ class CausalSelfAttention(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        if self.split_qkv:
+            q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        else:
+            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(bsz, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.n_head, self.head_dim).transpose(1, 2)

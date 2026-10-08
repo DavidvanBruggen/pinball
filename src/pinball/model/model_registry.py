@@ -71,6 +71,7 @@ def build_transformer_model(
         gradient_checkpointing=bool(getattr(args, "transformer_gradient_checkpointing", getattr(args, "use_gradient_checkpointing", False))),
         tie_weights=bool(getattr(args, "transformer_tie_weights", tie_weights)),
         ffn_type=str(getattr(args, "transformer_ffn_type", "swiglu")),
+        split_qkv=bool(getattr(args, "transformer_split_qkv", False)),
         causal=bool(causal),
         class_cond_enable=bool(class_cond_enable),
         num_classes=int(getattr(args, "image_num_classes", 1000)) if class_cond_enable else 0,
@@ -103,7 +104,7 @@ def build_transformer_model(
     )
     model = TransformerLM(config, tokenizer=tokenizer)
     logger.info(
-        "Built Transformer baseline: layers=%d heads=%d embd=%d block=%d backend=%s ffn=%s rope=%s abs_pos=%s tied=%s causal=%s class_cond=%s",
+        "Built Transformer baseline: layers=%d heads=%d embd=%d block=%d backend=%s ffn=%s rope=%s abs_pos=%s split_qkv=%s tied=%s causal=%s class_cond=%s",
         int(config.n_layer),
         int(config.n_head),
         int(config.n_embd),
@@ -112,6 +113,7 @@ def build_transformer_model(
         str(config.ffn_type),
         bool(config.use_rope),
         bool(config.use_abs_pos_emb),
+        bool(config.split_qkv),
         bool(config.tie_weights),
         bool(config.causal),
         bool(config.class_cond_enable),
