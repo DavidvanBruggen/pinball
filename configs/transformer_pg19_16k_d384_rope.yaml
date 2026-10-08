@@ -1,0 +1,130 @@
+# ============================================================================
+# PG19 @16k, d384 -- TRANSFORMER, RoPE-ONLY baseline (2026-10-08).
+# Derived from transformer_pg19_16k_d384.yaml by:
+#     transformer_use_abs_pos_emb: false   (was the default true)
+#     checkpoint_dir
+# Nothing else differs.
+# WHY. The baseline had RoPE on every q/k PLUS a learned absolute position table (16384 x 384 =
+#   6.29M params, GPT-2 style), redundant with RoPE and a hard 16k length limit. Pinball has no
+#   absolute table (RoPE in the local band, position-free far keys + per-level bias). RoPE-only
+#   is the modern (LLaMA-style) baseline and removes an uncontrolled difference; its effect on
+#   the transformer could go either way, so it is measured rather than assumed.
+# PARAMS: 40.57M (19.30M tied token embedding + 21.27M core) vs 46.86M with the table.
+#   Pairs with pinball_pg19_16k_shared_nope_tdesc_sep_coarse.yaml (parameter parity, ~25.0M
+#   non-embedding incl. the indexer vs 21.3M here).
+# SCORES: (none yet)
+# ============================================================================
+# ---- parent header (history) ----
+# ============================================================================
+# PG19 @16k, d384 -- DENSE BASELINE: matched GPT-style transformer, d384, 12 layers, RoPE (2026-10-05).
+# Derived from transformer_wikitext_d384_4k.yaml (WikiText 4k: best 24.53 @ ep109) by the PG19 rules below; nothing
+# else differs.
+# WIDTH d384 (as the WikiText arms). Measured 16k x6 on the Blackwell, compiled, steady state:
+#   transformer 185k tok/s (84.9 GB); pinball NoPE + slots (stream selector) 160k (0.87x,
+#   70.7 GB); pinball no-slots 184k (0.99x, 62.3 GB). d768 gave the same ratio (0.82-0.87x at
+#   16k x4), so width does not buy speed here; d384 trains ~2x faster per token.
+# PG19 SETTINGS (all four arms identical):
+#   text_file ./data/pg19_train.txt -- the loader reads the token cache next to it
+#     (./data/pg19_train.pt, 24.5 GB int64, mmap). Copy BOTH, or it re-tokenises 11 GB of text.
+#   block_size 16384; val_split 0.01 (last 1% of train, ~30M tokens; 50 eval batches/epoch).
+#   samples_per_epoch 1000 = 16.4M tokens/epoch (same tokens/epoch as the WikiText arms);
+#   num_epochs 200 = 3.3B tokens ~ one PG19 pass. batch_size: SET PER GPU (see below).
+#   longctx_diag_long_edges [8192] -> buckets never, <128, 128-511, 512-2k, 2k-8k, >8k.
+#   Report data/pg19_test.txt at the end.
+# BATCH: 8 on the 120 GB cluster GPU, identical for all four arms (same tokens per optimizer
+#   step). Per-process peak at 16k on the Blackwell (compiled): transformer 57.1 GB @b4 / 84.9 GB
+#   @b6 = 13.9 GB per sequence -> ~113 GB @b8 (the binding arm); pinball l0_coarse 48.6 / 71.7 GB
+#   = 11.6 GB per sequence -> ~95 GB @b8. If the transformer OOMs at 8, set ALL arms to 7 (~99 GB).
+#   125 optimizer steps/epoch (1000 samples), 25k steps over 200 epochs; warmup 1000 = 8 epochs.
+# CHECK on every run: grep -ci "flex.*fail" <log> must be 0 (pinball arms). The far-NoPE
+#   arms raise instead of degrading; the q control could degrade silently to additive.
+# VERIFIED @16k on the Blackwell (scripts/nomination/smoke_pg19.py): 46.9M params; peak 14.7 GiB (b1, eager fwd+bwd).
+# SCORES: (none yet)
+# ============================================================================
+# ---- parent header (history) ----
+# ============================================================================
+# CONTEXT 4096 (2026-09-29): block_size 1024 -> 4096, batch_size 16 -> 4, samples_per_epoch
+# 15625 -> 3906, so tokens/step (16,384), steps/epoch (976), tokens/epoch (16.0M) and the LR
+# schedule are UNCHANGED vs the 1024 curves: only the context grows. glob400 at 4096 no longer
+# covers every coarse row: levels [4096, 512, 256, 128], the 400 budget takes L3 + L2 (384
+# rows) as the prefix and leaves L1 (512) to the band. The old d768 curves are 1024-context and
+# NOT comparable; the d768 width control at 4096 is pinball_wikitext_pack_glob400_d768_4k.yaml.
+# TRANSFORMER CONTROL @1024, d384. Derived from transformer_wikitext.yaml by hidden_dim 768 ->
+# 384, num_heads 12 -> 6, checkpoint_dir, muon_batched: true.
+#
+# THE d384 SET. Four arms at hidden_dim 384 / 6 heads (head_dim 64 as before), 12 layers,
+# everything else as the d768 parent, all with muon_batched: true (same update; the d768
+# curves ran the per-matrix step -- equivalent, not bit-identical):
+#     transformer_wikitext_d384_4k.yaml                 transformer control
+#     pinball_wikitext_pack_glob400_d384_4k.yaml        glob400 control
+#     pinball_wikitext_pack_glob400_l0coarse_d384_4k.yaml + hier_level_qkv/ffn: l0_coarse
+#     pinball_wikitext_pack_glob400_levelsep_d384_4k.yaml  + hier_level_qkv/ffn: per_level
+# Readouts: (1) headroom at fixed width (all four at 384; the capacity-limited regime);
+# (2) STRUCTURED vs PLAIN capacity: levelsep@384 has the NON-EMBEDDING parameter count of
+# glob400@768 (data/curve_text_glob400.csv) at ~1/4 of the projection FLOPs -- one spends
+# the parameters as level-specific weights, the other as width. Report non-embedding params:
+# the tied 50k x 384 embedding (19.3M) is about as large as the d384 network itself.
+# Same LR / schedule / optimizer as the parents for every arm.
+# SCORES: (none yet)
+# ============================================================================
+# ---- parent header (history) ----
+# GPT-style transformer baseline (same data/tokenizer as the Pinball configs).
+
+model_type: transformer
+modality: text
+tokenizer_name: gpt2
+
+# Data — point this at your text file (WikiText-103 combined, FineWeb, etc.).
+text_file: ./data/pg19_train.txt   # + ./data/pg19_train.pt (token cache) alongside
+block_size: 16384
+batch_size: 4                      # GH200: 95 GB usable; transformer OOMs at 8 (full logits). SAME for all arms
+val_split: 0.01
+
+num_epochs: 200                       # ~3.3B tokens ~ one PG19 pass
+samples_per_epoch: 1000              # 16.4M tokens/epoch
+gradient_accumulation_steps: 1  # accumulate grads over N batches before an optimizer step
+gradient_checkpointing: false    # trade compute for memory in the refinement stack
+# Chunked CE loss head: the model emits token FEATURES and the loss projects + cross-entropies
+# in seq-chunks of `chunked_ce_seq_chunk`, never materializing the full [B,T,vocab] logits (+ its
+# softmax/CE backward). 
+train_feature_chunked_ce_enable: true
+chunked_ce_seq_chunk: 64
+# Long-context diagnostic: every N validations, log next-token PPL bucketed by in-context
+# recurrence distance (never / <128 / 128-511 / 512-2k / >2k). Cheap — reuses the val batches,
+# no extra forward. The split that matters: <128 (inside local window) vs >=128 (needs the
+# hierarchy). 0 = off. longctx_diag_max_seqs caps sequences scanned per run (default 64).
+longctx_diag_every: 1
+longctx_diag_long_edges: [8192]   # adds 2k-8k and >8k buckets
+# longctx_diag_max_seqs: 64
+# Generation prompt/continuation lengths. gen_prompt_tokens defaults to min(64, block_size//2);
+# raise it for long-range PG19 conditioning (must be <= block_size). Leave sample_prompt unset
+# so the prompt is sampled from held-out val text rather than a fixed short string.
+gen_prompt_tokens: 1024
+gen_max_new_tokens: 512
+save_every: 0
+checkpoint_dir: ./transformer/pg19_16k_transformer_rope/checkpoints
+
+train_mode: ar
+learning_rate: 1e-4 #0.0001
+weight_decay: 0.1
+#max_steps: 20000
+warmup_steps: 1000
+optimizer: muon_hybrid    # adamw | muon_hybrid (Muon on matrices, AdamW on 1D params)
+muon_lr_mult: 6.0
+
+# Transformer shape
+hidden_dim: 384 #768 (parent)
+num_heads: 6 #12 (parent); head_dim stays 64
+transformer_n_layer: 12
+transformer_ffn_type: swiglu
+transformer_use_rope: true
+transformer_use_abs_pos_emb: false   # RoPE ONLY: no learned absolute position table (see header)
+transformer_attn_backend: auto   # auto | flash | sdpa
+# Compile each block's forward in training (parity with pinball's hier_layer_compile so the
+# speed comparison stays fair; +33-37% measured on image shapes). Training-only, eager
+# fallback on failure. Numerics shift slightly under fusion — don't flip mid-comparison.
+transformer_compile: true
+dropout: 0.1
+
+# ---- d384 set (see header) ----
+muon_batched: true             # same update, Newton-Schulz batched per shape
