@@ -1242,6 +1242,41 @@ class HierarchicalMessagePassing(MessagePassing):
         # head keeps the gate and learns from the task loss alone. The main model never
         # feels the KL.
         local_pack_global_nom_kl_detach: bool = False,
+        # ATTENTION-GUIDED TILE SELECTION (local_pack_global_nominator: attn). NSA-style: the
+        # chunk slots are whole L0 blocks, picked per 128-row tile by the tile's OWN attention.
+        # Hop 1: every query of the tile scores the level-`tile_level` nodes with the far
+        # (NoPE) q.k the flex softmax uses; softmax per query and head over the nodes the tile
+        # may read, summed over the tile -> mass per node; each ALIGNED block (a node whose
+        # window starts at a multiple of its span, so blocks never overlap) takes the mass of
+        # every node overlapping it, weighted by the overlap; top `tile_k` blocks. Optional
+        # hop 2 (`tile_fine_level` >= 1): the aligned level-`tile_fine_level` sub-blocks of
+        # those blocks, scored the same way, top `tile_fine_k`. Slots = the L0 tokens of the
+        # final blocks, read inside the flex softmax with no gate. No parameters and no
+        # auxiliary loss: q and k are the layer's own, trained by the task loss through the
+        # attention itself. The live-slot count is geometry, so the BlockMask is cached.
+        local_pack_global_tile_level: int = 0,
+        local_pack_global_tile_k: int = 0,
+        local_pack_global_tile_fine_level: int = -1,
+        local_pack_global_tile_fine_k: int = 0,
+        # TILED DESCENT (local_pack_global_nominator: tdesc). The xq descent's recipe with the
+        # result shared per 128-row tile, so the slots stay one contiguous K/V prefix per tile.
+        # Blocks are a regular token grid per level (2 * stride tokens: 128/64/32/16 at L4..L1
+        # at 16k), each represented by the earliest-closing node covering it. From
+        # `tile_level` down to `tdesc_final_level`: the tile's candidates (all allowed blocks
+        # at the top, the sub-blocks of the kept blocks below) are scored by a detached
+        # indexer (q.k, d `tdesc_dim`, per-level k, layer-normed DETACHED layer inputs, as the
+        # xq descent's); each query of the PREVIOUS tile (causal) votes for its top
+        # `tdesc_votes` (Gumbel noise in training), the tile keeps the `tdesc_beams[i]`
+        # most-voted. Slots = the L0 tokens of the final picks + the `tdesc_recent` newest
+        # final blocks beyond the band (always read). Indexer trained ONLY by a KL to the
+        # read's subtree mass over each level's kept blocks (exact slot mass from the flex
+        # LSE; lambda_nom_kl, nom_kl_chunks sampled tiles). Live-slot counts are geometry.
+        local_pack_global_tdesc_beams: Optional[List[int]] = None,
+        local_pack_global_tdesc_final_level: int = 1,
+        local_pack_global_tdesc_votes: int = 2,
+        local_pack_global_tdesc_recent: int = 4,
+        local_pack_global_tdesc_dim: int = 64,
+        local_pack_global_tdesc_gumbel: float = 1.0,
         # DIVERSITY (head only). At most `region_cap` picks per region, a region being a
         # candidate's ancestor at `region_level` (L2 = 64 tokens at 4096; a row at or above that
         # level is its own region). Measured 2026-09-30 on the q arms: the deterministic top-k
@@ -1430,9 +1465,52 @@ class HierarchicalMessagePassing(MessagePassing):
         self.local_pack_global_nominator = str(local_pack_global_nominator or "key").lower()
         self.local_pack_global_candidates = str(local_pack_global_candidates or "l0").lower()
         self.local_pack_global_gumbel = max(0.0, float(local_pack_global_gumbel or 0.0))
-        if self.local_pack_global_nominator not in {"key", "head"}:
-            raise ValueError("local_pack_global_nominator must be 'key' or 'head', got "
-                             f"{local_pack_global_nominator!r}")
+        if self.local_pack_global_nominator not in {"key", "head", "attn", "tdesc"}:
+            raise ValueError("local_pack_global_nominator must be 'key', 'head', 'attn' or 'tdesc', "
+                             f"got {local_pack_global_nominator!r}")
+        self.local_pack_global_tdesc_beams = [int(v) for v in (local_pack_global_tdesc_beams or [])]
+        self.local_pack_global_tdesc_final_level = int(local_pack_global_tdesc_final_level)
+        self.local_pack_global_tdesc_votes = max(1, int(local_pack_global_tdesc_votes))
+        self.local_pack_global_tdesc_recent = max(0, int(local_pack_global_tdesc_recent))
+        self.local_pack_global_tdesc_dim = max(8, int(local_pack_global_tdesc_dim))
+        self.local_pack_global_tdesc_gumbel = max(0.0, float(local_pack_global_tdesc_gumbel))
+        if self.local_pack_global_nominator == "tdesc":
+            _tl, _fl = int(local_pack_global_tile_level or 0), self.local_pack_global_tdesc_final_level
+            if not (1 <= _fl <= _tl) or len(self.local_pack_global_tdesc_beams) != _tl - _fl + 1:
+                raise ValueError("local_pack_global_nominator='tdesc' needs 1 <= tdesc_final_level <= "
+                                 "tile_level and one tdesc_beams entry per level tile_level..final")
+            if not (str(local_pack_global_coarse or "content").lower() == "levels"
+                    and bool(local_pack_flex_union)):
+                raise ValueError("local_pack_global_nominator='tdesc' needs local_pack_global_coarse="
+                                 "'levels' and local_pack_flex_union (the chunk-slot prefix)")
+            if str(local_pack_global_boost or "logit").lower() == "key" or bool(local_pack_global_logit):
+                raise ValueError("local_pack_global_nominator='tdesc' has no slot weight: set "
+                                 "local_pack_global_boost: logit and local_pack_global_logit: false")
+            # the indexer: q for every packed row, k per level (index = level), on layer-normed
+            # DETACHED layer inputs -- trained only by the tdesc KL
+            _Hx = int(self.num_heads) * int(self.head_dim)
+            _di = self.local_pack_global_tdesc_dim
+            self.tdesc_q = nn.Linear(_Hx, _di, bias=False)
+            self.tdesc_k = nn.ModuleList(nn.Linear(_Hx, _di, bias=False) for _ in range(_tl + 1))
+        self.local_pack_global_tile_level = int(local_pack_global_tile_level or 0)
+        self.local_pack_global_tile_k = int(local_pack_global_tile_k or 0)
+        self.local_pack_global_tile_fine_level = int(local_pack_global_tile_fine_level)
+        self.local_pack_global_tile_fine_k = int(local_pack_global_tile_fine_k or 0)
+        if self.local_pack_global_nominator == "attn":
+            _tl, _tf = self.local_pack_global_tile_level, self.local_pack_global_tile_fine_level
+            if _tl < 1 or self.local_pack_global_tile_k < 1:
+                raise ValueError("local_pack_global_nominator='attn' needs local_pack_global_tile_level "
+                                 ">= 1 and local_pack_global_tile_k >= 1")
+            if _tf >= 0 and not (1 <= _tf < _tl and self.local_pack_global_tile_fine_k >= 1):
+                raise ValueError("local_pack_global_tile_fine_level must be in [1, tile_level) with "
+                                 "local_pack_global_tile_fine_k >= 1 (or -1 = one hop)")
+            if not (str(local_pack_global_coarse or "content").lower() == "levels"
+                    and bool(local_pack_flex_union)):
+                raise ValueError("local_pack_global_nominator='attn' needs local_pack_global_coarse="
+                                 "'levels' and local_pack_flex_union (the chunk-slot prefix)")
+            if str(local_pack_global_boost or "logit").lower() == "key" or bool(local_pack_global_logit):
+                raise ValueError("local_pack_global_nominator='attn' has no slot weight: set "
+                                 "local_pack_global_boost: logit and local_pack_global_logit: false")
         if self.local_pack_global_candidates not in {"l0", "all"}:
             raise ValueError("local_pack_global_candidates must be 'l0' or 'all', got "
                              f"{local_pack_global_candidates!r}")
@@ -1474,9 +1552,10 @@ class HierarchicalMessagePassing(MessagePassing):
             raise ValueError("local_pack_global_nom_compile needs local_pack_global_select_impl='stream'")
         self.local_pack_global_nom_inline = bool(local_pack_global_nom_inline)
         if self.local_pack_global_nom_inline and not (
-                self.local_pack_global_nom_compile and self.local_pack_global_nominator == "head"):
+                (self.local_pack_global_nom_compile and self.local_pack_global_nominator == "head")
+                or self.local_pack_global_nominator in ("attn", "tdesc")):
             raise ValueError("local_pack_global_nom_inline needs local_pack_global_nom_compile "
-                             "and local_pack_global_nominator='head'")
+                             "and local_pack_global_nominator='head' (or nominator 'attn'/'tdesc')")
         self.local_pack_global_nom_query = bool(local_pack_global_nom_query)
         self.local_pack_global_nom_kl = bool(local_pack_global_nom_kl)
         self.local_pack_global_nom_kl_chunks = max(1, int(local_pack_global_nom_kl_chunks or 8))
@@ -1577,7 +1656,7 @@ class HierarchicalMessagePassing(MessagePassing):
                     # [heads, head_dim] table, routed to AdamW by name in cli._build_optimizer.
                     self.nom_boost_u = nn.Parameter(torch.zeros(int(self.num_heads), int(self.head_dim)))
                 self.local_pack_global_nom_dim = _d
-            else:
+            elif self.local_pack_global_nominator == "key":
                 self.global_nominate_vec = nn.Parameter(
                     torch.randn(_nlv, int(self.num_heads) * int(self.head_dim)) * 0.02)
         if self.local_pack_far_bias == "level":
@@ -5136,15 +5215,18 @@ class HierarchicalMessagePassing(MessagePassing):
         return self._FLEX_TILE_LADDER[lvl]
 
     def _nominate_rows(self, kp: torch.Tensor, spec: Dict, lvl_packed: Optional[torch.Tensor],
-                       budget: int, x_nodes: Optional[torch.Tensor] = None):
+                       budget: int, x_nodes: Optional[torch.Tensor] = None,
+                       qp: Optional[torch.Tensor] = None):
         """Call-site dispatch: traced inline (local_pack_global_nom_inline) or opaque."""
         if self.local_pack_global_nom_inline:
-            return self._nominate_global_rows_impl(kp, spec, lvl_packed, budget, x_nodes=x_nodes)
-        return self._nominate_global_rows(kp, spec, lvl_packed, budget, x_nodes=x_nodes)
+            return self._nominate_global_rows_impl(kp, spec, lvl_packed, budget, x_nodes=x_nodes,
+                                                   qp=qp)
+        return self._nominate_global_rows(kp, spec, lvl_packed, budget, x_nodes=x_nodes, qp=qp)
 
     def _nominate_global_rows_impl(self, kp: torch.Tensor, spec: Dict,
                               lvl_packed: Optional[torch.Tensor], budget: int,
-                              x_nodes: Optional[torch.Tensor] = None):
+                              x_nodes: Optional[torch.Tensor] = None,
+                              qp: Optional[torch.Tensor] = None):
         """Content-selected global block -> (packed rows [K], per-row score [N] or None).
 
         Scores come off the packed KEYS rather than raw features: they are what the block
@@ -5166,6 +5248,16 @@ class HierarchicalMessagePassing(MessagePassing):
         rather than being forced to attend it.
         """
         rows_default = spec["global_block"]["rows"]
+        if getattr(self, "local_pack_global_nominator", "key") == "tdesc":
+            if x_nodes is None or qp is None:
+                raise RuntimeError("local_pack_global_nominator='tdesc' needs the layer input and "
+                                   "the packed queries (flex-union path only)")
+            return self._nominate_by_tdesc(spec, x_nodes, int(qp.size(1)))
+        if getattr(self, "local_pack_global_nominator", "key") == "attn":
+            if qp is None:
+                raise RuntimeError("local_pack_global_nominator='attn' needs the packed queries "
+                                   "(flex-union path only)")
+            return self._nominate_by_tile_attn(spec, qp, kp)
         if getattr(self, "local_pack_global_nominator", "key") == "head":
             if x_nodes is None or lvl_packed is None or "nom_avail" not in spec:
                 raise RuntimeError("local_pack_global_nominator='head' needs the layer input and "
@@ -5345,6 +5437,443 @@ class HierarchicalMessagePassing(MessagePassing):
                 self.nom_level_offset, seg_idx, seg_sizes, cs, pslots,
                 spec["nom_parent_node"], spec["nom_node_level"], spec["perm"],
                 float(self.local_pack_global_nom_dim) ** -0.5)
+
+    def _tile_attn_geom(self, spec: Dict, C: int, W: int, nch: int) -> Dict:
+        """Geometry of the attention-guided tile selector (cached per skeleton in the spec).
+
+        A level-l node closing at token t covers [t - cov_l + 1, t], cov_l = first node's close
+        time + 1 (windows nest children, so this is wider than the pooling span); stride_l =
+        the close-time step. Blocks are a REGULAR token grid of size 2 * stride_l, aligned to
+        multiples of it, so blocks never overlap and each L0 token is read at most once. A
+        block's score is the attention mass of every level-l node covering it, weighted by
+        the fraction of the node's coverage inside the block. A block (and a node used for
+        scoring) is allowed for chunk c only if all its tokens and the node row sit below the
+        chunk limit c*C - W -- the other selectors' limit: causal for every query of the chunk
+        and disjoint from every band. Pure geometry."""
+        _key = ("tile_geom", C, W, nch, self.local_pack_global_tile_level,
+                self.local_pack_global_tile_fine_level)
+        g = spec.get(_key, None)
+        if g is not None:
+            return g
+        lr, pos = spec["level_rows"], spec["pos"]
+        dev = pos.device
+        lr0 = lr[0]                                                     # packed row of token p
+        n_tok = int(lr0.numel())
+        limit = (torch.arange(nch, device=dev) * C - W).clamp(min=0)    # [nch]
+
+        def level(l):
+            rows = lr[l]
+            t = pos.index_select(0, rows)
+            cov = int(t[0]) + 1
+            stride = int(t[1] - t[0]) if int(t.numel()) > 1 else cov
+            ns = (t - cov + 1).clamp(min=0)
+            close = torch.maximum(rows, lr0.index_select(0, t.clamp(max=n_tok - 1)))   # last row
+            return rows, ns, t + 1, close, 2 * stride
+
+        def ov_frac(bs, S, ns, ne):                                     # [nb, nn]
+            o = (torch.minimum(bs.view(-1, 1) + S, ne.view(1, -1))
+                 - torch.maximum(bs.view(-1, 1), ns.view(1, -1))).clamp(min=0).float()
+            return o / (ne - ns).clamp(min=1).float().view(1, -1)
+
+        l1 = int(self.local_pack_global_tile_level)
+        rows1, ns1, ne1, close1, S1 = level(l1)
+        nb1 = n_tok // S1
+        bst1 = torch.arange(nb1, device=dev) * S1                       # block starts
+        blast = lr0.index_select(0, (bst1 + S1 - 1).clamp(max=max(n_tok - 1, 0)))
+        g = {"rows1": rows1, "bst1": bst1, "S1": S1, "lr0": lr0, "limit": limit,
+             "ov1": ov_frac(bst1, S1, ns1, ne1),                         # [nb1, n1]
+             "node_ok1": close1.view(1, -1) < limit.view(-1, 1),         # [nch, n1]
+             "bok": blast.view(1, -1) < limit.view(-1, 1)}               # [nch, nb1]
+        l2 = int(self.local_pack_global_tile_fine_level)
+        if l2 >= 1:
+            rows2, ns2, ne2, close2, S2 = level(l2)
+            if S1 % S2:
+                raise ValueError(f"tile blocks: level {l1} block {S1} is not a multiple of level "
+                                 f"{l2} block {S2}")
+            r = S1 // S2
+            ovb = ov_frac(bst1, S1, ns2, ne2) > 0                         # nodes touching each block
+            M = int(ovb.sum(1).max())
+            cand = torch.topk(ovb.float() + torch.linspace(0, 1e-3, int(ovb.size(1)), device=dev)
+                              .view(1, -1), M, dim=1).indices.sort(1).values     # [nb1, M] node ids
+            cv = ovb.gather(1, cand)                                      # live candidate
+            sst = bst1.view(-1, 1) + torch.arange(r, device=dev).view(1, -1) * S2     # [nb1, r]
+            o2 = (torch.minimum(sst.unsqueeze(1) + S2, ne2[cand].unsqueeze(-1))
+                  - torch.maximum(sst.unsqueeze(1), ns2[cand].unsqueeze(-1))).clamp(min=0).float()
+            o2 = o2 / (ne2[cand] - ns2[cand]).clamp(min=1).float().unsqueeze(-1)      # [nb1, M, r]
+            g.update({"c2_rows": rows2[cand], "c2_close": close2[cand], "c2_live": cv,
+                      "ov2": o2 * cv.unsqueeze(-1).float(), "sst": sst, "S2": S2, "r": r, "M2": M})
+        g["n_allow1"] = g["bok"].sum(1)                                  # [nch]
+        spec[_key] = g
+        return g
+
+    def _tile_mass(self, q_src: torch.Tensor, q_ok: torch.Tensor, k_c: torch.Tensor,
+                   ok_c: torch.Tensor, shared_k: bool) -> torch.Tensor:
+        """Attention mass per candidate, summed over a tile's queries and heads.
+
+        q_src [B, T, C, H, D] (T tiles of C queries), q_ok [T, C] real (non-pad) rows, k_c [B, J, H, D]
+        (shared_k: every tile scores the same J keys) or [B, T, J, H, D], ok_c [T, J] or
+        [B, T, J]. softmax per (query, head) over the tile's allowed candidates, the far q.k
+        the flex softmax uses. Returns [B, T, J] (fp32). Processed in groups of tiles."""
+        B, T, Cq, H, D = q_src.shape
+        sc = float(D) ** -0.5
+        out = []
+        G = 16
+        for a in range(0, T, G):
+            b = min(T, a + G)
+            q = q_src[:, a:b]
+            if shared_k:
+                s = torch.einsum("btqhd,bjhd->bthqj", q, k_c)
+                okk = ok_c[a:b].view(1, b - a, 1, 1, -1)
+            else:
+                s = torch.einsum("btqhd,btjhd->bthqj", q, k_c[:, a:b])
+                okk = (ok_c[a:b].view(1, b - a, 1, 1, -1) if ok_c.dim() == 2
+                       else ok_c[:, a:b].view(B, b - a, 1, 1, -1))
+            with torch.autocast(s.device.type, enabled=False):
+                # fp32 reductions: under autocast an einsum runs in bf16 even on fp32 inputs,
+                # and a bf16 sum over C*H probabilities (8-bit mantissa) turns block scores
+                # into exact ties that the top-k then breaks arbitrarily
+                s = (s.float() * sc).masked_fill(~okk, float("-inf"))
+                p = torch.softmax(s, -1).nan_to_num(0.0)                   # no allowed -> 0
+                out.append(torch.einsum("bthqj,tq->btj", p, q_ok[a:b].float()))
+        return torch.cat(out, 1)
+
+    def _nominate_by_tile_attn(self, spec: Dict, qp: torch.Tensor, kp: torch.Tensor):
+        """Attention-guided tile selection -> (rows [B, nch*G], None, meta). See
+        local_pack_global_nominator='attn' in __init__.
+
+        CAUSALITY: the slots of chunk c are scored by the queries of chunk c-1 (all rows
+        < c*C), never by chunk c's own queries -- scoring with a tile's own queries would let
+        an early query's slots depend on later queries' q, the content-selection leak. Every
+        candidate sits below the chunk limit by geometry. No gradient: selection only."""
+        C = int(self.local_pack_global_chunk)
+        W = int(spec.get("window", 0) or 0)
+        B, n, H, D = (int(v) for v in qp.shape)
+        nch = (n + C - 1) // C
+        geo = self._tile_attn_geom(spec, C, W, nch)
+        nb1 = int(geo["bst1"].numel())
+        k1 = min(int(self.local_pack_global_tile_k), nb1)
+        two = int(self.local_pack_global_tile_fine_level) >= 1
+        r = int(geo["r"]) if two else 1
+        S_f = int(geo["S2"]) if two else int(geo["S1"])
+        kf = min(int(self.local_pack_global_tile_fine_k), k1 * r) if two else k1
+        G = max(1, kf * S_f)
+        dev = qp.device
+        live1 = torch.minimum(geo["n_allow1"], torch.full_like(geo["n_allow1"], k1))
+        livef = torch.minimum(live1 * r, torch.full_like(live1, kf))
+        ok = (torch.arange(G, device=dev).view(1, -1) < (livef * S_f).view(-1, 1))     # [nch, G]
+        st = spec["global_block"]["rows"]
+        meta = {"chunk": C, "G": G, "nch": int(nch), "ok": ok.reshape(-1).contiguous(),
+                "n_static": int(st.numel()), "static_rows": st, "per_batch": True}
+        if k1 == 0 or kf == 0 or nch < 2:
+            return torch.zeros(B, nch * G, dtype=torch.long, device=dev), None, meta
+        lvl = spec["levels"]
+        with torch.no_grad():
+            qd = qp.detach()
+            pad = nch * C - n
+            if pad:
+                qd = torch.cat([qd, qd.new_zeros(B, pad, H, D)], 1)
+            q_src = qd.view(B, nch, C, H, D)[:, :-1]                        # chunk c-1 scores c
+            q_ok = (torch.arange(nch * C, device=dev) < n).view(nch, C)[:-1]
+            r1 = geo["rows1"]
+            kc1 = self._far_keys(kp.detach().index_select(1, r1), lvl.index_select(0, r1))
+            m1 = self._tile_mass(q_src, q_ok, kc1, geo["node_ok1"][1:], True)   # [B, nch-1, n1]
+            with torch.autocast(qp.device.type, enabled=False):          # fp32 (see _tile_mass)
+                sc1 = torch.einsum("btj,kj->btk", m1, geo["ov1"])           # block score
+            sc1 = torch.cat([sc1.new_zeros(B, 1, nb1), sc1], 1)            # chunk 0: nothing allowed
+            neg = torch.finfo(sc1.dtype).min
+            sc1 = sc1.masked_fill(~geo["bok"].unsqueeze(0), neg)
+            top1 = torch.topk(sc1, k1, dim=-1).indices                       # [B, nch, k1]
+            if two:
+                M = int(geo["M2"])
+                cand = geo["c2_rows"][top1].reshape(B, nch, k1 * M)          # packed rows
+                pick_live = (torch.arange(k1, device=dev).view(1, 1, -1)
+                             < live1.view(1, -1, 1)).expand(B, -1, -1)         # [B, nch, k1]
+                cok = (geo["c2_live"][top1] & pick_live.unsqueeze(-1)
+                       & (geo["c2_close"][top1] < geo["limit"].view(1, -1, 1, 1))
+                       ).reshape(B, nch, k1 * M)
+                kc2 = kp.detach().gather(1, cand.reshape(B, -1, 1, 1).expand(-1, -1, H, D))
+                kc2 = self._far_keys(kc2, lvl.index_select(0, cand.reshape(-1)).view(B, -1))
+                kc2 = kc2.view(B, nch, k1 * M, H, D)[:, 1:]
+                m2 = self._tile_mass(q_src, q_ok, kc2, cok[:, 1:], False)    # [B, nch-1, k1*M]
+                m2 = torch.cat([m2.new_zeros(B, 1, k1 * M), m2], 1).view(B, nch, k1, M)
+                with torch.autocast(qp.device.type, enabled=False):
+                    sc2 = torch.einsum("bckm,bckmr->bckr", m2,
+                                       geo["ov2"][top1]).reshape(B, nch, k1 * r)
+                sub_live = pick_live.unsqueeze(-1).expand(-1, -1, -1, r).reshape(B, nch, k1 * r)
+                sc2 = sc2.masked_fill(~sub_live, neg)
+                top2 = torch.topk(sc2, kf, dim=-1).indices                     # [B, nch, kf]
+                bst = geo["sst"][top1].reshape(B, nch, k1 * r).gather(2, top2)
+            else:
+                bst = geo["bst1"][top1]                                        # [B, nch, k1]
+            tok = bst.unsqueeze(-1) + torch.arange(S_f, device=dev).view(1, 1, 1, -1)
+            rows = geo["lr0"][tok.clamp(max=int(geo["lr0"].numel()) - 1)].reshape(B, nch, G)
+            rows = torch.where(ok.unsqueeze(0), rows, torch.zeros_like(rows)).reshape(B, nch * G)
+            self._nom_stats = {"tile_live_frac": ok.float().mean()}
+        return rows.contiguous(), None, meta
+
+    def _tdesc_geom(self, spec: Dict, C: int, W: int, nch: int) -> Dict:
+        """Geometry of the tiled descent (cached per skeleton in the spec).
+
+        Per level l (tile_level down to tdesc_final_level): a regular block grid of
+        S_l = 2 * stride_l tokens, each block represented by the EARLIEST-closing level-l node
+        whose coverage holds it (coverage = first node's close time + 1 tokens: windows nest
+        children, so it is wider than the pooling span). A block's effective close row is the
+        max over its representative and all its descendants (final level: and its last
+        token), so an allowed block has only allowed descendants and the live counts below
+        are pure geometry. Allowed for chunk c: effective close row < c*C - W (causal for every
+        query of the chunk, disjoint from every band). Recency: the final blocks whose tokens
+        are all below the limit, newest first."""
+        tl, fl = int(self.local_pack_global_tile_level), int(self.local_pack_global_tdesc_final_level)
+        R = int(self.local_pack_global_tdesc_recent)
+        _key = ("tdesc_geom", C, W, nch, tl, fl, R)
+        g = spec.get(_key, None)
+        if g is not None:
+            return g
+        lr, pos, perm = spec["level_rows"], spec["pos"], spec["perm"]
+        dev = pos.device
+        lr0 = lr[0]
+        n_tok = int(lr0.numel())
+        BIG = torch.iinfo(torch.long).max // 4
+        limit = (torch.arange(nch, device=dev) * C - W).clamp(min=0)       # [nch]
+        lv = {}
+        for l in range(fl, tl + 1):
+            rows = lr[l]
+            t = pos.index_select(0, rows)
+            nl = int(t.numel())
+            cov = int(t[0]) + 1 if nl else 1
+            stride = int(t[1] - t[0]) if nl > 1 else cov
+            S = 2 * stride
+            nb = n_tok // S if nl else 0
+            bst = torch.arange(nb, device=dev) * S
+            j = torch.searchsorted(t.contiguous(), bst + S - 1)              # first close >= block end
+            ok = j < nl
+            jj = j.clamp(max=max(nl - 1, 0))
+            tj = t.index_select(0, jj) if nl else bst
+            ok &= (tj - cov + 1) <= bst                                        # coverage holds the block
+            rrow = rows.index_select(0, jj) if nl else bst
+            close = torch.maximum(rrow, lr0.index_select(0, tj.clamp(max=n_tok - 1)))
+            close = torch.where(ok, close, torch.full_like(close, BIG))
+            if l == fl:
+                last = lr0.index_select(0, (bst + S - 1).clamp(max=n_tok - 1))
+                close = torch.maximum(close, last)
+            lv[l] = {"S": S, "nb": nb, "close": close, "node": perm.index_select(0, rrow) if nl else bst,
+                     "last_tok": lr0.index_select(0, (bst + S - 1).clamp(max=n_tok - 1)) if l == fl else None}
+        for l in range(fl + 1, tl + 1):                                        # nesting, bottom-up
+            r = lv[l]["S"] // lv[l - 1]["S"]
+            if lv[l]["S"] % lv[l - 1]["S"]:
+                raise ValueError(f"tdesc: level {l} block {lv[l]['S']} is not a multiple of level "
+                                 f"{l - 1} block {lv[l - 1]['S']}")
+            lv[l]["r"] = r
+            ch = torch.arange(lv[l]["nb"], device=dev).view(-1, 1) * r + torch.arange(r, device=dev).view(1, -1)
+            cc = torch.where(ch < lv[l - 1]["nb"],
+                             lv[l - 1]["close"][ch.clamp(max=max(lv[l - 1]["nb"] - 1, 0))],
+                             torch.full_like(ch, BIG)) if lv[l - 1]["nb"] else torch.full_like(ch, BIG)
+            lv[l]["close"] = torch.maximum(lv[l]["close"], cc.max(1).values if r else lv[l]["close"])
+        top, fin = lv[tl], lv[fl]
+        a_c = (fin["last_tok"].view(1, -1) < limit.view(-1, 1)).sum(1)       # final blocks below limit
+        g = {"lv": lv, "limit": limit, "lr0": lr0,
+             "allow_top": top["close"].view(1, -1) < limit.view(-1, 1),       # [nch, nb_top]
+             "a_c": a_c, "live_R": torch.minimum(a_c, torch.full_like(a_c, R))}
+        spec[_key] = g
+        return g
+
+    def _tdesc_votes(self, q_src: torch.Tensor, q_ok: torch.Tensor, kc: torch.Tensor,
+                     okc: torch.Tensor, shared_k: bool) -> torch.Tensor:
+        """Per-query top-`votes` over the tile's candidates, summed -> [B, T, M] (fp32).
+        q_src [B, T, C, d], q_ok [T, C], kc [B, M, d] (shared_k) or [B, T, M, d], okc
+        [T, M] or [B, T, M]. Gumbel noise in training. Ties broken by the mean softmax mass."""
+        B, T, Cq, d = q_src.shape
+        v = int(self.local_pack_global_tdesc_votes)
+        tau = float(self.local_pack_global_tdesc_gumbel) if self.training else 0.0
+        if shared_k:
+            s = torch.einsum("btqd,bjd->btqj", q_src, kc)
+        else:
+            s = torch.einsum("btqd,btjd->btqj", q_src, kc)
+        okk = okc.view(1, T, 1, -1) if okc.dim() == 2 else okc.view(B, T, 1, -1)
+        with torch.autocast(s.device.type, enabled=False):
+            s = (s.float() * (float(d) ** -0.5)).masked_fill(~okk, float("-inf"))
+            M = int(s.size(-1))
+            if tau > 0.0:
+                u = torch.rand_like(s).clamp_(1e-6, 1.0 - 1e-6)
+                sg = s - tau * torch.log(-torch.log(u))
+            else:
+                sg = s
+            top = torch.topk(sg, min(v, M), dim=-1)
+            hit = torch.isfinite(top.values) & q_ok.view(1, T, Cq, 1)
+            votes = torch.zeros_like(s).scatter_add_(-1, top.indices, hit.float()).sum(2)   # [B, T, M]
+            mass = (torch.softmax(s, -1).nan_to_num(0.0) * q_ok.view(1, T, Cq, 1).float()).sum(2)
+            # votes first; the mass (in [0, 1] after / C) breaks ties at half a vote -- big
+            # enough to survive fp32 next to counts ~100 (a 1e-3 scale rounded away -> ties)
+            return votes + 0.5 * mass / float(Cq)
+
+    def _nominate_by_tdesc(self, spec: Dict, x_nodes: torch.Tensor, n: int):
+        """Tiled descent -> (rows [B, nch*G], None, meta). See local_pack_global_nominator=
+        'tdesc' in __init__. CAUSAL: chunk c's slots are voted by chunk c-1's queries (rows
+        < c*C); every candidate is below the chunk limit by geometry."""
+        C = int(self.local_pack_global_chunk)
+        W = int(spec.get("window", 0) or 0)
+        nch = (n + C - 1) // C
+        geo = self._tdesc_geom(spec, C, W, nch)
+        lv = geo["lv"]
+        tl, fl = int(self.local_pack_global_tile_level), int(self.local_pack_global_tdesc_final_level)
+        levels = list(range(tl, fl - 1, -1))
+        beams = self.local_pack_global_tdesc_beams
+        S_f = int(lv[fl]["S"])
+        R = min(int(self.local_pack_global_tdesc_recent), int(lv[fl]["nb"]))
+        ks, k = [], None                                            # effective beams (python ints)
+        for i, l in enumerate(levels):
+            k = min(int(beams[i]), int(lv[l]["nb"])) if i == 0 else min(int(beams[i]), k * int(lv[l + 1]["r"]))
+            ks.append(k)
+        kf = ks[-1]
+        G = max(1, (kf + R) * S_f)
+        B = int(x_nodes.size(0))
+        dev = x_nodes.device
+        # live counts per chunk (geometry): top = allowed, below = children of the live parents;
+        # final: conservatively minus the recency blocks the parents may contain
+        live = [torch.minimum(geo["allow_top"].sum(1), torch.full((nch,), ks[0], device=dev, dtype=torch.long))]
+        for i, l in enumerate(levels[1:], 1):
+            cap = live[-1] * int(lv[l + 1]["r"])
+            if l == fl:
+                cap = (cap - geo["live_R"]).clamp(min=0)
+            live.append(torch.minimum(cap, torch.full_like(cap, ks[i])))
+        if len(levels) == 1:
+            live[0] = (live[0] - geo["live_R"]).clamp(min=0)
+        live_f, live_R = live[-1], geo["live_R"]
+        sl = torch.arange(G, device=dev).view(1, -1)
+        ok = torch.where(sl < kf * S_f, sl < (live_f * S_f).view(-1, 1),
+                         (sl - kf * S_f) < (live_R * S_f).view(-1, 1))           # [nch, G]
+        st = spec["global_block"]["rows"]
+        meta = {"chunk": C, "G": G, "nch": int(nch), "ok": ok.reshape(-1).contiguous(),
+                "n_static": int(st.numel()), "static_rows": st, "per_batch": True}
+        lr0 = geo["lr0"]
+        n_tok = int(lr0.numel())
+        # indexer on layer-normed DETACHED layer inputs (grad only into tdesc_q / tdesc_k)
+        Hx = int(x_nodes.size(-1))
+        xd = F.layer_norm(x_nodes.detach().float(), (Hx,))
+        q_all = self.tdesc_q(xd.index_select(1, spec["perm"]))                 # [B, n, d] packed
+        k_lv = {l: self.tdesc_k[l](xd.index_select(1, lv[l]["node"])) for l in levels}
+        d = int(q_all.size(-1))
+        rec_ids = (geo["a_c"].view(-1, 1) - 1 - torch.arange(R, device=dev).view(1, -1)).clamp(min=0)  # [nch, R]
+        if kf == 0 or nch < 2:
+            rr = lr0[(rec_ids.unsqueeze(-1) * S_f + torch.arange(S_f, device=dev)).clamp(max=n_tok - 1)]
+            rows = rr.reshape(1, nch, -1).expand(B, -1, -1)
+            rows = torch.cat([torch.zeros(B, nch, G - int(rows.size(-1)), dtype=torch.long, device=dev), rows], -1)
+            rows = torch.where(ok.unsqueeze(0), rows, torch.zeros_like(rows)).reshape(B, nch * G)
+            return rows.contiguous(), None, meta
+        kept = []
+        with torch.no_grad():
+            qd = q_all.detach()
+            pad = nch * C - n
+            if pad:
+                qd = torch.cat([qd, qd.new_zeros(B, pad, d)], 1)
+            q_src = qd.view(B, nch, C, d)[:, :-1]                                 # chunk c-1 votes for c
+            q_ok = (torch.arange(nch * C, device=dev) < n).view(nch, C)[:-1]
+            neg = float("-inf")
+            prev = None
+            for i, l in enumerate(levels):
+                kc = k_lv[l].detach()
+                if i == 0:
+                    sc = self._tdesc_votes(q_src, q_ok, kc, geo["allow_top"][1:], True)
+                    if len(levels) == 1:                                           # final == top: no recency
+                        nr = (torch.arange(int(lv[l]["nb"]), device=dev).view(1, -1)
+                              < (geo["a_c"] - geo["live_R"]).view(-1, 1))[1:]
+                        sc = sc.masked_fill(~nr.unsqueeze(0), neg)
+                    sc = torch.cat([sc.new_full((B, 1, int(sc.size(-1))), neg), sc], 1)
+                    sc = sc.masked_fill(~geo["allow_top"].unsqueeze(0), neg)
+                    top = torch.topk(sc, ks[i], dim=-1).indices                   # [B, nch, k]
+                else:
+                    r = int(lv[l + 1]["r"])
+                    cand = (prev.unsqueeze(-1) * r + torch.arange(r, device=dev)).reshape(B, nch, -1)
+                    cok = (torch.arange(ks[i - 1], device=dev).view(1, 1, -1, 1)
+                           < live[i - 1].view(1, -1, 1, 1)).expand(B, -1, -1, r).reshape(B, nch, -1)
+                    cok = cok & (cand < int(lv[l]["nb"]))
+                    if l == fl:
+                        cok = cok & (cand < (geo["a_c"] - geo["live_R"]).view(1, -1, 1))   # not recency
+                    cs = cand.clamp(max=int(lv[l]["nb"]) - 1)
+                    kg = kc.gather(1, cs.reshape(B, -1, 1).expand(-1, -1, d)).view(B, nch, -1, d)
+                    sc = self._tdesc_votes(q_src, q_ok, kg[:, 1:], cok[:, 1:], False)
+                    sc = torch.cat([sc.new_full((B, 1, int(sc.size(-1))), neg), sc], 1)
+                    sc = sc.masked_fill(~cok, neg)
+                    top = cand.gather(2, torch.topk(sc, ks[i], dim=-1).indices)
+                kept.append(top)
+                prev = top
+            fb = kept[-1].clamp(max=int(lv[fl]["nb"]) - 1)                         # [B, nch, kf]
+            toks = torch.cat([fb, rec_ids.unsqueeze(0).expand(B, -1, -1)], -1)    # [B, nch, kf+R]
+            tok = toks.unsqueeze(-1) * S_f + torch.arange(S_f, device=dev).view(1, 1, 1, -1)
+            rows = lr0[tok.clamp(max=n_tok - 1)].reshape(B, nch, G)
+            rows = torch.where(ok.unsqueeze(0), rows, torch.zeros_like(rows)).reshape(B, nch * G)
+        meta["tdesc"] = {"q": q_all, "k": k_lv, "kept": kept, "live": live, "levels": levels,
+                         "S": [int(lv[l]["S"]) for l in levels], "kf": kf, "S_f": S_f}
+        self._nom_stats = {"tdesc_live_frac": ok.float().mean()}
+        return rows.contiguous(), None, meta
+
+    def _tdesc_kl_from_flex(self, q_s: torch.Tensor, k_s: torch.Tensor, lse: torch.Tensor,
+                            gsel: Tuple) -> None:
+        """Tiled-descent indexer distillation (the xq descent's loss, per tile).
+
+        For nom_kl_chunks sampled chunks, each query's attention mass on the chunk's DESCENT
+        slots (not the recency blocks) is exp(q.k / sqrt(D) - lse), head-averaged (exact: the
+        slots carry no score_mod) and summed per final block. Per level, a kept block's
+        target is the mass of its kept final descendants (subtree), renormalised over the
+        level's kept blocks; the prediction is softmax of the indexer score q_i . k_block over
+        them. KL summed over levels, mean over live queries. Detached target and inputs:
+        grad only into the indexer. Stores self._nom_kl_loss / _nom_kl_stat."""
+        meta = gsel[2]
+        td = meta["tdesc"]
+        G, C = int(meta["G"]), int(meta["chunk"])
+        nch, S = int(meta["nch"]), int(meta["n_static"])
+        B, H, N, D = (int(v) for v in q_s.shape)
+        kf, S_f = int(td["kf"]), int(td["S_f"])
+        m = min(int(self.local_pack_global_nom_kl_chunks), max(1, nch - 1))
+        dev = q_s.device
+        ok = meta["ok"].view(nch, G)
+        with torch.no_grad():
+            ch = torch.randint(1, max(2, nch), (m,), device=dev)                    # chunks >= 1
+            qr = ch.view(-1, 1) * C + torch.arange(C, device=dev).view(1, -1)
+            qv = qr < N
+            qr = qr.clamp(max=N - 1).reshape(-1)
+            Gd = kf * S_f
+            kr = (S + ch.view(-1, 1) * G + torch.arange(Gd, device=dev).view(1, -1)).reshape(-1)
+            qg = q_s.index_select(2, qr).view(B, H, m, C, D).float()
+            kg = k_s.index_select(2, kr).view(B, H, m, Gd, D).float()
+            s = torch.einsum("bhmcd,bhmgd->bhmcg", qg, kg) * (float(D) ** -0.5)
+            ls = lse.index_select(2, qr).view(B, H, m, C, 1).float()
+            okg = ok.index_select(0, ch)[:, :Gd]                                    # [m, Gd]
+            p = ((s - ls).exp() * okg.view(1, 1, m, 1, Gd).float()).mean(1)        # [B, m, C, Gd]
+            mf = p.view(B, m, C, kf, S_f).sum(-1)                                  # per final block
+            tot = mf.sum(-1)
+            fst = td["kept"][-1].index_select(1, ch) * S_f                         # [B, m, kf] starts
+            fok = okg.view(m, kf, S_f)[..., 0].view(1, m, kf)
+        losses = []
+        for i, l in enumerate(td["levels"]):
+            kept = td["kept"][i].index_select(1, ch)                                # [B, m, k]
+            kk = int(kept.size(-1))
+            vk = (torch.arange(kk, device=dev).view(1, 1, -1)
+                  < td["live"][i].index_select(0, ch).view(1, -1, 1))              # [1, m, k]
+            with torch.no_grad():
+                S_l = int(td["S"][i])
+                kst = kept * S_l
+                mem = ((fst.unsqueeze(2) >= kst.unsqueeze(-1)) & (fst.unsqueeze(2) < (kst + S_l).unsqueeze(-1))
+                       & fok.unsqueeze(2) & vk.unsqueeze(-1))                       # [B, m, k, kf]
+                tgt = torch.einsum("bmcf,bmkf->bmck", mf, mem.float())
+                tt = tgt.sum(-1)
+                live = qv.view(1, m, C) & (tt > 1e-6) & (vk.sum(-1) > 1).view(1, m, 1)
+                t = tgt / tt.clamp_min(1e-20).unsqueeze(-1)
+                ent = (t * t.clamp_min(1e-20).log()).sum(-1)
+            qi = td["q"].index_select(1, qr).view(B, m, C, -1).float()
+            kl_ = td["k"][l]
+            ksafe = kept.clamp(max=int(kl_.size(1)) - 1)              # dead picks may be out of range
+            kq = kl_.gather(1, ksafe.reshape(B, -1, 1).expand(-1, -1, int(kl_.size(-1)))).view(B, m, kk, -1).float()
+            lg = torch.einsum("bmcd,bmkd->bmck", qi, kq) * (float(qi.size(-1)) ** -0.5)
+            lg = lg.masked_fill(~vk.unsqueeze(2), -1e4)
+            logq = torch.log_softmax(lg, -1)
+            xent = -(t * logq).sum(-1)
+            lf = live.float()
+            losses.append(((xent + ent) * lf).sum() / lf.sum().clamp(min=1.0))
+        kl = torch.stack(losses).sum()
+        self._nom_kl_loss = kl
+        lq = (qv.view(1, m, C) & (tot > 1e-6)).float()
+        self._nom_kl_stat = torch.stack([kl.detach(), (tot * lq).sum() / lq.sum().clamp(min=1.0)])
 
     def _nominate_by_head(self, spec: Dict, lvl_packed: torch.Tensor, x_nodes: torch.Tensor):
         """Hierarchy-nominated slots -> (rows [B, nch*K], weight [B, nch*K], meta).
@@ -6309,7 +6838,8 @@ class HierarchicalMessagePassing(MessagePassing):
             _st = gsel[2]["static_rows"]
             _B0 = int(kp.size(0))
             _ix = gsel[0].view(_B0, -1, 1, 1).expand(-1, -1, kp.size(2), kp.size(3))
-            _g = torch.sigmoid(gsel[1]).to(vp.dtype).view(_B0, -1, 1, 1)
+            _g = (torch.sigmoid(gsel[1]).to(vp.dtype).view(_B0, -1, 1, 1)
+                  if gsel[1] is not None else None)          # nominator attn: no gate
             _ks = kp.gather(1, _ix)
             if str(getattr(self, "local_pack_global_boost", "logit")) == "key":
                 # QUERY-CONDITIONED BOOST: k_j += z_j * R_pos(j) u, so the extra score is
@@ -6340,7 +6870,8 @@ class HierarchicalMessagePassing(MessagePassing):
                 _kst = self._far_keys(_kst, _lv.index_select(0, _st))
                 _ks = self._far_keys(_ks, _lv.index_select(0, gsel[0].reshape(-1)).view(_B0, -1))
             k_s = torch.cat([_kst, _ks, kp], 1).transpose(1, 2)
-            v_s = torch.cat([vp.index_select(1, _st), vp.gather(1, _ix) * _g, vp],
+            _vsl = vp.gather(1, _ix)
+            v_s = torch.cat([vp.index_select(1, _st), _vsl * _g if _g is not None else _vsl, vp],
                             1).transpose(1, 2)
         elif _pre is not None:
             # Identity layout: no q gather, K/V carry the block rows as a prefix.
@@ -6423,7 +6954,12 @@ class HierarchicalMessagePassing(MessagePassing):
         if _kl and (_ring or _smod is not None):
             raise NotImplementedError("local_pack_global_nom_kl: slot mass needs a plain-score "
                                       "main call (no ring merge, logit boost or dropkey)")
-        _want_lse = _lse or _kl
+        # tiled descent (training): its indexer KL reads the slot mass off the same LSE
+        _tdk = bool(_l0s and self.training and "tdesc" in gsel[2])
+        if _tdk and (_ring or _smod is not None):
+            raise NotImplementedError("tdesc indexer KL: slot mass needs a plain-score main call "
+                                      "(no ring merge, logit boost or dropkey)")
+        _want_lse = _lse or _kl or _tdk
         if q_s.is_cuda and int(perm.numel()) >= 512:
             fn = _flex_compiled_singleton()
             # Default tiles exceed the workstation Blackwell's 101KB shared memory, so the
@@ -6440,6 +6976,8 @@ class HierarchicalMessagePassing(MessagePassing):
         out, lse_main = out if _want_lse else (out, None)
         if _kl:
             self._nom_kl_from_flex(q_s, k_s, lse_main, gsel)
+        if _tdk:
+            self._tdesc_kl_from_flex(q_s, k_s, lse_main, gsel)
         if _cc is not None:
             out = self._flex_coarse_call_merge(qp, kp, vp, spec, _cc, bool(causal), out, lse_main)
         out = out.transpose(1, 2)  # [B, N, H, D]
@@ -6723,7 +7261,7 @@ class HierarchicalMessagePassing(MessagePassing):
                         kp, spec, lvl_packed,
                         int(spec["global_block"].get(
                             "budget", spec["global_block"]["rows"].numel())),
-                        x_nodes=x_nodes)
+                        x_nodes=x_nodes, qp=qp)
                     _gsel = (_gr, _gs, _gm)
                 # Retry across the tile ladder before giving up: the common failure is a
                 # lowering guard on the mask granularity, not a broken environment, and a
@@ -7828,6 +8366,16 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_nom_kl: bool = False,  # head: KL of the slot weights to the flex slot mass
         local_pack_global_nom_kl_chunks: int = 8,  # query chunks sampled per call for that KL
         local_pack_global_nom_kl_detach: bool = False,  # KL trains a separate detached ranking scorer
+        local_pack_global_tile_level: int = 0,  # nominator attn (see the layer)
+        local_pack_global_tile_k: int = 0,
+        local_pack_global_tile_fine_level: int = -1,
+        local_pack_global_tile_fine_k: int = 0,
+        local_pack_global_tdesc_beams: Optional[List[int]] = None,
+        local_pack_global_tdesc_final_level: int = 1,
+        local_pack_global_tdesc_votes: int = 2,
+        local_pack_global_tdesc_recent: int = 4,
+        local_pack_global_tdesc_dim: int = 64,
+        local_pack_global_tdesc_gumbel: float = 1.0,
         local_pack_global_region_cap: int = 0,  # head: max picks per region (0 = off)
         local_pack_global_region_level: int = 2,  # head: level defining regions
         local_pack_far_nope_dims: int = 0,  # far keys: unrotated tail dims only (0 = off)
@@ -7957,6 +8505,16 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_nom_kl=local_pack_global_nom_kl,
             local_pack_global_nom_kl_chunks=local_pack_global_nom_kl_chunks,
             local_pack_global_nom_kl_detach=local_pack_global_nom_kl_detach,
+            local_pack_global_tile_level=local_pack_global_tile_level,
+            local_pack_global_tile_k=local_pack_global_tile_k,
+            local_pack_global_tile_fine_level=local_pack_global_tile_fine_level,
+            local_pack_global_tile_fine_k=local_pack_global_tile_fine_k,
+            local_pack_global_tdesc_beams=local_pack_global_tdesc_beams,
+            local_pack_global_tdesc_final_level=local_pack_global_tdesc_final_level,
+            local_pack_global_tdesc_votes=local_pack_global_tdesc_votes,
+            local_pack_global_tdesc_recent=local_pack_global_tdesc_recent,
+            local_pack_global_tdesc_dim=local_pack_global_tdesc_dim,
+            local_pack_global_tdesc_gumbel=local_pack_global_tdesc_gumbel,
             local_pack_global_region_cap=local_pack_global_region_cap,
             local_pack_global_region_level=local_pack_global_region_level,
             local_pack_far_nope_dims=local_pack_far_nope_dims,

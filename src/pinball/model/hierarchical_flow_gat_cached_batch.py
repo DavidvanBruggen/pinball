@@ -3043,6 +3043,16 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_nom_kl: bool = False,  # head: lightning-style KL of slot weights to flex slot mass
         local_pack_global_nom_kl_chunks: int = 8,  # query chunks sampled per layer call for that KL
         local_pack_global_nom_kl_detach: bool = False,  # KL trains a separate scorer on detached inputs
+        local_pack_global_tile_level: int = 0,  # nominator attn: level whose aligned blocks the tiles rank
+        local_pack_global_tile_k: int = 0,  # nominator attn: blocks kept per tile at that level
+        local_pack_global_tile_fine_level: int = -1,  # nominator attn: optional second hop (-1 = off)
+        local_pack_global_tile_fine_k: int = 0,  # nominator attn: sub-blocks kept per tile at the fine level
+        local_pack_global_tdesc_beams: Optional[List[int]] = None,  # nominator tdesc: beam per level, start..final
+        local_pack_global_tdesc_final_level: int = 1,
+        local_pack_global_tdesc_votes: int = 2,
+        local_pack_global_tdesc_recent: int = 4,
+        local_pack_global_tdesc_dim: int = 64,
+        local_pack_global_tdesc_gumbel: float = 1.0,
         lambda_nom_kl: float = 1.0,  # weight of the mean-over-layers nomination KL in the objective
         local_pack_far_nope_dims: int = 0,  # far keys (global block + slots) unrotated tail only; 0 = off
         local_pack_far_bias: str = "off",   # off | level: per-level logit bias on far keys (see the layer)
@@ -3737,6 +3747,16 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_nom_kl = bool(local_pack_global_nom_kl)
         self.local_pack_global_nom_kl_chunks = max(1, int(local_pack_global_nom_kl_chunks or 8))
         self.local_pack_global_nom_kl_detach = bool(local_pack_global_nom_kl_detach)
+        self.local_pack_global_tile_level = int(local_pack_global_tile_level or 0)
+        self.local_pack_global_tile_k = int(local_pack_global_tile_k or 0)
+        self.local_pack_global_tile_fine_level = int(local_pack_global_tile_fine_level)
+        self.local_pack_global_tile_fine_k = int(local_pack_global_tile_fine_k or 0)
+        self.local_pack_global_tdesc_beams = [int(v) for v in (local_pack_global_tdesc_beams or [])]
+        self.local_pack_global_tdesc_final_level = int(local_pack_global_tdesc_final_level)
+        self.local_pack_global_tdesc_votes = int(local_pack_global_tdesc_votes)
+        self.local_pack_global_tdesc_recent = int(local_pack_global_tdesc_recent)
+        self.local_pack_global_tdesc_dim = int(local_pack_global_tdesc_dim)
+        self.local_pack_global_tdesc_gumbel = float(local_pack_global_tdesc_gumbel)
         self.lambda_nom_kl = float(lambda_nom_kl)
         self._last_nom_kl_loss: Optional[torch.Tensor] = None
         self.local_pack_far_nope_dims = max(0, int(local_pack_far_nope_dims or 0))
@@ -4603,6 +4623,16 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_kl=bool(getattr(self, "local_pack_global_nom_kl", False)),
                         local_pack_global_nom_kl_chunks=int(getattr(self, "local_pack_global_nom_kl_chunks", 8)),
                         local_pack_global_nom_kl_detach=bool(getattr(self, "local_pack_global_nom_kl_detach", False)),
+                        local_pack_global_tile_level=int(getattr(self, "local_pack_global_tile_level", 0)),
+                        local_pack_global_tile_k=int(getattr(self, "local_pack_global_tile_k", 0)),
+                        local_pack_global_tile_fine_level=int(getattr(self, "local_pack_global_tile_fine_level", -1)),
+                        local_pack_global_tile_fine_k=int(getattr(self, "local_pack_global_tile_fine_k", 0)),
+                        local_pack_global_tdesc_beams=list(getattr(self, "local_pack_global_tdesc_beams", [])),
+                        local_pack_global_tdesc_final_level=int(getattr(self, "local_pack_global_tdesc_final_level", 1)),
+                        local_pack_global_tdesc_votes=int(getattr(self, "local_pack_global_tdesc_votes", 2)),
+                        local_pack_global_tdesc_recent=int(getattr(self, "local_pack_global_tdesc_recent", 4)),
+                        local_pack_global_tdesc_dim=int(getattr(self, "local_pack_global_tdesc_dim", 64)),
+                        local_pack_global_tdesc_gumbel=float(getattr(self, "local_pack_global_tdesc_gumbel", 1.0)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
@@ -4734,6 +4764,16 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_kl=bool(getattr(self, "local_pack_global_nom_kl", False)),
                         local_pack_global_nom_kl_chunks=int(getattr(self, "local_pack_global_nom_kl_chunks", 8)),
                         local_pack_global_nom_kl_detach=bool(getattr(self, "local_pack_global_nom_kl_detach", False)),
+                        local_pack_global_tile_level=int(getattr(self, "local_pack_global_tile_level", 0)),
+                        local_pack_global_tile_k=int(getattr(self, "local_pack_global_tile_k", 0)),
+                        local_pack_global_tile_fine_level=int(getattr(self, "local_pack_global_tile_fine_level", -1)),
+                        local_pack_global_tile_fine_k=int(getattr(self, "local_pack_global_tile_fine_k", 0)),
+                        local_pack_global_tdesc_beams=list(getattr(self, "local_pack_global_tdesc_beams", [])),
+                        local_pack_global_tdesc_final_level=int(getattr(self, "local_pack_global_tdesc_final_level", 1)),
+                        local_pack_global_tdesc_votes=int(getattr(self, "local_pack_global_tdesc_votes", 2)),
+                        local_pack_global_tdesc_recent=int(getattr(self, "local_pack_global_tdesc_recent", 4)),
+                        local_pack_global_tdesc_dim=int(getattr(self, "local_pack_global_tdesc_dim", 64)),
+                        local_pack_global_tdesc_gumbel=float(getattr(self, "local_pack_global_tdesc_gumbel", 1.0)),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
@@ -7146,10 +7186,12 @@ class HierarchicalFlowGAT(nn.Module):
         # caches); every later call replays.
         if not getattr(self, "_cg_checked", False):
             if (self.local_pack_global_select == "content"
-                    and self.local_pack_global_nominator != "head"):
+                    and self.local_pack_global_nominator not in ("head", "attn", "tdesc")):
+                # head / attn: the slot mask is pure geometry (cached on the first, uncaptured
+                # call of each spec, like their geometry caches), so re-picks never rebuild it
                 raise ValueError(
                     "hier_layer_cudagraphs: content selection with the key nominator rebuilds "
-                    "its BlockMask on re-picks inside the graph; use the head nominator")
+                    "its BlockMask on re-picks inside the graph; use the head or attn nominator")
             self._cg_checked = True
         spec = getattr(getattr(transformer, "message_passing", None), "_local_pack_spec", None)
         if getattr(transformer, "_cg_warm_spec", None) is not spec:
@@ -7592,6 +7634,10 @@ class HierarchicalFlowGAT(nn.Module):
                 (lvl_packed == L).nonzero(as_tuple=False).view(-1).contiguous()
                 for L in range(_n_lvl)
             ],
+            # window span of each level in L0 tokens (L0 = 1): pure geometry, read by the
+            # attention-guided tile selector to map a coarse node to its L0 block
+            "level_spans": [1] + [int(self._cumulative_window(L)[0])
+                                  for L in range(1, min(_n_lvl, len(self.compression_ratios) + 1))],
             "query_sel": sel,
             "query_nodes": perm.index_select(0, sel),
             "query_levels": q_levels,
@@ -16445,7 +16491,8 @@ class HierarchicalFlowGAT(nn.Module):
                     edge_attr_work = new_edge_attr
 
                 # nomination KL (local_pack_global_nom_kl): the layer stored its slot-mass KL
-                if self.training and self.local_pack_global_nom_kl:
+                if self.training and (self.local_pack_global_nom_kl
+                                      or self.local_pack_global_nominator == "tdesc"):
                     _mpk = getattr(transformer, "message_passing", None)
                     _lk = getattr(_mpk, "_nom_kl_loss", None) if _mpk is not None else None
                     if _lk is not None:
