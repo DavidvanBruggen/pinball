@@ -2846,6 +2846,19 @@ class HierarchicalFlowGAT(nn.Module):
         xq_index_gumbel: float = 1.0,
         lambda_xq_index: float = 1.0,
         xq_index_loss_queries: int = 1024,               # queries sampled per round for the KL (0 = all)
+        xq_descent_read: str = "gather",                 # gather (per-query) | staircase (tile union, flex)
+        xq_descent_tile: int = 128,                      # staircase: queries per tile
+        xq_descent_union_cap: int = 1024,                # staircase: union slots per tile
+        xq_descent_recent: int = 255,                    # staircase: newest tokens before the tile
+        xq_descent_noise: str = "query",                 # Gumbel per query | per tile (staircase)
+        xq_salience_prior: bool = False,                 # alpha * nope salience in the descent score
+        xq_salience_boost: bool = False,                 # tanh(salience) * u on the staircase keys
+        xq_salience_dim: int = 64,
+        xq_descent_final_level: int = 0,                 # 1 = per-query descent stops at L1
+        xq_descent_l0_by_salience: bool = False,         # L0 tokens inside the L1 picks ranked by salience
+        xq_far_kv_groups: int = 0,                       # grouped (MQA/GQA) far read; 0 = per-head k/v
+        xq_read_ckpt: bool = True,                       # checkpoint the descent read per query chunk
+        xq_select_cuda_graph: bool = False,              # descent selection as CUDA graphs
         # Per-query differentiable relevance gate: hqd read output scaled by
         # sigmoid(w * stage1_top_score + b). Gives queries a no-op option (the ungated read
         # HURT never-recurring tokens by ~1.6% on the 100ep run) AND routes a task gradient
@@ -3058,6 +3071,7 @@ class HierarchicalFlowGAT(nn.Module):
         lambda_nom_kl: float = 1.0,  # weight of the mean-over-layers nomination KL in the objective
         local_pack_far_nope_dims: int = 0,  # far keys (global block + slots) unrotated tail only; 0 = off
         local_pack_far_bias: str = "off",   # off | level: per-level logit bias on far keys (see the layer)
+        local_pack_far_slow_pairs: int = 0,  # ultra-slow RoPE pairs in the far tail (see the layer); 0 = off
         lap_pe_bias: bool = True,           # lap_pe_proj bias; False for a clean A/B (no constant offset)
         local_pack_global_region_cap: int = 0,      # head only: max picks per region (0 = off)
         local_pack_global_region_level: int = 2,    # head only: level whose nodes define regions
@@ -3765,6 +3779,9 @@ class HierarchicalFlowGAT(nn.Module):
         self._last_nom_kl_loss: Optional[torch.Tensor] = None
         self.local_pack_far_nope_dims = max(0, int(local_pack_far_nope_dims or 0))
         self.local_pack_far_bias = str(local_pack_far_bias or "off").lower()
+        self.local_pack_far_slow_pairs = max(0, int(local_pack_far_slow_pairs or 0))
+        # stored here (before the layers are built): the layers own the grouped far K/V
+        self.xq_far_kv_groups = max(0, int(xq_far_kv_groups or 0))
         self.lap_pe_bias = bool(lap_pe_bias)
         self.local_pack_global_region_cap = max(0, int(local_pack_global_region_cap or 0))
         self.local_pack_global_region_level = max(1, int(local_pack_global_region_level or 2))
@@ -4641,6 +4658,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_tdesc_read_coarse=list(getattr(self, "local_pack_global_tdesc_read_coarse", [])),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
+                        local_pack_far_slow_pairs=int(getattr(self, "local_pack_far_slow_pairs", 0) or 0),
+                        local_pack_far_slow_len=int(self.max_seq_len),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
                         local_pack_global_region_level=int(getattr(self, "local_pack_global_region_level", 2)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
@@ -4650,6 +4669,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
                         hqd_read_sink=bool(getattr(self, "xq_nominate_read_sink", False)),
+                        hqd_far_kv_groups=int(getattr(self, "xq_far_kv_groups", 0) or 0),
                         cross_level_packed=self.cross_level_packed,
                         cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
@@ -4784,6 +4804,8 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_tdesc_read_coarse=list(getattr(self, "local_pack_global_tdesc_read_coarse", [])),
                         local_pack_far_nope_dims=int(getattr(self, "local_pack_far_nope_dims", 0) or 0),
                         local_pack_far_bias=str(getattr(self, "local_pack_far_bias", "off")),
+                        local_pack_far_slow_pairs=int(getattr(self, "local_pack_far_slow_pairs", 0) or 0),
+                        local_pack_far_slow_len=int(self.max_seq_len),
                         local_pack_global_region_cap=int(getattr(self, "local_pack_global_region_cap", 0)),
                         local_pack_global_region_level=int(getattr(self, "local_pack_global_region_level", 2)),
                         hier_node_dropout=float(getattr(self, "hier_node_dropout", 0.0)),
@@ -4793,6 +4815,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_rope_axial=bool(getattr(self, "local_pack_rope_axial", False)),
                         hqd_read_prerope=bool(getattr(self, "xq_nominate_read_prerope", False)),
                         hqd_read_sink=bool(getattr(self, "xq_nominate_read_sink", False)),
+                        hqd_far_kv_groups=int(getattr(self, "xq_far_kv_groups", 0) or 0),
                         cross_level_packed=self.cross_level_packed,
                         cross_level_qkv=self.cross_level_qkv,
                         local_attn_sampled_mode=self.local_attn_sampled_mode,
@@ -5475,6 +5498,91 @@ class HierarchicalFlowGAT(nn.Module):
             self.xq_index_q = nn.Linear(_Hd, self.xq_index_dim, bias=False)
             self.xq_index_k = nn.ModuleList(
                 nn.Linear(_Hd, self.xq_index_dim, bias=False) for _ in range(int(num_levels)))
+        # STAIRCASE READ (xq_descent_read="staircase"): the descent's per-query picks are read
+        # through ONE flex call per consuming layer instead of the per-query gather. Each tile
+        # of xq_descent_tile consecutive L0 queries reads the UNION of its queries' own picks
+        # (deduped, ordered by first voter, capped at xq_descent_union_cap), plus the newest
+        # xq_descent_recent tokens before the tile and a zero-value sink. Query i of the tile
+        # sees the recency slots and the union slots whose FIRST voter is <= i -- a staircase
+        # mask, so a query never sees a pick chosen by a later query (causal by construction;
+        # on overflow the latest voters' picks drop, which keeps it causal). The boundary
+        # n_i lives in a persistent buffer updated in place: the BlockMask is built once per
+        # shape (measured +10% over a geometry-only mask, exact vs a rebuilt mask).
+        self.xq_descent_read = str(xq_descent_read or "gather").lower()
+        self.xq_descent_tile = int(xq_descent_tile)
+        self.xq_descent_union_cap = int(xq_descent_union_cap)
+        self.xq_descent_recent = int(xq_descent_recent)
+        # Gumbel exploration in the descent (training): "query" = independent per query and
+        # candidate (the gather arm); "tile" = shared per (tile, candidate), so a tile's queries
+        # explore alike and its union stays small (staircase read only)
+        self.xq_descent_noise = str(xq_descent_noise or "query").lower()
+        if self.xq_descent_noise not in {"query", "tile"}:
+            raise ValueError(f"xq_descent_noise must be 'query' or 'tile', got {xq_descent_noise!r}")
+        # SALIENCE (nope's hierarchy nomination weight, per node): w(c) = <Q(x_parent), K(x_c)>
+        # / sqrt(d) + w-term of the parent + level offset, query-independent, available once c,
+        # its parent and grandparent have closed. xq_salience_prior: alpha_l * w(c) is added to
+        # every query's descent score (alpha init 0 = the plain descent; alpha is trained by the
+        # indexer KL, w enters it detached). xq_salience_boost: each staircase slot key gets
+        # tanh(w) * u_layer (u init 0), so the QUERY decides via q.u how much salient content
+        # it wants and the task loss trains the salience heads (nope's key boost).
+        self.xq_salience_prior = bool(xq_salience_prior)
+        self.xq_salience_boost = bool(xq_salience_boost)
+        self.xq_salience_dim = int(xq_salience_dim)
+        # L1 STOP: the per-query descent (indexer + beams) runs from the start level down to
+        # xq_descent_final_level only; the levels below it take the CHILDREN of the query's
+        # picks ranked by salience (xq_descent_l0_by_salience; a scalar per node, no GEMM) or
+        # by recency. 0 = the full descent to L0 (default).
+        self.xq_descent_final_level = max(0, int(xq_descent_final_level or 0))
+        self.xq_descent_l0_by_salience = bool(xq_descent_l0_by_salience)
+        # recompute the read's gathered K/V per query chunk in backward (memory) instead of
+        # keeping them (speed); also switches the gather to fp32 (native atomics) either way
+        self.xq_read_ckpt = bool(xq_read_ckpt)
+        # replay the descent selection as CUDA graphs (it is launch-bound); off = eager
+        self.xq_select_cuda_graph = bool(xq_select_cuda_graph)
+        self._xq_graph_cache: Dict[tuple, Any] = {}
+        self._xq_graph_pool = None
+        if self.xq_descent_read not in {"gather", "staircase"}:
+            raise ValueError(f"xq_descent_read must be 'gather' or 'staircase', got {xq_descent_read!r}")
+        if self.xq_descent_read == "staircase":
+            if not self.xq_descent_enable:
+                raise ValueError("xq_descent_read='staircase' needs xq_descent_enable")
+            if self.xq_descent_tile != 128:
+                raise ValueError("xq_descent_tile must be 128 (the flex block size)")
+            _gt = self.xq_descent_union_cap + self.xq_descent_recent + 1
+            if self.xq_descent_union_cap <= 0 or self.xq_descent_recent < 0 or _gt % 128:
+                raise ValueError(f"xq_descent_union_cap + xq_descent_recent + 1 (sink) = {_gt} must "
+                                 "be a positive multiple of 128")
+        if (self.xq_salience_prior or self.xq_salience_boost) and not self.xq_descent_enable:
+            raise ValueError("xq_salience_prior / xq_salience_boost need xq_descent_enable")
+        if self.xq_salience_boost and self.xq_descent_read != "staircase" and self.xq_far_kv_groups <= 0:
+            raise ValueError("xq_salience_boost needs xq_descent_read='staircase' or xq_far_kv_groups > 0")
+        if self.xq_far_kv_groups and not self.xq_descent_enable:
+            raise ValueError("xq_far_kv_groups needs xq_descent_enable")
+        if self.xq_far_kv_groups and self.xq_descent_read == "staircase":
+            raise ValueError("xq_far_kv_groups uses the gather read (xq_descent_read='gather')")
+        if self.xq_descent_l0_by_salience and self.xq_descent_final_level < 1:
+            raise ValueError("xq_descent_l0_by_salience needs xq_descent_final_level >= 1")
+        if self.xq_salience_prior or self.xq_salience_boost or self.xq_descent_l0_by_salience:
+            _Hd = int(self.hidden_dim)
+            # child level l is scored by its parent at l + 1 (top level: no parent, e = 0)
+            self.xq_sal_q = nn.ModuleList(
+                nn.Linear(_Hd, self.xq_salience_dim, bias=False) for _ in range(int(num_levels) - 1))
+            self.xq_sal_k = nn.ModuleList(
+                nn.Linear(_Hd, self.xq_salience_dim, bias=False) for _ in range(int(num_levels) - 1))
+            self.xq_sal_offset = nn.Parameter(torch.zeros(int(num_levels)))
+        if self.xq_salience_prior:
+            self.xq_sal_alpha = nn.Parameter(torch.zeros(int(num_levels)))
+        if self.xq_salience_boost and self.xq_descent_read == "staircase":
+            # one direction per (layer, head); rows beyond the stack are never indexed
+            self.xq_stair_boost_u = nn.Parameter(
+                torch.zeros(64, int(self.num_heads), int(self.hidden_dim) // int(self.num_heads)))
+        if self.xq_salience_boost and self.xq_far_kv_groups:
+            # one direction per (layer, shared KV group) of the grouped far read
+            self.xq_far_boost_u = nn.Parameter(
+                torch.zeros(64, int(self.xq_far_kv_groups), int(self.hidden_dim) // int(self.num_heads)))
+        self._xq_far_state: Optional[Dict[str, Any]] = None
+        self._xq_stair_cache: Dict[tuple, Any] = {}
+        self._xq_stair_state: Optional[Dict[str, Any]] = None
         self._xq_nom_edges: Optional[tuple] = None
         self._xq_query_gate_full: Optional[torch.Tensor] = None  # [B,N,1], per nomination round
         self._xq_children_cache: Optional[tuple] = None
@@ -8191,6 +8299,339 @@ class HierarchicalFlowGAT(nn.Module):
                 else [l for l in self.xq_descent_read_levels if 0 <= l < n_levels])
         return start, beam, read
 
+    def _xq_parent_tables(self, sizes: List[int], tabs: List, device: torch.device) -> List:
+        """parent[l] [n_l]: each level-l node's EARLIEST-closing containing parent (local id
+        at level l + 1, -1 if none), inverted from the window-rule children tables. Cached."""
+        key = ("xq_parent", tuple(int(v) for v in sizes), str(device))
+        cached = self._xq_stair_cache.get(key)
+        if cached is not None:
+            return cached
+        par: List = []
+        for l in range(len(sizes)):
+            if l + 1 >= len(sizes):
+                par.append(None)
+                continue
+            tab = tabs[l + 1]                                              # [n_{l+1}, Kc] level-l ids
+            pid = torch.arange(int(tab.size(0)), device=device).view(-1, 1).expand_as(tab)
+            ok = tab >= 0
+            big = int(sizes[l + 1]) + 1
+            p = torch.full((int(sizes[l]),), big, dtype=torch.long, device=device).scatter_reduce(
+                0, tab[ok], pid[ok], reduce="amin")
+            par.append(torch.where(p < big, p, torch.full_like(p, -1)))
+        self._xq_stair_cache[key] = par
+        return par
+
+    def _xq_salience(self, x: torch.Tensor, o: List[int], sizes: List[int], t: torch.Tensor,
+                     tabs: List) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
+        """nope-style salience per level: (w[l] [B, n_l] WITH grad, avail[l] [n_l]).
+
+        w(c) = e(c) + e(parent(c)) + offset[l], e(c) = <Q_l(x_parent), K_l(x_c)> / sqrt(d) for
+        the earliest-closing parent (0 without one). Query-independent; it reads the parent's
+        and grandparent's features, so it may be used for a query only once c, its parent and
+        its grandparent have all closed: avail(c) = the latest of their close times."""
+        nl = len(sizes)
+        B, _, H = x.shape
+        par = self._xq_parent_tables(sizes, tabs, x.device)
+        xn = F.layer_norm(x, (H,))
+        scale = float(self.xq_salience_dim) ** -0.5
+        e: List[torch.Tensor] = []
+        for l in range(nl):
+            if par[l] is None:
+                e.append(x.new_zeros(B, int(sizes[l]), dtype=torch.float32))
+                continue
+            p = par[l]
+            xp = xn[:, o[l + 1]:o[l + 2]].index_select(1, p.clamp(min=0))
+            el = (self.xq_sal_q[l](xp) * self.xq_sal_k[l](xn[:, o[l]:o[l + 1]])).sum(-1).float() * scale
+            e.append(torch.where((p >= 0).view(1, -1), el, torch.zeros_like(el)))
+        w: Dict[int, torch.Tensor] = {}
+        av: Dict[int, torch.Tensor] = {}
+        for l in range(nl):
+            tl = t[o[l]:o[l + 1]]
+            a = tl
+            up = torch.zeros_like(e[l])
+            if par[l] is not None:
+                p = par[l]; okp = p >= 0; pc = p.clamp(min=0)
+                up = torch.where(okp.view(1, -1), e[l + 1].index_select(1, pc), up)
+                a = torch.where(okp, torch.maximum(a, t[o[l + 1]:o[l + 2]].index_select(0, pc)), a)
+                if par[l + 1] is not None:
+                    g = par[l + 1].index_select(0, pc)
+                    okg = okp & (g >= 0)
+                    a = torch.where(okg, torch.maximum(a, t[o[l + 2]:o[l + 3]].index_select(0, g.clamp(min=0))), a)
+            w[l] = e[l] + up + self.xq_sal_offset[l].float()
+            av[l] = a
+        return w, av
+
+    def _xq_stair_build(self, cand_abs: torch.Tensor, o: List[int], t: torch.Tensor,
+                        sal: Optional[Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]],
+                        round_idx: int) -> Dict[str, Any]:
+        """Tile unions + staircase boundaries for the staircase read (one descent round).
+
+        Per tile of T queries: the queries' own picks deduped (a node picked by several
+        queries is ONE slot owned by its earliest voter), ordered by first voter and capped at
+        G; n_i = number of slots whose first voter is <= i. L0 picks inside the recency
+        window are dropped from the union (the recency slots hold them). Layout per tile:
+        [union G | newest R tokens before the tile | sink]. All no-grad except the boost."""
+        T, G, R = int(self.xq_descent_tile), int(self.xq_descent_union_cap), int(self.xq_descent_recent)
+        Gt = G + R + 1
+        B, n0, K = (int(v) for v in cand_abs.shape)
+        dev = cand_abs.device
+        Nn = int(o[-1])
+        nT = (n0 + T - 1) // T
+        Qp = nT * T
+        st_tok = torch.arange(nT, device=dev) * T                              # first query token
+        with torch.no_grad():
+            c = cand_abs
+            if Qp > n0:
+                c = torch.cat([c, c.new_full((B, Qp - n0, K), -1)], 1)
+            c = c.view(B, nT, T, K)
+            tok = c - int(o[0])
+            in_rec = (c >= int(o[0])) & (c < int(o[1])) & (tok >= (st_tok.view(1, -1, 1, 1) - R))
+            valid = (c >= 0) & ~in_rec
+            voter = torch.arange(T, device=dev).view(1, 1, T, 1).expand_as(c)
+            S1 = Nn * T + T
+            key = torch.where(valid, c * T + voter, torch.full_like(c, S1)).view(B, nT, T * K)
+            sk, ps = key.sort(-1)
+            v_s = sk < S1
+            node_s, voter_s = sk // T, sk % T
+            first = v_s.clone()
+            first[..., 1:] &= node_s[..., 1:] != node_s[..., :-1]
+            S2 = T * (Nn + 1) + Nn + 1
+            key2 = torch.where(first, voter_s * (Nn + 1) + node_s, torch.full_like(sk, S2))
+            sk2, ps2 = key2.sort(-1)                                           # slots by first voter
+            TK = int(sk2.size(-1))
+            if TK < G:
+                sk2 = torch.cat([sk2, sk2.new_full((B, nT, G - TK), S2)], -1)
+            keep = sk2[..., :G] < S2
+            voted = torch.where(keep, sk2[..., :G] % (Nn + 1), torch.zeros_like(sk2[..., :G]))
+            fv = torch.where(keep, sk2[..., :G] // (Nn + 1), torch.zeros_like(sk2[..., :G]))
+            cnt = torch.zeros(B, nT, T, dtype=torch.long, device=dev).scatter_add_(-1, fv, keep.long())
+            nlim = cnt.cumsum(-1).view(B, Qp)
+            # each pick's slot (for the KL mass): node-sorted element -> its group's first ->
+            # that first's rank in the first-voter order; then back to the original order
+            ar = torch.arange(TK, device=dev).view(1, 1, -1).expand(B, nT, -1)
+            inv2 = torch.empty_like(ps2[..., :TK]).scatter_(-1, ps2[..., :TK], ar)
+            fpos = torch.where(first, ar, torch.zeros_like(ar)).cummax(-1).values
+            slot_s = inv2.gather(-1, fpos)
+            slot_s = torch.where(v_s & (slot_s < G), slot_s, torch.full_like(slot_s, -1))
+            slot = torch.empty_like(slot_s).scatter_(-1, ps, slot_s).view(B, nT, T, K)
+            rslot = G + tok - (st_tok.view(1, -1, 1, 1) - R)
+            pick_slot = torch.where(in_rec, rslot, slot).view(B, Qp, K)[:, :n0].contiguous()
+            rtok = st_tok.view(-1, 1) - R + torch.arange(R, device=dev).view(1, -1)   # [nT, R]
+            rec_lo = (R - st_tok).clamp(0, R).to(torch.int32)
+            rec_rows = (int(o[0]) + rtok.clamp(min=0)).view(1, nT, R).expand(B, -1, -1)
+            rows = torch.cat([voted, rec_rows, torch.zeros(B, nT, 1, dtype=torch.long, device=dev)], -1)
+            rows = rows.reshape(B, nT * Gt).contiguous()
+            q_pos = torch.cat([t[o[0]:o[1]].float(), t.new_zeros(Qp - n0).float()]) if Qp > n0 \
+                else t[o[0]:o[1]].float()
+            if self.training:
+                _uf = (key2 < S2).sum(-1).float()
+                self._last_xq_stair_stats = {
+                    "union_mean": float(keep.sum(-1).float().mean()),
+                    "union_full_mean": float(_uf.mean()), "union_full_p99": float(_uf.quantile(0.99)),
+                    "overflow_tiles": float((_uf > G).float().mean())}
+        bkey = ("xq_stair_bm", B, nT, Gt, int(round_idx))
+        ent = self._xq_stair_cache.get(bkey)
+        if ent is None:
+            from torch.nn.attention.flex_attention import BlockMask
+            nlim_buf = torch.zeros(B, Qp, dtype=torch.int32, device=dev)
+            rec_buf = torch.zeros(nT, dtype=torch.int32, device=dev)
+
+            def mask_mod(b, h, qi, ki):
+                tl = qi // T
+                j = ki - tl * Gt
+                return ((ki // Gt) == tl) & ((j < nlim_buf[b, qi]) | ((j >= G) & ((j - G) >= rec_buf[tl])))
+
+            nb = Gt // 128
+            num = torch.full((1, 1, nT), nb, dtype=torch.int32, device=dev)
+            idx = (torch.arange(nT, device=dev).view(-1, 1) * nb + torch.arange(nb, device=dev).view(1, -1))
+            idx = torch.cat([idx, torch.zeros(nT, nT * nb - nb, dtype=torch.long, device=dev)], -1)
+            bm = BlockMask.from_kv_blocks(num, idx.to(torch.int32).view(1, 1, nT, nT * nb), None, None,
+                                          BLOCK_SIZE=128, mask_mod=mask_mod, seq_lengths=(Qp, nT * Gt))
+            ent = (nlim_buf, rec_buf, bm)
+            self._xq_stair_cache[bkey] = ent
+        nlim_buf, rec_buf, bm = ent
+        # a separate buffer per round: flex re-evaluates mask_mod in BACKWARD, after the later
+        # rounds of the same step have run
+        nlim_buf.copy_(nlim.to(torch.int32))
+        rec_buf.copy_(rec_lo)
+        st = {"rows": rows, "bm": bm, "q_pos": q_pos, "node_pos": t.float(), "pick_slot": pick_slot,
+              "o0": int(o[0]), "n0": n0, "Qp": Qp, "Gt": Gt, "nT": nT, "T": T,
+              "boost_node": None, "boost_ok": None, "sel": None}
+        if self.xq_salience_boost and sal is not None:
+            w_lv, av_lv = sal
+            nl = len(o) - 1
+            wf = torch.cat([w_lv[l] if l in w_lv else w_lv[0].new_zeros(B, o[l + 1] - o[l]) for l in range(nl)], 1)
+            BIGT = torch.iinfo(torch.long).max // 4
+            af = torch.cat([av_lv[l] if l in av_lv else torch.full((o[l + 1] - o[l],), BIGT, device=dev,
+                                                                    dtype=torch.long) for l in range(nl)])
+            t0 = t[o[0]:o[1]].index_select(0, st_tok.clamp(max=n0 - 1))           # tile start times
+            ok = (af.index_select(0, rows.view(-1)).view(B, nT, Gt) < t0.view(1, -1, 1))
+            ok[:, :, -1] = False                                                   # sink: no boost
+            # node-level boost value (grad) + per-slot "available before the tile" flag: the
+            # read boosts the ~N source rows once and picks plain/boosted per slot by index
+            st["boost_node"] = torch.tanh(wf)
+            st["boost_ok"] = ok.view(B, -1)
+        if self.training and int(self.xq_index_loss_queries) > 0 and int(self.xq_index_loss_queries) < n0:
+            st["sel"] = torch.randperm(n0, device=dev)[: int(self.xq_index_loss_queries)].sort().values
+        elif self.training:
+            st["sel"] = torch.arange(n0, device=dev)
+        return st
+
+    def _xq_select_core(self, ins: List[torch.Tensor], ctx: Dict[str, Any]):
+        """The descent's no-grad selection (the loop of _xq_descent_nominate), as a pure
+        function of its tensor inputs: no host syncs, static shapes per ctx -- so it can be
+        captured as a CUDA graph (xq_select_cuda_graph). Returns (levels_rec, cand_abs)."""
+        o, sizes, start, beam = ctx["o"], ctx["sizes"], ctx["start"], ctx["beam"]
+        read_levels, tabs, fl, tau = ctx["read_levels"], ctx["tabs"], ctx["fl"], ctx["tau"]
+        allow_same, B, n0, scale, d, dev = ctx["allow_same"], ctx["B"], ctx["n0"], ctx["scale"], ctx["d"], ctx["dev"]
+        nl = len(o) - 1
+        q_all = ins[0]
+        k_lv = {l: ins[1 + i] for i, l in enumerate(range(fl, start + 1))}
+        j = 1 + (start + 1 - fl)
+        t, q_t = ins[j], ins[j + 1]
+        j += 2
+        sal_w = sal = sal_a = None
+        if ctx["has_sal"]:
+            sal_w = {l: ins[j + l] for l in range(nl)}
+            sal = (None, {l: ins[j + nl + l] for l in range(nl)})
+            j += 2 * nl
+        if ctx["has_prior"]:
+            sal_a = ins[j]
+        q_pos = torch.arange(n0, device=dev)
+        levels_rec = []
+        CH = 4096              # query chunk: bounds the [B, CH, n_l] score transient (bf16, ~0.5 GB at L0 16k)
+        par = None
+        for i, lvl in enumerate(range(start, -1, -1)):
+            k_keep = beam[i] if lvl > 0 else int(self.xq_descent_topk_l0)
+            tl = t[o[lvl]:o[lvl + 1]]
+            if par is None:
+                cand = torch.arange(sizes[lvl], device=dev).view(1, 1, -1).expand(B, n0, -1)
+                pslot = None
+            else:
+                kp = int(par.size(-1))
+                ch = tabs[lvl + 1]                                   # [n_{l+1}, Kc]
+                cand = ch.index_select(0, par.clamp(min=0).reshape(-1)).view(B, n0, kp, -1)
+                cand = torch.where((par >= 0).unsqueeze(-1), cand, torch.full_like(cand, -1))
+                pslot = torch.arange(kp, device=dev).view(1, 1, kp, 1).expand_as(cand).reshape(B, n0, -1)
+                cand = cand.reshape(B, n0, -1)
+                cand, order = cand.sort(dim=-1, descending=True)     # -1 sinks; dups adjacent
+                pslot = pslot.gather(-1, order)
+                dup = torch.zeros_like(cand, dtype=torch.bool)
+                dup[..., 1:] = cand[..., 1:] == cand[..., :-1]
+                cand = torch.where(dup, torch.full_like(cand, -1), cand)
+            m = int(cand.size(-1))
+            kk = min(k_keep, m)
+            keep_idx = torch.empty(B, n0, kk, dtype=torch.long, device=dev)
+            keep_ok = torch.empty(B, n0, kk, dtype=torch.bool, device=dev)
+            below = lvl < fl                      # L1 stop: children ranked without the indexer
+            kl = k_lv[lvl].float() if not below else None
+            # score-gather: one [c, d] x [d, n_l] GEMM per chunk, then gather the candidate
+            # columns -- far cheaper than gathering [c, m, d] keys (measured 8.5 of 15 ms
+            # per round). O(n0 * n_l * d) FLOPs, so past xq_stage3_gemm_max_n0 the
+            # linear key-gather path is kept.
+            _gemm = (not below) and int(sizes[lvl]) <= int(getattr(self, "xq_stage3_gemm_max_n0", 16384))
+            klT = kl.to(torch.bfloat16).transpose(1, 2).contiguous() if _gemm else None
+            # staircase: Gumbel noise SHARED per (tile, candidate) -- the same exploration
+            # per tile, but neighbouring queries perturb alike, so the tile union keeps its
+            # eval size (per-query noise doubled it: 2386 vs ~1250 rows). Content-free.
+            _nz = None
+            if tau > 0.0 and self.xq_descent_read == "staircase" and self.xq_descent_noise == "tile":
+                _Tq = int(self.xq_descent_tile)
+                _nz = torch.rand(B, (n0 + _Tq - 1) // _Tq, int(sizes[lvl]), device=dev).clamp_(1e-6, 1.0 - 1e-6)
+            for s0 in range(0, n0, CH):
+                e0 = min(n0, s0 + CH)
+                c = cand[:, s0:e0]
+                ok = c >= 0
+                safe = c.clamp(min=0)
+                tc = tl.index_select(0, safe.reshape(-1)).view_as(safe)
+                qt = q_t[s0:e0].view(1, -1, 1)
+                ok &= (tc <= qt) if allow_same else (tc < qt)
+                if lvl == 0:
+                    ok &= safe <= (q_pos[s0:e0].view(1, -1, 1) - int(self.xq_descent_local_exclude))
+                if below:
+                    # salience of each child (available ones; others neutral 0) or recency
+                    if self.xq_descent_l0_by_salience:
+                        _w = sal_w[lvl].gather(1, safe.reshape(B, -1)).view_as(safe)
+                        _ac = sal[1][lvl].index_select(0, safe.reshape(-1)).view_as(safe)
+                        _okw = (_ac <= qt) if allow_same else (_ac < qt)
+                        sc = torch.where(_okw, _w, torch.zeros_like(_w)).float()
+                    else:
+                        sc = safe.float() * 1e-3
+                    sc = sc / scale                     # undone by the shared "* scale" below
+                elif par is None:
+                    sc = torch.matmul(q_all[:, s0:e0].float(), kl.transpose(1, 2))    # [B, c, n_l]
+                elif _gemm:
+                    sc = torch.matmul(q_all[:, s0:e0].to(torch.bfloat16), klT).gather(-1, safe).float()
+                else:
+                    kg = kl.gather(1, safe.reshape(B, -1, 1).expand(-1, -1, d)).view(B, e0 - s0, m, d)
+                    sc = (q_all[:, s0:e0].float().unsqueeze(2) * kg).sum(-1)
+                sc = sc * scale
+                if sal_a is not None and not below:
+                    # salience prior: alpha_l * w(c), only where c's salience is available
+                    _w, _av = sal_w[lvl], sal[1][lvl]
+                    if par is None:
+                        _wc = _w.unsqueeze(1); _ac = _av.view(1, 1, -1)
+                    else:
+                        _wc = _w.gather(1, safe.reshape(B, -1)).view_as(safe); _ac = _av.index_select(0, safe.reshape(-1)).view_as(safe)
+                    _okw = (_ac <= qt) if allow_same else (_ac < qt)
+                    sc = sc + sal_a[lvl] * torch.where(_okw, _wc, torch.zeros_like(_wc))
+                if tau > 0.0:
+                    if _nz is not None:
+                        _tix = q_pos[s0:e0] // _Tq
+                        if par is None:
+                            u = _nz.index_select(1, _tix)                                  # [B, c, n_l]
+                        else:
+                            u = _nz.view(B, -1).gather(1, (_tix.view(1, -1, 1) * int(sizes[lvl]) + safe)
+                                                       .reshape(B, -1)).view_as(safe)
+                    else:
+                        u = torch.rand_like(sc).clamp_(1e-6, 1.0 - 1e-6)
+                    sc = sc - tau * torch.log(-torch.log(u))         # Gumbel top-k == sampling
+                sc = sc.masked_fill(~ok, float("-inf"))
+                top = sc.topk(kk, dim=-1)
+                keep_idx[:, s0:e0] = c.gather(-1, top.indices) if par is not None else top.indices
+                keep_ok[:, s0:e0] = torch.isfinite(top.values)
+                if pslot is not None:
+                    if s0 == 0:
+                        keep_par = torch.empty(B, n0, kk, dtype=torch.long, device=dev)
+                    keep_par[:, s0:e0] = pslot[:, s0:e0].gather(-1, top.indices)
+            kept = torch.where(keep_ok, keep_idx, torch.full_like(keep_idx, -1))
+            levels_rec.append((lvl, kept, keep_par if pslot is not None else None))
+            par = kept
+
+        cols = [torch.where(kept >= 0, kept + o[lvl], kept) for lvl, kept, _ in levels_rec if lvl in read_levels]
+        return levels_rec, torch.cat(cols, dim=-1)
+
+    def _xq_select_graphed(self, ins: List[torch.Tensor], ctx: Dict[str, Any]):
+        """_xq_select_core replayed as a CUDA graph (the eager loop is ~77% launch-bound:
+        ~750 small kernels per round). One graph per (mode, batch, geometry, round): each
+        round keeps its own output buffers because the backward of earlier rounds still
+        reads their indices; the graphs share one memory pool (replayed in capture order,
+        outputs kept alive). Training noise uses the graph-safe CUDA RNG (differs from the
+        eager stream, same distribution)."""
+        key = ("xq_sel_graph", bool(self.training), tuple(ctx["o"]), int(getattr(self, "_xq_round_idx", 0)),
+               tuple((tuple(v.shape), v.dtype) for v in ins))
+        ent = self._xq_graph_cache.get(key)
+        if ent is None:
+            static = [v.detach().clone() for v in ins]
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side), torch.no_grad():
+                for _ in range(2):                                   # warm-up (tables, cuBLAS)
+                    self._xq_select_core(static, ctx)
+            torch.cuda.current_stream().wait_stream(side)
+            if self._xq_graph_pool is None:
+                self._xq_graph_pool = torch.cuda.graph_pool_handle()
+            g = torch.cuda.CUDAGraph()
+            with torch.no_grad(), torch.cuda.graph(g, pool=self._xq_graph_pool):
+                out = self._xq_select_core(static, ctx)
+            ent = (g, static, out)
+            self._xq_graph_cache[key] = ent
+        g, static, out = ent
+        for dst, src in zip(static, ins):
+            dst.copy_(src.detach())
+        g.replay()
+        return out
+
     def _xq_descent_nominate(self, x: torch.Tensor, level_offsets: torch.Tensor,
                              node_ar_time: torch.Tensor) -> Optional[tuple]:
         """xq descent (xq_descent_enable): per-L0-query beam search through the hierarchy.
@@ -8224,90 +8665,71 @@ class HierarchicalFlowGAT(nn.Module):
         scale = float(d) ** -0.5
         xd = F.layer_norm(x.detach().float(), (H,))                    # indexer input: detached
         q_all = self.xq_index_q(xd[:, o[0]:o[1]])                      # [B, n0, d] (grad)
-        k_lv = {l: self.xq_index_k[l](xd[:, o[l]:o[l + 1]]) for l in range(start + 1)}
+        fl = min(int(self.xq_descent_final_level), start)
+        k_lv = {l: self.xq_index_k[l](xd[:, o[l]:o[l + 1]]) for l in range(fl, start + 1)}
+        sal = None
+        if self.xq_salience_prior or self.xq_salience_boost or self.xq_descent_l0_by_salience:
+            sal = self._xq_salience(x, o, sizes, t, tabs)               # w WITH grad (boost path)
+        sal_w = {l: w.detach() for l, w in sal[0].items()} if sal is not None else None
+        sal_a = self.xq_sal_alpha.detach().float() if self.xq_salience_prior else None
 
-        levels_rec = []        # per level, top-down: (lvl, kept local ids [B,n0,k] (-1), parent slot [B,n0,k] | None)
-        CH = 4096              # query chunk: bounds the [B, CH, n_l] score transient (bf16, ~0.5 GB at L0 16k)
-        with torch.no_grad():
-            par = None
-            for i, lvl in enumerate(range(start, -1, -1)):
-                k_keep = beam[i] if lvl > 0 else int(self.xq_descent_topk_l0)
-                tl = t[o[lvl]:o[lvl + 1]]
-                if par is None:
-                    cand = torch.arange(sizes[lvl], device=dev).view(1, 1, -1).expand(B, n0, -1)
-                    pslot = None
-                else:
-                    kp = int(par.size(-1))
-                    ch = tabs[lvl + 1]                                   # [n_{l+1}, Kc]
-                    cand = ch.index_select(0, par.clamp(min=0).reshape(-1)).view(B, n0, kp, -1)
-                    cand = torch.where((par >= 0).unsqueeze(-1), cand, torch.full_like(cand, -1))
-                    pslot = torch.arange(kp, device=dev).view(1, 1, kp, 1).expand_as(cand).reshape(B, n0, -1)
-                    cand = cand.reshape(B, n0, -1)
-                    cand, order = cand.sort(dim=-1, descending=True)     # -1 sinks; dups adjacent
-                    pslot = pslot.gather(-1, order)
-                    dup = torch.zeros_like(cand, dtype=torch.bool)
-                    dup[..., 1:] = cand[..., 1:] == cand[..., :-1]
-                    cand = torch.where(dup, torch.full_like(cand, -1), cand)
-                m = int(cand.size(-1))
-                kk = min(k_keep, m)
-                keep_idx = torch.empty(B, n0, kk, dtype=torch.long, device=dev)
-                keep_ok = torch.empty(B, n0, kk, dtype=torch.bool, device=dev)
-                kl = k_lv[lvl].float()
-                # score-gather: one [c, d] x [d, n_l] GEMM per chunk, then gather the candidate
-                # columns -- far cheaper than gathering [c, m, d] keys (measured 8.5 of 15 ms
-                # per round). O(n0 * n_l * d) FLOPs, so past xq_stage3_gemm_max_n0 the
-                # linear key-gather path is kept.
-                _gemm = int(sizes[lvl]) <= int(getattr(self, "xq_stage3_gemm_max_n0", 16384))
-                klT = kl.to(torch.bfloat16).transpose(1, 2).contiguous() if _gemm else None
-                for s0 in range(0, n0, CH):
-                    e0 = min(n0, s0 + CH)
-                    c = cand[:, s0:e0]
-                    ok = c >= 0
-                    safe = c.clamp(min=0)
-                    tc = tl.index_select(0, safe.reshape(-1)).view_as(safe)
-                    qt = q_t[s0:e0].view(1, -1, 1)
-                    ok &= (tc <= qt) if allow_same else (tc < qt)
-                    if lvl == 0:
-                        ok &= safe <= (q_pos[s0:e0].view(1, -1, 1) - int(self.xq_descent_local_exclude))
-                    if par is None:
-                        sc = torch.matmul(q_all[:, s0:e0].float(), kl.transpose(1, 2))    # [B, c, n_l]
-                    elif _gemm:
-                        sc = torch.matmul(q_all[:, s0:e0].to(torch.bfloat16), klT).gather(-1, safe).float()
-                    else:
-                        kg = kl.gather(1, safe.reshape(B, -1, 1).expand(-1, -1, d)).view(B, e0 - s0, m, d)
-                        sc = (q_all[:, s0:e0].float().unsqueeze(2) * kg).sum(-1)
-                    sc = sc * scale
-                    if tau > 0.0:
-                        u = torch.rand_like(sc).clamp_(1e-6, 1.0 - 1e-6)
-                        sc = sc - tau * torch.log(-torch.log(u))         # Gumbel top-k == sampling
-                    sc = sc.masked_fill(~ok, float("-inf"))
-                    top = sc.topk(kk, dim=-1)
-                    keep_idx[:, s0:e0] = c.gather(-1, top.indices) if par is not None else top.indices
-                    keep_ok[:, s0:e0] = torch.isfinite(top.values)
-                    if pslot is not None:
-                        if s0 == 0:
-                            keep_par = torch.empty(B, n0, kk, dtype=torch.long, device=dev)
-                        keep_par[:, s0:e0] = pslot[:, s0:e0].gather(-1, top.indices)
-                kept = torch.where(keep_ok, keep_idx, torch.full_like(keep_idx, -1))
-                levels_rec.append((lvl, kept, keep_par if pslot is not None else None))
-                par = kept
-
-            cols, col_map = [], []
-            for lvl, kept, _ in levels_rec:
-                if lvl in read_levels:
-                    cols.append(torch.where(kept >= 0, kept + o[lvl], kept))
-                    col_map.append(lvl)
-            if not cols:
-                return None
-            cand_abs = torch.cat(cols, dim=-1)                           # [B, n0, K]
-            if self.training:
-                # stats are host ints (a sync): training only -- the eval / generation forward
-                # must stay sync-free so it can be captured as a CUDA graph
+        ctx = {"o": o, "sizes": sizes, "start": start, "beam": beam, "read_levels": read_levels, "tabs": tabs,
+               "fl": fl, "tau": tau, "allow_same": allow_same, "B": B, "n0": n0, "scale": scale, "d": d,
+               "dev": dev, "has_sal": sal is not None, "has_prior": sal_a is not None}
+        if not any(l in read_levels for l in range(start, -1, -1)):
+            return None
+        col_map = [l for l in range(start, -1, -1) if l in read_levels]
+        ins = [q_all.detach()] + [k_lv[l].detach() for l in range(fl, start + 1)] + [t, q_t]
+        if sal is not None:
+            ins += [sal_w[l] for l in range(nl)] + [sal[1][l] for l in range(nl)]
+        if sal_a is not None:
+            ins += [sal_a]
+        _graphed = bool(self.xq_select_cuda_graph) and x.is_cuda
+        if _graphed:
+            levels_rec, cand_abs = self._xq_select_graphed(ins, ctx)
+        else:
+            with torch.no_grad():
+                levels_rec, cand_abs = self._xq_select_core(ins, ctx)
+        if self.training:
+            with torch.no_grad():
                 has_any = cand_abs >= 0
-                self._last_xq_nom_count = int(has_any.sum())
-                self._last_xq_nom_queries = int(has_any.any(-1).any(0).sum())
+                if _graphed:
+                    # device tensors: read (synced) only by the periodic log / stats dict
+                    self._last_xq_nom_count = has_any.sum()
+                    self._last_xq_nom_queries = has_any.any(-1).any(0).sum()
+                else:
+                    # stats are host ints (a sync): training only -- the eval / generation
+                    # forward must stay sync-free so it can be captured as a CUDA graph
+                    self._last_xq_nom_count = int(has_any.sum())
+                    self._last_xq_nom_queries = int(has_any.any(-1).any(0).sum())
         self._xq_desc_record = {"levels": levels_rec, "read_levels": col_map,
-                                "q": q_all, "k": k_lv, "scale": scale, "o": o}
+                                "q": q_all, "k": k_lv, "scale": scale, "o": o,
+                                "q_t": q_t, "allow_same": allow_same,
+                                "sal": None if sal is None else (sal_w, sal[1]),
+                                "index_levels": set(range(fl, start + 1))}
+        self._xq_far_state = None
+        if self.xq_far_kv_groups:
+            Nn = int(o[-1])
+            st_f = {"node_pos": t.float(), "boost_node": None}
+            if self.xq_salience_boost and sal is not None:
+                # pick c of query i reads the BOOSTED row (id + Nn) iff c's salience is
+                # available before i -- per (query, pick), causal
+                BIGT = torch.iinfo(torch.long).max // 4
+                af = torch.cat([sal[1][l] if l in sal[1] else torch.full((o[l + 1] - o[l],), BIGT, device=dev,
+                                                                         dtype=torch.long) for l in range(nl)])
+                wf = torch.cat([sal[0][l] for l in range(nl)], 1)
+                with torch.no_grad():
+                    okc = cand_abs >= 0
+                    ac = af.index_select(0, cand_abs.clamp(min=0).reshape(-1)).view_as(cand_abs)
+                    qt_ = q_t.view(1, -1, 1)
+                    okb = okc & ((ac <= qt_) if allow_same else (ac < qt_))
+                    cand_abs = torch.where(okb, cand_abs + Nn, cand_abs)
+                st_f["boost_node"] = torch.tanh(wf)
+            self._xq_far_state = st_f
+        self._xq_stair_state = None
+        if self.xq_descent_read == "staircase":
+            self._xq_stair_state = self._xq_stair_build(cand_abs.long(), o, t, sal,
+                                                        int(getattr(self, "_xq_round_idx", 0)))
         self._xq_query_gate_full = None
         dst_nodes = o[0] + torch.arange(n0, device=dev, dtype=torch.long)
         return torch.zeros(1, device=dev, dtype=torch.long), cand_abs.long(), dst_nodes
@@ -8325,9 +8747,20 @@ class HierarchicalFlowGAT(nn.Module):
         if rec is None or read_mass is None:
             return None
         levels, read_levels, q, k, scale = rec["levels"], rec["read_levels"], rec["q"], rec["k"], rec["scale"]
+        q_t = rec.get("q_t")
+        sel = None
+        if isinstance(read_mass, tuple):
+            # staircase read: the queries were sampled before the read, mass is [B, nq, K]
+            sel, read_mass = read_mass
+            n0 = int(q.size(1))
+            q = q.index_select(1, sel)
+            levels = [(l, kept.index_select(1, sel), None if ps is None else ps.index_select(1, sel))
+                      for l, kept, ps in levels]
+            if q_t is not None:
+                q_t = q_t.index_select(0, sel)
         B, n0, _ = read_mass.shape
         nq = int(self.xq_index_loss_queries)
-        if 0 < nq < n0:
+        if sel is None and 0 < nq < n0:
             # a random subset of query positions (shared across the batch): a distillation
             # target needs no full coverage, and the coarse keys' gather backward is a
             # contended scatter (measured 48 ms/step at 16k x4 with every query)
@@ -8335,6 +8768,8 @@ class HierarchicalFlowGAT(nn.Module):
             read_mass, q = read_mass.index_select(1, sel), q.index_select(1, sel)
             levels = [(l, kept.index_select(1, sel), None if ps is None else ps.index_select(1, sel))
                       for l, kept, ps in levels]
+            if q_t is not None:
+                q_t = q_t.index_select(0, sel)
             n0 = nq
         own = {}
         c0 = 0
@@ -8355,10 +8790,20 @@ class HierarchicalFlowGAT(nn.Module):
             mass = torch.where(valid, mass, torch.zeros_like(mass))
             tot = mass.sum(-1, keepdim=True)
             use = (tot.squeeze(-1) > 1e-6) & (valid.sum(-1) > 1)
-            if bool(use.any()):
+            # levels below the L1 stop were not chosen by the indexer: no KL there (their read
+            # mass still flows up into the parents' subtree targets)
+            if bool(use.any()) and lvl in rec.get("index_levels", {lvl}):
                 safe = kept.clamp(min=0)
                 kg = k[lvl].gather(1, safe.reshape(B, -1, 1).expand(-1, -1, k[lvl].size(-1))).view(B, n0, kk, -1)
                 sc = (q.unsqueeze(2).float() * kg.float()).sum(-1) * scale
+                if self.xq_salience_prior and rec.get("sal") is not None:
+                    # the selection score's prior, so alpha trains by this KL (w detached)
+                    _w, _av = rec["sal"][0][lvl], rec["sal"][1][lvl]
+                    _wc = _w.gather(1, safe.reshape(B, -1)).view_as(safe)
+                    _ac = _av.index_select(0, safe.reshape(-1)).view_as(safe)
+                    _qt = q_t.view(1, -1, 1)
+                    _okw = (_ac <= _qt) if rec.get("allow_same", True) else (_ac < _qt)
+                    sc = sc + self.xq_sal_alpha[lvl].float() * torch.where(_okw, _wc, torch.zeros_like(_wc))
                 logq = torch.log_softmax(sc.masked_fill(~valid, float("-inf")), dim=-1)
                 p = mass / tot.clamp(min=1e-12)
                 kl = (p * (torch.log(p.clamp(min=1e-12)) - logq)).masked_fill(~valid | (p <= 0), 0.0).sum(-1)
@@ -16350,8 +16795,20 @@ class HierarchicalFlowGAT(nn.Module):
                                 _o = self._xq_desc_record["o"]
                                 _xq_fed_mp._xq_dst_range = (int(_o[0]), int(_o[1] - _o[0]))
                                 _xq_fed_mp._xq_store_read_mass = bool(self.training)
-                                _xq_fed_mp._xq_read_ckpt = True
+                                _xq_fed_mp._xq_read_ckpt = bool(self.xq_read_ckpt)
+                                _xq_fed_mp._xq_read_fp32 = True
                                 _xq_fed_mp._xq_level_tags = True
+                                _st = self._xq_stair_state
+                                if _st is not None:
+                                    _st = dict(_st, u=(self.xq_stair_boost_u[int(layer_idx)]
+                                                       if self.xq_salience_boost else None))
+                                _xq_fed_mp._xq_stair = _st
+                                _ft = self._xq_far_state
+                                if _ft is not None:
+                                    _ft = dict(_ft, u=(self.xq_far_boost_u[int(layer_idx)]
+                                                       if (self.xq_salience_boost and _ft.get("boost_node") is not None)
+                                                       else None))
+                                _xq_fed_mp._xq_far = _ft
                         # per-query relevance gate: carried as an EXPLICIT tensor argument
                         # through the checkpoint boundary (see _forward_with_hqd — the inner
                         # reentrant checkpoint double-backwards through attr-captured live
@@ -16516,6 +16973,8 @@ class HierarchicalFlowGAT(nn.Module):
                 if _xq_fed_mp is not None:
                     _mass = getattr(_xq_fed_mp, "_xq_read_mass", None)
                     _xq_fed_mp._xq_read_mass = None
+                    _xq_fed_mp._xq_stair = None
+                    _xq_fed_mp._xq_far = None
                     if self.training and _mass is not None:
                         _l = self._xq_index_loss(_mass)
                         if _l is not None:
@@ -16524,11 +16983,14 @@ class HierarchicalFlowGAT(nn.Module):
                             # visibility: indexer KL + read stats, one sync every 250 rounds
                             self._xq_log_n = int(getattr(self, "_xq_log_n", 0)) + 1
                             if self._xq_log_n % 250 == 1:
-                                _B, _Q, _K = (int(v) for v in _mass.shape)
+                                _mm = _mass[1] if isinstance(_mass, tuple) else _mass
+                                _B, _Q, _K = (int(v) for v in _mm.shape)
+                                if isinstance(_mass, tuple):        # sampled: count over all queries
+                                    _Q = int(self._xq_desc_record["q"].size(1))
                                 logger.info(
                                     "[XQ-DESC] round %d: indexer KL %.4f | read mass on candidates "
                                     "%.3f (rest -> sink) | live candidates/query %.1f of %d",
-                                    self._xq_log_n, float(_l.detach()), float(_mass.sum(-1).mean()),
+                                    self._xq_log_n, float(_l.detach()), float(_mm.sum(-1).mean()),
                                     float(self._last_xq_nom_count) / max(1, _B * _Q), _K)
 
                 # ~~~~ Zipper (unchanged, runs after transformer) ~~~~
@@ -16646,6 +17108,7 @@ class HierarchicalFlowGAT(nn.Module):
                         or (_xq_every > 0 and (layer_step - _xq_last_nom_step) >= _xq_every)
                     )
                 ):
+                    self._xq_round_idx = int(_xq_nom_calls)   # staircase: one mask buffer per round
                     self._xq_nom_edges = (
                         self._xq_descent_nominate(x, base_lo, base_ar_time)
                         if self.xq_descent_enable else

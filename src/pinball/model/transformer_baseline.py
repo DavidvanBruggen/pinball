@@ -41,6 +41,12 @@ class TransformerConfig:
     # gradient dominates (measured at init: Q/K steps 10-20x smaller than when split). Pinball's
     # q_proj/k_proj/v_proj are separate, so this is the optimizer-parity knob. Off = fused.
     split_qkv: bool = False
+    # Partial RoPE: the LAST rope_nope_dims dims of every q/k head stay unrotated (position-free
+    # content matching at any distance); the rest rotate with the full-head_dim frequency
+    # schedule, so the unrotated dims are exactly the slowest pairs. Same split as pinball's
+    # local_pack_far_nope_dims (which additionally zeroes the rotated part for far keys -- not
+    # expressible in a dense causal softmax). 0 = full RoPE (default).
+    rope_nope_dims: int = 0
     causal: bool = True
     class_cond_enable: bool = False
     num_classes: int = 0
@@ -77,11 +83,18 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim: int, max_seq_len: int = 131072, base: float = 10000.0):
+    def __init__(self, head_dim: int, max_seq_len: int = 131072, base: float = 10000.0, nope_dims: int = 0):
         super().__init__()
         rotary_dim = head_dim - (head_dim % 2)
-        self.rotary_dim = int(rotary_dim)
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2).float() / max(1, rotary_dim)))
+        nope_dims = int(nope_dims or 0)
+        if nope_dims:
+            if nope_dims % 2 or not 0 < nope_dims < rotary_dim:
+                raise ValueError(f"rope_nope_dims={nope_dims} must be even and in (0, {rotary_dim})")
+            # keep the full-head schedule and drop its slowest pairs: the last nope_dims dims pass
+            rotary_dim -= nope_dims
+            inv_freq = inv_freq[: rotary_dim // 2]
+        self.rotary_dim = int(rotary_dim)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.max_seq_len = int(max_seq_len)
         self._seq_len_cached = 0
@@ -176,7 +189,8 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.rope = RotaryEmbedding(self.head_dim, config.block_size) if config.use_rope else None
+        self.rope = (RotaryEmbedding(self.head_dim, config.block_size, nope_dims=config.rope_nope_dims)
+                     if config.use_rope else None)
         self.backend_used = "eager"
 
     def _manual_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:

@@ -522,6 +522,25 @@ def _flex_compiled_singleton():
     return _FLEX_COMPILED
 
 
+def _slow_rope(x: torch.Tensor, pos: torch.Tensor, d0: int, pairs: int, base_len: int) -> torch.Tensor:
+    """Rotate the `pairs` interleaved pairs (d0+2i, d0+2i+1) of x [..., D] with ULTRA-SLOW
+    frequencies (local_pack_far_slow_pairs): pair i has wavelength 4 * base_len / 2**i, so the
+    first pair never wraps over +-base_len and q . k gains a signed, smooth term in the
+    distance -- direction and coarse distance for far reads that are otherwise position-free
+    (bidi needs it: there the causal mask gives no direction). pos broadcasts against x[..., 0]
+    (token time; coarse rows use their close time). Phases in fp32. Same pairing as
+    RotaryPositionalEncoding (even = x cos - odd sin, odd = odd cos + even sin)."""
+    if pairs <= 0:
+        return x
+    lam = 4.0 * float(base_len) / (2.0 ** torch.arange(pairs, device=x.device, dtype=torch.float32))
+    ph = pos.float().unsqueeze(-1) * (2.0 * math.pi / lam)                       # [..., pairs]
+    c, s = torch.cos(ph).to(x.dtype), torch.sin(ph).to(x.dtype)
+    seg = x[..., d0:d0 + 2 * pairs]
+    xe, xo = seg[..., 0::2], seg[..., 1::2]
+    rot = torch.stack((xe * c - xo * s, xo * c + xe * s), dim=-1).flatten(-2)
+    return torch.cat([x[..., :d0], rot, x[..., d0 + 2 * pairs:]], dim=-1)
+
+
 _FLEX_FLASH_PROBE: Dict[Tuple[int, int, str], Tuple[bool, str]] = {}
 _FLEX_TILE_PROBE: Dict[Tuple, Tuple[int, str]] = {}
 
@@ -1314,6 +1333,14 @@ class HierarchicalMessagePassing(MessagePassing):
         # is added before RoPE, so its score q.R(d)t_L depends on the query and the distance.
         # Needs far_nope_dims >= 2. "off" = default.
         local_pack_far_bias: str = "off",
+        # FAR SLOW PAIRS (needs far_nope_dims): the first 2*p dims of the unrotated tail get an
+        # ULTRA-SLOW rotation (wavelengths 4L, 2L, L, L/2, ... for L = far_slow_len), so far
+        # scores carry a signed, smooth distance/direction term instead of none (Gemma-3 style
+        # slow RoPE on the global path). Bidi needs it: without a causal mask a position-free
+        # far read cannot tell upstream from downstream. Also used by the xq staircase read.
+        # 0 = off (default, bit-identical).
+        local_pack_far_slow_pairs: int = 0,
+        local_pack_far_slow_len: int = 0,
         # DropNode on the hierarchy: per (batch, coarse row) each step, zero that row's
         # VALUE in the packed key/value set so nothing reads its content this step. L0 is
         # never dropped and the residual stream is untouched, so the upward/downward refresh
@@ -1342,6 +1369,11 @@ class HierarchicalMessagePassing(MessagePassing):
         # useful candidates can no-op instead of emitting a forced weighted average.
         hqd_read_prerope: bool = False,
         hqd_read_sink: bool = False,
+        # GROUPED far read (xq descent): the packed per-query read uses G shared K/V heads of
+        # head_dim (own projections), each shared by num_heads / G query heads -- MQA at 1,
+        # GQA above (the DSA trick: a picked row serves many heads, so the per-pick bandwidth
+        # drops G/H). 0 = off: the read uses the layer's own per-head k/v (default).
+        hqd_far_kv_groups: int = 0,
         rope_level_axis_enable: bool = False,
         rope_level_axis_scale: float = 32.0,
         norm_type: str = "rmsnorm",
@@ -1572,6 +1604,17 @@ class HierarchicalMessagePassing(MessagePassing):
         if self.local_pack_far_bias != "off" and _fnd < 2:
             raise ValueError("local_pack_far_bias needs local_pack_far_nope_dims >= 2 (the bias "
                              "lives in an unrotated dim)")
+        self.local_pack_far_slow_pairs = max(0, int(local_pack_far_slow_pairs or 0))
+        self.local_pack_far_slow_len = max(0, int(local_pack_far_slow_len or 0))
+        if self.local_pack_far_slow_pairs:
+            _room = _fnd - (2 if self.local_pack_far_bias != "off" else 0)
+            if 2 * self.local_pack_far_slow_pairs > _room:
+                raise ValueError(f"local_pack_far_slow_pairs={self.local_pack_far_slow_pairs} needs "
+                                 f"{2 * self.local_pack_far_slow_pairs} unrotated dims, have {_room} "
+                                 "(far_nope_dims minus the reserved bias pair)")
+            if self.local_pack_far_slow_len <= 0:
+                raise ValueError("local_pack_far_slow_pairs needs local_pack_far_slow_len > 0 "
+                                 "(the model passes its max_seq_len)")
         if self.local_pack_global_gumbel_norm not in {"raw", "chunk", "prefix"}:
             raise ValueError("local_pack_global_gumbel_norm must be 'raw', 'chunk' or 'prefix', got "
                              f"{local_pack_global_gumbel_norm!r}")
@@ -1760,6 +1803,18 @@ class HierarchicalMessagePassing(MessagePassing):
         self.hqd_read_sink_k = (
             nn.Parameter(torch.zeros(self.num_heads, self.head_dim)) if bool(hqd_read_sink) else None
         )
+        self.hqd_far_kv_groups = max(0, int(hqd_far_kv_groups or 0))
+        if self.hqd_far_kv_groups:
+            _G = self.hqd_far_kv_groups
+            if self.num_heads % _G:
+                raise ValueError(f"hqd_far_kv_groups={_G} must divide num_heads={self.num_heads}")
+            self.xq_far_k = nn.Linear(hidden_dim, _G * self.head_dim, bias=False)
+            self.xq_far_v = nn.Linear(hidden_dim, _G * self.head_dim, bias=False)
+            _nlev_f = max(1, int(num_local_levels))
+            # per-level tag of the shared rows (the per-head local_pack_level_*_emb cannot be
+            # added to a key that several heads share); init 0
+            self.xq_far_level_k = nn.Parameter(torch.zeros(_nlev_f, _G, self.head_dim))
+            self.xq_far_level_v = nn.Parameter(torch.zeros(_nlev_f, _G, self.head_dim))
         self.l0_local_backend = str(l0_local_backend).lower()
         if self.l0_local_backend not in {"pyg", "flash", "xformers", "sdpa"}:
             self.l0_local_backend = "pyg"
@@ -3639,7 +3694,46 @@ class HierarchicalMessagePassing(MessagePassing):
 
         if hqd_edges is not None:
             hqd_b_idx, hqd_src_idx, hqd_dst_idx = hqd_edges
-            if hqd_src_idx is not None and hqd_src_idx.dim() == 3:
+            if (hqd_src_idx is not None and hqd_src_idx.dim() == 3
+                    and getattr(self, "_xq_stair", None) is not None):
+                # xq descent, xq_descent_read="staircase": the same picks read as tile unions
+                # through one flex call (see the model's _xq_stair_build)
+                hqd_out = self._xq_staircase_read(q_hqd, k_hqd, v_hqd, num_nodes, B, self._xq_stair)
+            elif (hqd_src_idx is not None and hqd_src_idx.dim() == 3
+                    and int(getattr(self, "hqd_far_kv_groups", 0) or 0) > 0
+                    and getattr(self, "_xq_far", None) is not None):
+                # xq descent, GROUPED far read: G shared K/V heads of head_dim from their own
+                # projections of the (normed) layer input; candidate ids >= num_nodes pick the
+                # BOOSTED copy (salience available before that query, set by the model)
+                _G, _D = int(self.hqd_far_kv_groups), int(self.head_dim)
+                k_far = self.xq_far_k(x).view(B, num_nodes, _G, _D)
+                v_far = self.xq_far_v(x).view(B, num_nodes, _G, _D)
+                if node_level is not None and int(node_level.numel()) == int(num_nodes):
+                    _nl = node_level.to(device=k_far.device, dtype=torch.long).clamp(
+                        0, int(self.xq_far_level_k.size(0)) - 1)
+                    k_far = k_far + self.xq_far_level_k.index_select(0, _nl).unsqueeze(0).to(k_far.dtype)
+                    v_far = v_far + self.xq_far_level_v.index_select(0, _nl).unsqueeze(0).to(v_far.dtype)
+                _fx = self._xq_far
+                k_src, v_src = k_far, v_far
+                if _fx.get("u") is not None and _fx.get("boost_node") is not None:
+                    k_src = torch.cat([k_far, k_far + _fx["boost_node"].to(k_far.dtype).view(B, num_nodes, 1, 1)
+                                       * _fx["u"].to(k_far.dtype).view(1, 1, _G, _D)], 1)
+                    v_src = torch.cat([v_far, v_far], 1)
+                q_far = q_hqd
+                _sp = int(getattr(self, "local_pack_far_slow_pairs", 0) or 0)
+                if _sp:
+                    _d0 = _D - int(self.local_pack_far_nope_dims)
+                    _sl = int(self.local_pack_far_slow_len)
+                    _np = _fx["node_pos"].float()
+                    q_far = _slow_rope(q_hqd, _np.view(1, -1, 1), _d0, _sp, _sl)
+                    _rep = int(k_src.size(1)) // int(num_nodes)
+                    k_src = _slow_rope(k_src, torch.cat([_np] * _rep).view(1, -1, 1), _d0, _sp, _sl)
+                hqd_out = self._compute_hqd_packed_l0_attn(
+                    q=q_far, k=k_src, v=v_src,
+                    dst_nodes=hqd_dst_idx, candidate_nodes=hqd_src_idx,
+                    num_nodes=num_nodes, B=B,
+                )
+            elif hqd_src_idx is not None and hqd_src_idx.dim() == 3:
                 # Packed per-query candidate table [B, Q, K] (-1 padded) from xq nomination:
                 # fixed-K dense read — same math as the per-edge scatter, but GEMM-shaped and
                 # without materializing per-edge q/k/v gathers in autograd.
@@ -4285,9 +4379,11 @@ class HierarchicalMessagePassing(MessagePassing):
         v_dim = max(1, int(v.size(-1)))  # Fat-V: value head dim (== head_dim when off)
         chunk = max(1, int(getattr(self, "hqd_packed_witness_chunk_size", 2048)))
         neg = torch.finfo(q.dtype).min
-        batch_offsets = torch.arange(int(B), device=device, dtype=torch.long).view(int(B), 1, 1) * int(num_nodes)
-        flat_k = k.reshape(int(B) * int(num_nodes), num_heads, head_dim)
-        flat_v = v.reshape(int(B) * int(num_nodes), num_heads, v_dim)
+        n_src = int(k.size(1))          # == num_nodes, or 2N for the grouped read's boosted copy
+        kv_heads = int(k.size(2))       # == num_heads, or G for the grouped (MQA/GQA) far read
+        batch_offsets = torch.arange(int(B), device=device, dtype=torch.long).view(int(B), 1, 1) * n_src
+        flat_k = k.reshape(int(B) * n_src, kv_heads, head_dim)
+        flat_v = v.reshape(int(B) * n_src, kv_heads, v_dim)
         # xq nomination always targets the full contiguous L0 range: read queries by slice
         # and write messages by slice (one CopySlices backward) instead of index_select +
         # index_add_ over [B*N] rows, whose scatter-style backward dominated the read cost.
@@ -4305,7 +4401,7 @@ class HierarchicalMessagePassing(MessagePassing):
         _store_mass = bool(getattr(self, "_xq_store_read_mass", False))
         _ckpt = bool(getattr(self, "_xq_read_ckpt", False)) and self.training and torch.is_grad_enabled()
         masses: list = []
-        if bool(getattr(self, "_xq_read_ckpt", False)):
+        if bool(getattr(self, "_xq_read_fp32", getattr(self, "_xq_read_ckpt", False))):
             # xq descent: gather K/V in fp32. Many queries pick the SAME coarse rows, so the
             # gather's backward is a heavily contended index_add -- and bf16 has no native
             # atomic add (CAS loops): measured 58 ms/step of 643 at 16k x4. fp32 atomics are
@@ -4333,10 +4429,10 @@ class HierarchicalMessagePassing(MessagePassing):
                 # [B, Qc, K, H, D] per chunk alive (the read's whole memory cost)
                 msg, wmass = torch.utils.checkpoint.checkpoint(
                     self._hqd_packed_chunk, q_c, flat_k, flat_v, gather_idx, valid,
-                    num_heads, head_dim, v_dim, K, use_reentrant=False)
+                    num_heads, head_dim, v_dim, K, kv_heads, use_reentrant=False)
             else:
                 msg, wmass = self._hqd_packed_chunk(q_c, flat_k, flat_v, gather_idx, valid,
-                                                    num_heads, head_dim, v_dim, K)
+                                                    num_heads, head_dim, v_dim, K, kv_heads)
             if _store_mass:
                 masses.append(wmass.detach())
             if contig:
@@ -4360,16 +4456,96 @@ class HierarchicalMessagePassing(MessagePassing):
         self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
         return out
 
+    @torch._dynamo.disable
+    def _xq_staircase_read(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                           num_nodes: int, B: int, st: Dict[str, Any]) -> torch.Tensor:
+        """xq descent STAIRCASE read: one flex call over per-tile union keys.
+
+        q/k/v [B, num_nodes, H, D] in node order (the read's pre-RoPE q/k, level tags in k).
+        st (built by the model per round): rows [B, nT*Gt] node id per slot (tile layout:
+        voted union | recency | sink), bm the round's BlockMask (staircase boundary in a
+        persistent buffer), q_pos / k_pos for the slow pairs, optional boost [B, nT*Gt] and
+        u [H, D], pick_slot [B, n0, K] (slot of each query's own pick, -1 none) and sel (KL
+        query sample). Same scores as the gather read (pre-RoPE q.k / sqrt(D), zero-value
+        sink q.sink_k), but query i also sees the earlier queries' picks of its tile and the
+        recency slots. Outside the layer's trace: the BlockMask and its buffers stay eager;
+        flex runs through the shared compiled kernel."""
+        o0, n0, Qp, Gt, nT = (int(st[n]) for n in ("o0", "n0", "Qp", "Gt", "nT"))
+        H, D, Dv = int(q.size(2)), int(q.size(3)), int(v.size(3))
+        qq = q[:, o0:o0 + n0]
+        if Qp > n0:
+            qq = torch.cat([qq, qq.new_zeros(B, Qp - n0, H, D)], 1)
+        rows = st["rows"]
+        P = int(rows.size(1))
+        N_ = int(num_nodes)
+        # everything per NODE first (num_nodes rows, not nT * Gt slots): slow pairs at the
+        # node's close time, the boosted copy, the sink row -- then ONE gather per K and V
+        _sp = int(getattr(self, "local_pack_far_slow_pairs", 0) or 0)
+        if _sp:
+            _d0 = D - int(self.local_pack_far_nope_dims)              # the main path's slow dims
+            _sl = int(self.local_pack_far_slow_len)
+            qq = _slow_rope(qq, st["q_pos"].view(1, -1, 1), _d0, _sp, _sl)
+        sink_k = getattr(self, "hqd_read_sink_k", None)
+        sk = (sink_k.to(k.dtype) if sink_k is not None else k.new_zeros(H, D)).view(1, 1, H, D).expand(B, 1, H, D)
+        boost = st.get("u") is not None and st.get("boost_node") is not None
+        srcs = [k]
+        if boost:
+            srcs.append(k + st["boost_node"].to(k.dtype).view(B, N_, 1, 1) * st["u"].to(k.dtype).view(1, 1, H, D))
+        k_src = torch.cat(srcs, 1)
+        if _sp:
+            _np = st["node_pos"].float()
+            k_src = _slow_rope(k_src, torch.cat([_np] * len(srcs)).view(1, -1, 1), _d0, _sp, _sl)
+        k_src = torch.cat([k_src, sk], 1)                                     # sink = last row
+        v_src = torch.cat([v, v.new_zeros(B, 1, H, Dv)], 1)
+        is_sink = (torch.arange(P, device=rows.device) % Gt) == (Gt - 1)
+        kidx = rows + (N_ * st["boost_ok"].long() if boost else 0)
+        kidx = torch.where(is_sink.view(1, -1), torch.full_like(kidx, len(srcs) * N_), kidx)
+        vidx = torch.where(is_sink.view(1, -1), torch.full_like(rows, N_), rows)
+        q_s = qq.transpose(1, 2)
+        k_s = k_src.gather(1, kidx.view(B, P, 1, 1).expand(-1, -1, H, D)).transpose(1, 2)
+        v_s = v_src.gather(1, vidx.view(B, P, 1, 1).expand(-1, -1, H, Dv)).transpose(1, 2)
+        if q_s.is_cuda:
+            out, lse = _flex_compiled_singleton()(q_s, k_s, v_s, block_mask=st["bm"], return_lse=True)
+        else:
+            from torch.nn.attention.flex_attention import flex_attention
+            out, lse = flex_attention(q_s, k_s, v_s, block_mask=st["bm"], return_lse=True)
+        if bool(getattr(self, "_xq_store_read_mass", False)) and st.get("sel") is not None:
+            # indexer-KL target: each sampled query's mass on its OWN picks (head mean, detached)
+            with torch.no_grad():
+                sel = st["sel"]; nq = int(sel.numel())
+                ps = st["pick_slot"].index_select(1, sel)                          # [B, nq, K]
+                Kc = int(ps.size(-1))
+                kidx = (sel // int(st["T"])).view(1, -1, 1) * Gt + ps.clamp(min=0)
+                kk = k_s.transpose(1, 2).gather(
+                    1, kidx.reshape(B, -1, 1, 1).expand(-1, -1, H, D)).view(B, nq, Kc, H, D)
+                qs = q_s.transpose(1, 2).index_select(1, sel)                      # [B, nq, H, D]
+                s = (qs.unsqueeze(2).float() * kk.float()).sum(-1) * (float(D) ** -0.5)
+                ls = lse.transpose(1, 2).index_select(1, sel).float()              # [B, nq, H]
+                ls = torch.where(torch.isfinite(ls), ls, torch.full_like(ls, 1e30))
+                p = torch.where((ps >= 0).unsqueeze(-1), (s - ls.unsqueeze(2)).exp(), torch.zeros_like(s))
+                self._xq_read_mass = (sel, p.mean(-1))
+        msg = out.transpose(1, 2)[:, :n0].to(q.dtype)                             # [B, n0, H, Dv]
+        out_buf = torch.cat([msg.new_zeros(B, o0, H, Dv), msg,
+                             msg.new_zeros(B, int(num_nodes) - o0 - n0, H, Dv)], 1)
+        return self.sparse_out_proj(out_buf.reshape(B, int(num_nodes), H * Dv))
+
     def _hqd_packed_chunk(self, q_c, flat_k, flat_v, gather_idx, valid, num_heads: int,
-                          head_dim: int, v_dim: int, K: int):
+                          head_dim: int, v_dim: int, K: int, kv_heads: Optional[int] = None):
         """One query chunk of _compute_hqd_packed_l0_attn -> (msg [B,Qc,H,Dv], head-mean
         weights [B,Qc,K] fp32). Factored out so the xq descent can checkpoint it; the math
-        is the previous inline body, unchanged."""
+        is the previous inline body, unchanged. kv_heads < num_heads: grouped read, each
+        gathered K/V group serves num_heads / kv_heads query heads (MQA at 1)."""
         B, Qc = int(q_c.size(0)), int(q_c.size(1))
         neg = torch.finfo(q_c.dtype).min
-        k_c = flat_k.index_select(0, gather_idx).view(B, Qc, K, num_heads, head_dim)
-        v_c = flat_v.index_select(0, gather_idx).view(B, Qc, K, num_heads, v_dim)
-        scores = (q_c.unsqueeze(2) * k_c).sum(dim=-1) / math.sqrt(float(head_dim))  # [B,Qc,K,H]
+        G = int(kv_heads) if kv_heads is not None else int(num_heads)
+        k_c = flat_k.index_select(0, gather_idx).view(B, Qc, K, G, head_dim)
+        v_c = flat_v.index_select(0, gather_idx).view(B, Qc, K, G, v_dim)
+        if G != int(num_heads) and G != 1:      # G == 1 (MQA): the per-head code broadcasts as is
+            r = int(num_heads) // G
+            qg = q_c.view(B, Qc, 1, G, r, head_dim)
+            scores = (qg * k_c.unsqueeze(-2)).sum(-1).reshape(B, Qc, K, num_heads) / math.sqrt(float(head_dim))
+        else:
+            scores = (q_c.unsqueeze(2) * k_c).sum(dim=-1) / math.sqrt(float(head_dim))  # [B,Qc,K,H]
         scores = scores.masked_fill(~valid.unsqueeze(-1), neg)
         sink_k = getattr(self, "hqd_read_sink_k", None)
         if sink_k is not None:
@@ -4383,7 +4559,11 @@ class HierarchicalMessagePassing(MessagePassing):
         if sink_k is not None:
             weights = weights[:, :, :K, :]
         weights = torch.where(valid.unsqueeze(-1), weights, torch.zeros_like(weights))
-        msg = (weights.unsqueeze(-1) * v_c).sum(dim=2)  # [B,Qc,H,Dv]
+        if G != int(num_heads) and G != 1:  # grouped: broadcast the shared V over its query heads
+            msg = (weights.view(B, Qc, K, G, int(num_heads) // G, 1) * v_c.unsqueeze(-2).to(weights.dtype)
+                   ).sum(dim=2).reshape(B, Qc, num_heads, v_dim)
+        else:
+            msg = (weights.unsqueeze(-1) * v_c).sum(dim=2)  # [B,Qc,H,Dv]
         return msg.to(dtype=q_c.dtype), weights.float().mean(-1)
 
 
@@ -7357,6 +7537,14 @@ class HierarchicalMessagePassing(MessagePassing):
                 # _flex_union_attn (_far_keys).
                 qp = torch.cat([qp[..., :-_fnd], qp_un[..., -_fnd:]], -1)
                 kp = torch.cat([kp[..., :-_fnd], kp_un[..., -_fnd:]], -1)
+                _sp = int(getattr(self, "local_pack_far_slow_pairs", 0) or 0)
+                if _sp:
+                    # slow pairs at the START of the unrotated tail: far keys keep them
+                    # (_far_keys zeroes only the fast head), band keys barely turn (tiny delta)
+                    _pf = pos.view(1, num_nodes, 1)
+                    _sl = int(self.local_pack_far_slow_len)
+                    qp = _slow_rope(qp, _pf, int(self.head_dim) - _fnd, _sp, _sl)
+                    kp = _slow_rope(kp, _pf, int(self.head_dim) - _fnd, _sp, _sl)
                 if str(getattr(self, "local_pack_far_bias", "off")) != "off":
                     # reserved bias dim (the last one): q = 1 for every query, k = 0 for every
                     # row; _far_keys writes sqrt(d) * b into far keys only, so band keys score
@@ -8529,6 +8717,8 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_region_level: int = 2,  # head: level defining regions
         local_pack_far_nope_dims: int = 0,  # far keys: unrotated tail dims only (0 = off)
         local_pack_far_bias: str = "off",  # off | level: true per-level logit bias on far keys
+        local_pack_far_slow_pairs: int = 0,  # ultra-slow RoPE pairs in the far tail
+        local_pack_far_slow_len: int = 0,
         hier_node_dropout: float = 0.0,  # DropNode on coarse rows (value-side, L0 exempt)
         hier_node_dropout_per_level: Optional[Sequence[float]] = None,  # overrides the scalar
         local_window_dropout: float = 0.0,  # DropNode on L0 rows -- forces use of the hierarchy
@@ -8536,6 +8726,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_rope_axial: bool = False,  # axial ND RoPE on the packed path (curve-mode coords)
         hqd_read_prerope: bool = False,   # xq/HQD fetch read + stage-3 score on PRE-RoPE q/k (content-only)
         hqd_read_sink: bool = False,      # learned zero-value sink slot in the packed fetch read softmax
+        hqd_far_kv_groups: int = 0,       # grouped (MQA/GQA) far read for the xq descent; 0 = off
         per_level_ffn_dims: Optional[List[int]] = None,  # per-level FFN "processing dim" (inner ~ mult*dim); [] => uniform
         norm_type: str = "layernorm",
         norm_eps: float = 1e-6,
@@ -8670,6 +8861,8 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_region_level=local_pack_global_region_level,
             local_pack_far_nope_dims=local_pack_far_nope_dims,
             local_pack_far_bias=local_pack_far_bias,
+            local_pack_far_slow_pairs=local_pack_far_slow_pairs,
+            local_pack_far_slow_len=local_pack_far_slow_len,
             hier_node_dropout=hier_node_dropout,
             hier_node_dropout_per_level=hier_node_dropout_per_level,
             local_window_dropout=local_window_dropout,
@@ -8677,6 +8870,7 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_rope_axial=local_pack_rope_axial,
             hqd_read_prerope=hqd_read_prerope,
             hqd_read_sink=hqd_read_sink,
+            hqd_far_kv_groups=hqd_far_kv_groups,
             norm_type=norm_type,
             norm_eps=norm_eps,
             rope_level_axis_enable=rope_level_axis_enable,

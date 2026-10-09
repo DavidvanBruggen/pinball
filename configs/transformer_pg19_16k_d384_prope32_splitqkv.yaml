@@ -1,4 +1,33 @@
 # ============================================================================
+# PG19 @16k, d384 -- TRANSFORMER, PARTIAL RoPE (32 of 64 head dims unrotated) + split QKV, 2026-10-08.
+# Derived from transformer_pg19_16k_d384_rope_splitqkv.yaml by:
+#     transformer_rope_nope_dims: 32   (was the default 0 = full RoPE)
+#     checkpoint_dir
+# Nothing else differs.
+# WHY. Pinball's LATE lead over the transformer (fused cluster arm, ep120-146, ppl ratio
+#   transformer / nope) is not at short range (<128 1.03, 128-511 1.03) but at first-occurrence
+#   (never 1.15) and FAR tokens (2k-8k 1.17, >8k 1.18). One candidate: position handling. The
+#   transformer matches far tokens through fully rotated q.k, whose fast pairs are near-random
+#   phase at 2k-16k offsets and must be learned away; pinball's far keys score on 32 unrotated
+#   dims only (local_pack_far_nope_dims: 32), position-free at any distance. If partial RoPE
+#   closes most of the 2k-16k gap, the lead is position handling, not the hierarchy.
+# WHAT. RotaryEmbedding keeps the full 64-dim frequency schedule and rotates only its first 32
+#   dims (16 fastest pairs); the last 32 dims (the slowest pairs) pass unrotated for every
+#   query and key -- the same split pinball uses. Pinball additionally zeroes the rotated half
+#   for far keys; a dense causal softmax cannot do that without a distance mask, so here every
+#   key keeps both halves. No parameter change (40.57M), no speed change expected.
+# COMPARE against transformer_pg19_16k_d384_rope_splitqkv.yaml at matched epochs, per bucket
+#   (2k-8k, >8k and never are the readouts; <128 should be ~unchanged), and against nope.
+# SCORES (local Blackwell run, 200 epochs, 2026-10-08; val ppl, ep164 is every arm's best):
+#   ep146 24.05 | ep164 22.98 | ep189 23.56 | ep199 24.46   vs cluster split full-RoPE 24.43 /
+#   23.33 / 23.96 / 24.92 (-1.5%), tdesc_sep_coarse 23.53 / 22.29 / 22.87 / 23.76 (+3.0%),
+#   shared tdesc 24.52 / 23.32 / 23.99 / 24.83 (this arm is 1.5% BETTER), fused 23.90 @164.
+#   Last 10 epochs vs the descent arm (descent / this): never 0.859, <128 0.978, 128-511 1.024,
+#   512-2k 1.003, 2k-8k 0.945, >8k 0.919, val 0.959. Partial RoPE removed most of pinball's
+#   512-8k lead; first-occurrence ("never") is unchanged (~15% pinball lead throughout).
+# ============================================================================
+# ---- parent header (history) ----
+# ============================================================================
 # PG19 @16k, d384 -- TRANSFORMER, RoPE-ONLY + SPLIT QKV (optimizer parity), 2026-10-08.
 # Derived from transformer_pg19_16k_d384_rope.yaml by:
 #     transformer_split_qkv: true   (was the default false: one fused c_attn [1152, 384])
@@ -22,8 +51,7 @@
 # COMPARE against transformer_pg19_16k_d384_rope.yaml at MATCHED epochs (early ep5-30 and late),
 #   per recurrence bucket. Prediction: the early gap to pinball shrinks clearly; the late gap
 #   shrinks a little. If the late gap also closes, the optimizer was the main explainer.
-# SCORES (cluster, 200 epochs): ep146 24.43 | ep164 23.33 (best) | ep189 23.96 | ep199 24.92;
-#   2.4-2.5% better than the fused arm at every matched epoch (23.90 @164).
+# SCORES: (none yet)
 # ============================================================================
 # ---- parent header (history) ----
 # ============================================================================
@@ -130,7 +158,7 @@ longctx_diag_long_edges: [8192]   # adds 2k-8k and >8k buckets
 gen_prompt_tokens: 1024
 gen_max_new_tokens: 512
 save_every: 0
-checkpoint_dir: ./transformer/pg19_16k_transformer_rope_splitqkv/checkpoints
+checkpoint_dir: ./transformer/pg19_16k_transformer_prope32_splitqkv/checkpoints
 
 train_mode: ar
 learning_rate: 1e-4 #0.0001
@@ -148,6 +176,7 @@ transformer_ffn_type: swiglu
 transformer_use_rope: true
 transformer_use_abs_pos_emb: false   # RoPE ONLY: no learned absolute position table (see header)
 transformer_split_qkv: true   # separate q/k/v matrices = pinball's layout (Muon orthogonalises each; see header)
+transformer_rope_nope_dims: 32   # partial RoPE: last 32 of 64 head dims unrotated = pinball's far_nope_dims (see header)
 transformer_attn_backend: auto   # auto | flash | sdpa
 # Compile each block's forward in training (parity with pinball's hier_layer_compile so the
 # speed comparison stays fair; +33-37% measured on image shapes). Training-only, eager

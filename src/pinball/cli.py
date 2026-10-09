@@ -160,8 +160,10 @@ def _build_optimizer(model, cfg):
     # coupled; measured 2026-09-29 (l0sel sanity, 2 epochs): layer 0's L0 row collapsed
     # 0.39 -> 0.003 and the picks covered FEWER copy targets than random rows.
     # nom_boost_u: likewise a [heads, head_dim] table of per-head directions, not a weight matrix.
+    # xq_stair_boost_u: [layers, heads, head_dim] per-layer per-head boost directions, the same kind.
     head_name_markers = ("output_projection", "lm_head", "hier_pc_decoder", "global_nominate_vec",
-                         "nom_boost_u", "lap_pe_proj", "far_level_bias")
+                         "nom_boost_u", "lap_pe_proj", "far_level_bias",
+                         "xq_stair_boost_u", "xq_far_boost_u")
     for name, p in model.named_parameters():
         if any(marker in name for marker in head_name_markers):
             embed_param_ids.add(id(p))
