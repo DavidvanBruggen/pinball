@@ -3692,6 +3692,9 @@ class HierarchicalMessagePassing(MessagePassing):
             k_hqd = k_hqd + _tag_k
             v_hqd = v_hqd + self.local_pack_level_v_emb.index_select(0, _nl).unsqueeze(0).to(v_hqd.dtype)
 
+        if hqd_edges is not None and getattr(self, "_xq_merge", None) is not None:
+            # xq_read_merge: the descent picks were read inside the packed softmax
+            hqd_edges = None
         if hqd_edges is not None:
             hqd_b_idx, hqd_src_idx, hqd_dst_idx = hqd_edges
             if (hqd_src_idx is not None and hqd_src_idx.dim() == 3
@@ -5299,6 +5302,80 @@ class HierarchicalMessagePassing(MessagePassing):
         o_bt = o_b.transpose(1, 2)
         merged = ((o_a.float() * w_a + o_bt.float() * w_b) / (w_a + w_b)).to(out_t.dtype)
         return out_t.index_copy(1, qr, merged).transpose(1, 2)            # back to [B, H, N, D]
+
+    def _xq_pick_merge(self, qp, kp, v_s, spec: Dict, gsel, out: torch.Tensor,
+                       lse_main: torch.Tensor, causal: bool, cand: torch.Tensor) -> torch.Tensor:
+        """xq descent v2 (xq_read_merge): each L0 query's descent picks join the packed
+        softmax EXACTLY, as one extra key set merged through the log-sum-exps:
+            o = (o_A e^{L_A} + o_B e^{L_B}) / (e^{L_A} + e^{L_B}).
+        Exact only over DISJOINT key sets, so a pick is dropped from the read (it stays in the
+        beam for navigation) when the main call already holds it: inside the query's band
+        (0 <= q_row - row <= window, causal; |.| <= window bidi), a static-block row, or one
+        of the query tile's chunk slots. Picks are scored like every far key of the main call
+        -- packed q against _far_keys(kp) (unrotated tail + per-level bias, slow pairs
+        included), flex's 1/sqrt(D) -- and read the band part of the main call's v_s, so a
+        row carries the same token-dropout mask in both. The fused kernel's lse is
+        differentiable; no sink (the band absorbs mass a query does not spend on picks).
+        cand [B, n0, K]: absolute node ids (-1 padding). out / lse_main: [B, H, N, D] /
+        [B, H, N] in prefix layout (row == packed row). Sets _xq_read_mass (head-mean
+        attention per pick within the picks) for the indexer KL when training."""
+        from .sparse_pick_attn import sparse_pick_attention
+        B, N, H, D = (int(x) for x in qp.shape)
+        dev = qp.device
+        inv = spec.get("xq_inv_perm", None)
+        if inv is None:
+            perm = spec["perm"]
+            inv = torch.empty_like(perm)
+            inv[perm] = torch.arange(int(perm.numel()), device=perm.device, dtype=perm.dtype)
+            spec["xq_inv_perm"] = inv
+        o0, n0 = (int(x) for x in self._xq_dst_range)
+        qrow = inv[o0:o0 + n0]                                                   # [n0]
+        ok = cand >= 0
+        prow = inv.index_select(0, cand.clamp(min=0).reshape(-1)).view_as(cand)  # [B, n0, K]
+        dr = qrow.view(1, -1, 1) - prow
+        W = int(spec["window"])
+        band = ((dr >= 0) & (dr <= W)) if causal else (dr.abs() <= W)
+        _is_st = spec.get("xq_static_rows_mask", None)
+        _st_rows = (gsel[2]["static_rows"] if (gsel is not None and len(gsel) > 2 and gsel[2] is not None)
+                    else spec.get("flex_kv_prefix", None))
+        if _is_st is None and _st_rows is not None:
+            _is_st = torch.zeros(N, dtype=torch.bool, device=dev)
+            _is_st[_st_rows] = True
+            spec["xq_static_rows_mask"] = _is_st
+        excl = band
+        if _is_st is not None:
+            excl = excl | _is_st[prow]
+        if gsel is not None and len(gsel) > 2 and gsel[2] is not None and gsel[2].get("per_batch", False):
+            # this query tile's live chunk slots are main-call keys too
+            C, G, nch = int(gsel[2]["chunk"]), int(gsel[2]["G"]), int(gsel[2]["nch"])
+            mark = torch.zeros(B, nch, N, dtype=torch.bool, device=dev)
+            slots = gsel[0].view(B, nch, G)
+            live = gsel[2]["ok"].view(1, nch, G).expand(B, -1, -1)
+            mark.scatter_(2, slots, live)
+            tile = (qrow // C).clamp(max=nch - 1)
+            excl = excl | mark[torch.arange(B, device=dev).view(B, 1, 1), tile.view(1, -1, 1), prow]
+        idx = torch.where(ok & ~excl, prow, torch.full_like(prow, -1))
+        k_tab = self._far_keys(kp, spec["levels"]) if int(getattr(self, "local_pack_far_nope_dims", 0) or 0) else kp
+        n_pre = int(v_s.size(2)) - N
+        v_tab = v_s[:, :, n_pre:].transpose(1, 2)                                # [B, N, H, D]
+        store = bool(getattr(self, "_xq_store_read_mass", False))
+        res = sparse_pick_attention(qp.index_select(1, qrow), k_tab, v_tab, idx,
+                                    float(D) ** -0.5, return_p=store)
+        o_b, l_b = res[0], res[1]
+        if store:
+            self._xq_read_mass = res[2]
+        out_t = out.transpose(1, 2)
+        if not out_t.is_contiguous():
+            out_t = out_t.contiguous()
+        l_a = lse_main.index_select(2, qrow).float().transpose(1, 2)              # [B, n0, H]
+        m = torch.maximum(l_a, l_b)
+        w_a = (l_a - m).exp().unsqueeze(-1)
+        w_b = (l_b - m).exp().unsqueeze(-1)
+        o_a = out_t.index_select(1, qrow)                                         # [B, n0, H, D]
+        merged = ((o_a.float() * w_a + o_b.float() * w_b) / (w_a + w_b)).to(out_t.dtype)
+        self._xq_merge_stats = {"read_frac": (ok & ~excl).float().sum() / ok.float().sum().clamp(min=1.0),
+                                "pick_mass": (w_b / (w_a + w_b)).mean()}
+        return out_t.index_copy(1, qrow, merged).transpose(1, 2)
 
     def _flex_ring_call(self, qp, kp, vp, spec: Dict, causal: bool, want_lse: bool):
         """Rings as their own flex call, in level-grouped order.
@@ -7302,7 +7379,13 @@ class HierarchicalMessagePassing(MessagePassing):
         if _tdk and (_ring or _smod is not None):
             raise NotImplementedError("tdesc indexer KL: slot mass needs a plain-score main call "
                                       "(no ring merge, logit boost or dropkey)")
-        _want_lse = _lse or _kl or _tdk
+        # xq descent v2 (xq_read_merge): the per-query picks join THIS softmax via an exact
+        # LSE merge (see _xq_pick_merge), so the main call must return its lse
+        _xm = getattr(self, "_xq_merge", None)
+        if _xm is not None and (_ring or _smod is not None or _pre is None):
+            raise NotImplementedError("xq_read_merge needs the prefix layout (a global block) "
+                                      "and a plain-score main call (no ring, logit boost or dropkey)")
+        _want_lse = _lse or _kl or _tdk or (_xm is not None)
         if q_s.is_cuda and int(perm.numel()) >= 512:
             fn = _flex_compiled_singleton()
             # Default tiles exceed the workstation Blackwell's 101KB shared memory, so the
@@ -7323,6 +7406,8 @@ class HierarchicalMessagePassing(MessagePassing):
             self._tdesc_kl_from_flex(q_s, k_s, lse_main, gsel)
         if _cc is not None:
             out = self._flex_coarse_call_merge(qp, kp, vp, spec, _cc, bool(causal), out, lse_main)
+        if _xm is not None:
+            out = self._xq_pick_merge(qp, kp, v_s, spec, gsel, out, lse_main, bool(causal), _xm)
         out = out.transpose(1, 2)  # [B, N, H, D]
         if not _ring:
             return out

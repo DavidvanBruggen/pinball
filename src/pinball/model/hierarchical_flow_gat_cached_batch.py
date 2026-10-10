@@ -2861,6 +2861,7 @@ class HierarchicalFlowGAT(nn.Module):
         xq_select_cuda_graph: bool = False,              # descent selection as CUDA graphs
         xq_read_kernel: str = "gather",                  # descent read: gather (torch) | triton (fused)
         xq_select_kernel: str = "torch",                 # descent levels: torch loop | triton (fused)
+        xq_read_merge: bool = False,                     # v2: picks LSE-merged into the packed softmax
         # Per-query differentiable relevance gate: hqd read output scaled by
         # sigmoid(w * stage1_top_score + b). Gives queries a no-op option (the ungated read
         # HURT never-recurring tokens by ~1.6% on the 100ep run) AND routes a task gradient
@@ -5553,6 +5554,21 @@ class HierarchicalFlowGAT(nn.Module):
         self.xq_select_kernel = str(xq_select_kernel or "torch").lower()
         if self.xq_select_kernel not in {"torch", "triton"}:
             raise ValueError(f"xq_select_kernel must be 'torch' or 'triton', got {xq_select_kernel!r}")
+        # descent v2 read: the per-query picks join the packed flex softmax through an exact
+        # LSE merge (layer._xq_pick_merge) instead of a separate sunk read added on top --
+        # scored like the static block's far keys (unrotated tail + level bias), disjoint
+        # from the band / static block / chunk slots by exclusion, no sink, no sparse_out_proj
+        self.xq_read_merge = bool(xq_read_merge)
+        if self.xq_read_merge:
+            _need = {"xq_descent_enable": self.xq_descent_enable, "xq_read_kernel triton": self.xq_read_kernel == "triton",
+                     "xq_descent_read gather": self.xq_descent_read == "gather",
+                     "xq_far_kv_groups 0": self.xq_far_kv_groups == 0,
+                     "local_pack_flex_union": self.local_pack_flex_union,
+                     "local_pack_flex_strict": self.local_pack_flex_strict,
+                     "local_pack_global_block > 0": self.local_pack_global_block > 0}
+            _miss = [k for k, v in _need.items() if not v]
+            if _miss:
+                raise ValueError(f"xq_read_merge requires {', '.join(_miss)}")
         self._xq_graph_cache: Dict[tuple, Any] = {}
         self._xq_graph_pool = None
         if self.xq_descent_read not in {"gather", "staircase"}:
@@ -16833,6 +16849,8 @@ class HierarchicalFlowGAT(nn.Module):
                                 _xq_fed_mp._xq_read_ckpt = bool(self.xq_read_ckpt)
                                 _xq_fed_mp._xq_read_fp32 = True
                                 _xq_fed_mp._xq_read_kernel = self.xq_read_kernel
+                                _xq_fed_mp._xq_merge = (self._xq_nom_edges[1] if self.xq_read_merge
+                                                        else None)
                                 _xq_fed_mp._xq_level_tags = True
                                 _st = self._xq_stair_state
                                 if _st is not None:
@@ -17011,6 +17029,7 @@ class HierarchicalFlowGAT(nn.Module):
                     _xq_fed_mp._xq_read_mass = None
                     _xq_fed_mp._xq_stair = None
                     _xq_fed_mp._xq_far = None
+                    _xq_fed_mp._xq_merge = None
                     if self.training and _mass is not None:
                         _l = self._xq_index_loss(_mass)
                         if _l is not None:
