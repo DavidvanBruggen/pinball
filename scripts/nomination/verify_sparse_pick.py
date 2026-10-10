@@ -49,6 +49,10 @@ def check(name, B, Nq, Nk, H, G, D, K, dtype, popular=0):
         _, _, pk = sparse_pick_attention(q, k, v, idx, sc, return_p=True)
         _, _, pr = sparse_pick_attention_ref(q, k, v, idx, sc, return_p=True)
     res["p"] = rel(pk, pr)
+    with torch.no_grad():
+        rows = torch.arange(0, Nq, 7, device="cuda")
+        _, _, ps = sparse_pick_attention(q, k, v, idx, sc, return_p=True, p_rows=rows)
+    res["p_rows"] = rel(ps, pr[:, rows])
     empty_ok = bool((lse[:, 3] == float("-inf")).all()) and float(o[:, 3].detach().abs().max()) == 0.0
     rep(name, all(x <= tol for x in res.values()) and empty_ok,
         " ".join(f"{a} {b:.1e}" for a, b in res.items()) + f" | empty row ok {empty_ok}")

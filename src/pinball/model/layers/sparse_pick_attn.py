@@ -31,8 +31,8 @@ import triton.language as tl
 
 
 @triton.jit
-def _pick_fwd(Q, K, V, IDX, O, LSE, P, scale,
-              Nq, Nk, KP,
+def _pick_fwd(Q, K, V, IDX, O, LSE, P, PSLOT, scale,
+              Nq, Nk, KP, NP,
               H: tl.constexpr, G: tl.constexpr, D: tl.constexpr,
               HP: tl.constexpr, BK: tl.constexpr, STORE_P: tl.constexpr):
     pid = tl.program_id(0)                       # = b * Nq + query
@@ -68,8 +68,10 @@ def _pick_fwd(Q, K, V, IDX, O, LSE, P, scale,
     lse = tl.where(live, m_i + tl.log(tl.where(live, l_i, 1.0)), float("-inf"))
     tl.store(LSE + pid * H + h, lse, mask=hm)
     if STORE_P:
-        # head-mean attention per pick (the indexer-KL target): a second pass over the keys
-        for k0 in range(0, KP, BK):
+        # head-mean attention per pick (the indexer-KL target): a second pass over the keys,
+        # only for the KL's sampled queries (PSLOT[i] = row in P, or -1)
+        slot = tl.load(PSLOT + pid % Nq)
+        for k0 in range(0, KP * (slot >= 0).to(tl.int32), BK):
             j = k0 + tl.arange(0, BK)
             ids = tl.load(IDX + pid * KP + j, mask=j < KP, other=-1)
             ok = ids >= 0
@@ -78,7 +80,7 @@ def _pick_fwd(Q, K, V, IDX, O, LSE, P, scale,
             kt = tl.load(K + off, mask=ok[:, None, None] & hm[None, :, None], other=0.0).to(tl.float32)
             s = tl.sum(q[None, :, :] * kt, axis=2) * scale
             pr = tl.where(ok[:, None] & live[None, :] & hm[None, :], tl.exp(s - lse[None, :]), 0.0)
-            tl.store(P + pid * KP + j, tl.sum(pr, axis=1) / H, mask=j < KP)
+            tl.store(P + (b * NP + slot) * KP + j, tl.sum(pr, axis=1) / H, mask=j < KP)
 
 
 @triton.jit
@@ -168,23 +170,28 @@ def _pick_inverse(idx: torch.Tensor, Nk: int, seg: int):
     dev = idx.device
     E = B * Nq * KP
     sent = B * Nk
-    flat = idx.reshape(B, Nq * KP).long()
-    key = torch.where(flat >= 0, flat + torch.arange(B, device=dev).view(B, 1) * Nk,
+    # int32 keys halve the radix passes (-3 ms at 176 picks, 16k x4); b * Nk + node only
+    # outgrows them past ~2.1e9 nodes per batch (1M tokens ~ 1.24M nodes, so B ~ 1700).
+    # Positions into the sorted entry list (E = B * Nq * KP) go int64 past 2^31.
+    kdt = torch.int32 if sent < 2 ** 31 - 1 else torch.int64
+    pdt = torch.int32 if E < 2 ** 31 - 1 else torch.int64
+    flat = idx.reshape(B, Nq * KP).to(kdt)
+    key = torch.where(flat >= 0, flat + torch.arange(B, device=dev, dtype=kdt).view(B, 1) * Nk,
                       torch.full_like(flat, sent)).reshape(-1)
     skey, order = torch.sort(key)
-    entry_q = (order // KP).to(torch.int32)               # flat entry (b, q, slot) -> b * Nq + q
+    entry_q = (order // KP).to(pdt)                       # flat entry (b, q, slot) -> b * Nq + q
     valid = skey < sent
     pos = torch.arange(E, device=dev)
     first = valid.clone()
     first[1:] &= skey[1:] != skey[:-1]
     run0 = torch.searchsorted(skey, skey)                  # run start (keys are sorted; cummax: 5.3 ms)
     start = first | (valid & ((pos - run0) % seg == 0))
-    slot = torch.cumsum(start.to(torch.int32), 0) - 1
+    slot = torch.cumsum(start.to(pdt), 0) - 1
     UB = max(1, min(E, sent + E // seg + 1))
-    seg_start = torch.full((UB + 1,), E, dtype=torch.int32, device=dev)
-    seg_start.scatter_(0, torch.where(start, slot.long(), torch.full_like(pos, UB)), pos.to(torch.int32))
+    seg_start = torch.full((UB + 1,), E, dtype=pdt, device=dev)
+    seg_start.scatter_(0, torch.where(start, slot.long(), torch.full_like(pos, UB)), pos.to(pdt))
     seg_start = seg_start[:UB].contiguous()
-    n_valid = valid.sum().to(torch.int32)
+    n_valid = valid.sum().to(pdt)
     seg_end = torch.minimum(torch.cat([seg_start[1:], seg_start.new_full((1,), E)]), n_valid).contiguous()
     seg_key = skey.gather(0, seg_start.clamp(max=E - 1).long()).contiguous()
     return seg_start, seg_end, seg_key, entry_q, UB
@@ -208,7 +215,8 @@ DKDV_WARPS = 2
 # traces through the read without a graph break; the ops are opaque to inductor.
 @torch.library.custom_op("pinball::sparse_pick_fwd", mutates_args=())
 def _sparse_pick_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, idx: torch.Tensor,
-                     scale: float, return_p: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                     scale: float, return_p: bool, p_slot: torch.Tensor,
+                     n_p: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, Nq, H, D = (int(x) for x in q.shape)
     Nk, G = int(k.size(1)), int(k.size(2))
     assert H % G == 0 and D == triton.next_power_of_2(D), (H, G, D)
@@ -217,19 +225,20 @@ def _sparse_pick_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, idx: tor
     KP = int(idx.size(-1))
     o = torch.empty_like(q)
     lse = torch.empty(B, Nq, H, device=q.device, dtype=torch.float32)
-    p = torch.empty((B, Nq, KP) if return_p else (0,), device=q.device, dtype=torch.float32)
+    p = torch.zeros((B, n_p, KP) if return_p else (0,), device=q.device, dtype=torch.float32)
     HP, BK, nw = _cfg(H, D)
-    _pick_fwd[(B * Nq,)](q, k, v, idx, o, lse, p if return_p else lse, float(scale), Nq, Nk, KP,
+    _pick_fwd[(B * Nq,)](q, k, v, idx, o, lse, p if return_p else lse, p_slot.to(torch.int32).contiguous(),
+                         float(scale), Nq, Nk, KP, int(n_p),
                          H=H, G=G, D=D, HP=HP, BK=BK, STORE_P=bool(return_p), num_warps=nw)
     return o, lse, p
 
 
 @_sparse_pick_fwd.register_fake
-def _(q, k, v, idx, scale, return_p):
+def _(q, k, v, idx, scale, return_p, p_slot, n_p):
     B, Nq, H, D = q.shape
     KP = idx.shape[-1]
     return (q.new_empty(q.shape), q.new_empty((B, Nq, H), dtype=torch.float32),
-            q.new_empty((B, Nq, KP) if return_p else (0,), dtype=torch.float32))
+            q.new_empty((B, n_p, KP) if return_p else (0,), dtype=torch.float32))
 
 
 @torch.library.custom_op("pinball::sparse_pick_bwd", mutates_args=())
@@ -261,7 +270,7 @@ def _(q, k, v, idx, o, lse, do, dlse, scale):
 
 
 def _setup_ctx(ctx, inputs, output):
-    q, k, v, idx, scale, _ = inputs
+    q, k, v, idx, scale = inputs[:5]
     o, lse, _ = output
     ctx.save_for_backward(q, k, v, idx, o, lse)
     ctx.scale = float(scale)
@@ -272,17 +281,27 @@ def _backward(ctx, do, dlse, dp):
     do = torch.zeros_like(o) if do is None else do
     dlse = torch.zeros_like(lse) if dlse is None else dlse
     dq, dk, dv = _sparse_pick_bwd(q, k, v, idx, o, lse, do, dlse, ctx.scale)
-    return dq, dk, dv, None, None, None
+    return dq, dk, dv, None, None, None, None, None
 
 
 _sparse_pick_fwd.register_autograd(_backward, setup_context=_setup_ctx)
 
 
 def sparse_pick_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, idx: torch.Tensor,
-                          scale: float, return_p: bool = False):
-    """-> (o [B, Nq, H, D], lse [B, Nq, H] fp32[, p [B, Nq, K] fp32 head-mean attention per
-    pick, non-differentiable, when return_p]). See the module docstring."""
-    o, lse, p = _sparse_pick_fwd(q, k, v, idx, float(scale), bool(return_p))
+                          scale: float, return_p: bool = False, p_rows=None):
+    """-> (o [B, Nq, H, D], lse [B, Nq, H] fp32[, p fp32 head-mean attention per pick,
+    non-differentiable, when return_p]). p is [B, Nq, K], or [B, len(p_rows), K] for the
+    queries p_rows (sorted indices, e.g. the indexer KL's sample: the second pass then runs
+    only for them). See the module docstring."""
+    Nq = int(q.size(1))
+    if return_p and p_rows is not None:
+        n_p = int(p_rows.numel())
+        p_slot = torch.full((Nq,), -1, dtype=torch.int32, device=q.device)
+        p_slot[p_rows] = torch.arange(n_p, dtype=torch.int32, device=q.device)
+    else:
+        n_p = Nq if return_p else 0
+        p_slot = torch.arange(Nq, dtype=torch.int32, device=q.device)
+    o, lse, p = _sparse_pick_fwd(q, k, v, idx, float(scale), bool(return_p), p_slot, n_p)
     return (o, lse, p.detach()) if return_p else (o, lse)
 
 

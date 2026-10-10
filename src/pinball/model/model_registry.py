@@ -352,6 +352,7 @@ def build_pinball_model(
         xq_read_kernel=str(getattr(args, "xq_read_kernel", "gather") or "gather"),
         xq_select_kernel=str(getattr(args, "xq_select_kernel", "torch") or "torch"),
         xq_read_merge=bool(getattr(args, "xq_read_merge", False)),
+        xq_descent_exclude_band=bool(getattr(args, "xq_descent_exclude_band", False)),
         xq_nominate_gate_enable=bool(getattr(args, "xq_nominate_gate_enable", False)),
         xq_nominate_stage2=str(getattr(args, "xq_nominate_stage2", "cosine")),
         local_pack_cross_level=bool(getattr(args, "local_pack_cross_level", False)),

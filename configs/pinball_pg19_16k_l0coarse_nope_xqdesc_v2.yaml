@@ -24,7 +24,11 @@
 #   eval+train, grads); knobs off bit-identical to HEAD.
 # NOTE: the read-time exclusion drops picks inside the band (measured 4% of picks at window
 #   156; ~35-40% of COARSE picks expected at 640); the beam still navigates through them.
-# SCORES: (none yet)
+# SCORES: STOPPED at ep39 (2026-10-10, val ppl 33.48; best 34.09 at ep30 vs nope_w640 33.34).
+#   ep21-30 ratio vs prope32: 128-511 0.937 (w640 0.910), 512-2k 1.113 (w640 0.973, descent
+#   1.062), 2k-8k 0.977 (0.927). Far range behind both: 56 picks hold 6-8% of the merged
+#   softmax mass; picks were cut at READ time (2-5% in band). Successor: _xqdesc_v2b (112
+#   picks, selection-time band exclusion).
 # ============================================================================
 # ---- parent header (history) ----
 # ============================================================================

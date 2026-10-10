@@ -4490,8 +4490,12 @@ class HierarchicalMessagePassing(MessagePassing):
             k = torch.cat([k, sink_k.to(k.dtype).view(1, 1, H, D).expand(B, 1, H, D)], 1)
             v = torch.cat([v, v.new_zeros(B, 1, H, int(v.size(-1)))], 1)
             cand = torch.cat([cand, torch.full((B, Q, 1), n_src, dtype=cand.dtype, device=cand.device)], -1)
-        res = sparse_pick_attention(q_sl, k, v, cand, float(D) ** -0.5, return_p=store_mass)
-        return res[0], (res[2][..., :K] if store_mass else None)
+        sel = getattr(self, "_xq_kl_sel", None) if store_mass else None
+        res = sparse_pick_attention(q_sl, k, v, cand, float(D) ** -0.5, return_p=store_mass, p_rows=sel)
+        if not store_mass:
+            return res[0], None
+        p = res[2][..., :K]
+        return res[0], ((sel, p) if sel is not None else p)       # (sel, mass): KL sample only
 
     @torch._dynamo.disable
     def _xq_staircase_read(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -5359,11 +5363,13 @@ class HierarchicalMessagePassing(MessagePassing):
         n_pre = int(v_s.size(2)) - N
         v_tab = v_s[:, :, n_pre:].transpose(1, 2)                                # [B, N, H, D]
         store = bool(getattr(self, "_xq_store_read_mass", False))
+        sel = getattr(self, "_xq_kl_sel", None) if store else None
         res = sparse_pick_attention(qp.index_select(1, qrow), k_tab, v_tab, idx,
-                                    float(D) ** -0.5, return_p=store)
+                                    float(D) ** -0.5, return_p=store, p_rows=sel)
         o_b, l_b = res[0], res[1]
         if store:
-            self._xq_read_mass = res[2]
+            # (sel, mass) for the KL's sampled queries (the second pass ran only for them)
+            self._xq_read_mass = (sel, res[2]) if sel is not None else res[2]
         out_t = out.transpose(1, 2)
         if not out_t.is_contiguous():
             out_t = out_t.contiguous()

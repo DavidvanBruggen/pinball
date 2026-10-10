@@ -49,41 +49,54 @@ print("1. round-0 picks (eval): the kernel vs an fp32 reference on ITS OWN paren
 # NOT vs the torch path: its bf16 GEMM output rounds the indexer scores so coarsely that at
 # L3 ~90% of queries tie exactly at the top-8 cut (L2 ~53%), so torch picks are partly
 # index-order tie breaks; the kernel scores in fp32.
-run("triton", X[:1, :L]); _, rb = run("triton", X[:1, :L])
-levels_b, o, t, qr, kr, sc = rb[0]
-tabs = m._xq_tree_tables([o[i + 1] - o[i] for i in range(len(o) - 1)], X.device)
-excl = int(m.xq_descent_local_exclude); n0 = o[1] - o[0]
-q_t = t[o[0]:o[1]]
-for l, kb, pb in levels_b:
-    if pb is None:
-        continue
-    par = next(kk for ll, kk, _ in levels_b if ll == l + 1)
-    ch = tabs[l + 1][par.clamp(min=0)]
-    ch = torch.where((par >= 0).unsqueeze(-1), ch, torch.full_like(ch, -1)).flatten(-2)
-    ok = ch >= 0; safe = ch.clamp(min=0)
-    tl_ = t[o[l]:o[l + 1]]
-    ok &= tl_[safe] <= q_t.view(1, -1, 1)
-    if l == 0:
-        ok &= safe <= torch.arange(n0, device=X.device).view(1, -1, 1) - excl
-    s_ = (qr.float().unsqueeze(2) * kr[l].float()[0][safe[0]].unsqueeze(0)).sum(-1) * sc
-    s_ = s_.masked_fill(~ok, float("-inf"))
-    srt, order = safe.masked_fill(~ok, -1).sort(-1)
-    dup = torch.zeros_like(ok); dup[..., 1:] = (srt[..., 1:] == srt[..., :-1]) & (srt[..., 1:] >= 0)
-    s_ = s_.masked_fill(torch.zeros_like(ok).scatter(-1, order, dup), float("-inf"))
-    top = s_.topk(kb.size(-1), -1)
-    ref = torch.where(torch.isfinite(top.values), ch.gather(-1, top.indices), torch.full_like(top.indices, -1))
-    vr, vb = ref >= 0, kb >= 0
-    has = vr.any(-1)
-    inter = ((ref.unsqueeze(-1) == kb.unsqueeze(-2)) & vr.unsqueeze(-1) & vb.unsqueeze(-2)).sum((-1, -2)).float()
-    ov = (inter / vr.sum(-1).clamp(min=1).float())[has].mean().item()
-    cnt = (vr.sum(-1) == vb.sum(-1)).float().mean().item()
-    sb = torch.where(vb, kb, -(torch.arange(kb.size(-1), device=X.device) + 2)).sort(-1).values
-    nodup = not bool((sb[..., 1:] == sb[..., :-1]).any())
-    par_id = par.gather(-1, pb.clamp(min=0))
-    slot_ok = torch.where(vb, (tabs[l + 1][par_id.clamp(min=0)] == kb.unsqueeze(-1)).any(-1), torch.ones_like(vb)).all().item()
-    rep(f"L{l}", ov > 0.995 and cnt > 0.995 and nodup and slot_ok,
-        f"overlap with fp32 ref {ov:.5f} (queries with candidates), same pick count {cnt:.5f}, "
-        f"no-dup {nodup}, slot->parent {slot_ok}")
+for BAND in (False, True):
+  m.xq_descent_exclude_band = BAND
+  print(f" band exclusion {'ON' if BAND else 'off'}")
+  run("triton", X[:1, :L]); _, rb = run("triton", X[:1, :L])
+  levels_b, o, t, qr, kr, sc = rb[0]
+  tabs = m._xq_tree_tables([o[i + 1] - o[i] for i in range(len(o) - 1)], X.device)
+  excl = int(m.xq_descent_local_exclude); n0 = o[1] - o[0]
+  q_t = t[o[0]:o[1]]
+  if BAND:
+      _sp = m._local_pack_spec_cache[1]; inv = _sp["xq_inv_perm"]; W = int(_sp["window"])
+  for l, kb, pb in levels_b:
+      if pb is None:
+          continue
+      par = next(kk for ll, kk, _ in levels_b if ll == l + 1)
+      ch = tabs[l + 1][par.clamp(min=0)]
+      ch = torch.where((par >= 0).unsqueeze(-1), ch, torch.full_like(ch, -1)).flatten(-2)
+      ok = ch >= 0; safe = ch.clamp(min=0)
+      tl_ = t[o[l]:o[l + 1]]
+      ok &= tl_[safe] <= q_t.view(1, -1, 1)
+      if l == 0:
+          ok &= safe <= torch.arange(n0, device=X.device).view(1, -1, 1) - excl
+      if BAND:
+          _dr = inv[o[0]:o[1]].view(1, -1, 1) - inv[o[l]:o[l + 1]][safe]
+          ok &= ~((_dr >= 0) & (_dr <= W))
+      s_ = (qr.float().unsqueeze(2) * kr[l].float()[0][safe[0]].unsqueeze(0)).sum(-1) * sc
+      s_ = s_.masked_fill(~ok, float("-inf"))
+      srt, order = safe.masked_fill(~ok, -1).sort(-1)
+      dup = torch.zeros_like(ok); dup[..., 1:] = (srt[..., 1:] == srt[..., :-1]) & (srt[..., 1:] >= 0)
+      s_ = s_.masked_fill(torch.zeros_like(ok).scatter(-1, order, dup), float("-inf"))
+      top = s_.topk(kb.size(-1), -1)
+      ref = torch.where(torch.isfinite(top.values), ch.gather(-1, top.indices), torch.full_like(top.indices, -1))
+      vr, vb = ref >= 0, kb >= 0
+      has = vr.any(-1)
+      inter = ((ref.unsqueeze(-1) == kb.unsqueeze(-2)) & vr.unsqueeze(-1) & vb.unsqueeze(-2)).sum((-1, -2)).float()
+      ov = (inter / vr.sum(-1).clamp(min=1).float())[has].mean().item()
+      cnt = (vr.sum(-1) == vb.sum(-1)).float().mean().item()
+      sb = torch.where(vb, kb, -(torch.arange(kb.size(-1), device=X.device) + 2)).sort(-1).values
+      nodup = not bool((sb[..., 1:] == sb[..., :-1]).any())
+      par_id = par.gather(-1, pb.clamp(min=0))
+      slot_ok = torch.where(vb, (tabs[l + 1][par_id.clamp(min=0)] == kb.unsqueeze(-1)).any(-1), torch.ones_like(vb)).all().item()
+      inband = 0
+      if BAND:
+          _db = inv[o[0]:o[1]].view(1, -1, 1) - inv[o[l]:o[l + 1]][kb.clamp(min=0)]
+          inband = int((vb & (_db >= 0) & (_db <= W)).sum())
+      rep(f"L{l}{' band' if BAND else ''}", ov > 0.995 and cnt > 0.995 and nodup and slot_ok and inband == 0,
+          f"overlap with fp32 ref {ov:.5f} (queries with candidates), same pick count {cnt:.5f}, "
+          f"no-dup {nodup}, slot->parent {slot_ok}, in-band picks {inband}")
+m.xq_descent_exclude_band = False
 
 print("2. eval NLL")
 def nll(kern):
@@ -108,6 +121,7 @@ p = L // 2 + 37
 g = torch.Generator().manual_seed(1)
 x2 = X[:1, :L].clone(); x2[:, p:] = torch.randint(0, inp.vocab_size, (1, L - p), generator=g).cuda()
 for train in (False, True):
+    run("triton", X[:1, :L], train)       # warm: first call captures the selection CUDA graphs (consumes RNG)
     A, _ = run("triton", X[:1, :L], train); A2, _ = run("triton", X[:1, :L], train); Bb, _ = run("triton", x2, train)
     rep(f"{'train' if train else 'eval'} reproducible", (A - A2).abs().max().item() == 0.0)
     past = (A[:, :p] - Bb[:, :p]).abs().max().item(); fut = (A[:, p:] - Bb[:, p:]).abs().max().item()

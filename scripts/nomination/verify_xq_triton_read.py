@@ -58,7 +58,9 @@ rep("eval logits (vs the 1e-3 noise baseline)", d999 < 2.0 and frac < 0.1,
     f"max|dlogit| {d:.3e}, 99.9th pct {d999:.3e}, positions > 0.25: {frac:.2e}")
 rep("eval NLL", dn < 2e-3, f"per-seq NLL gather {nll['gather'].round(4).tolist()} triton {nll['triton'].round(4).tolist()}")
 
-print("2. train step: loss, KL, gradients")
+print("2. train step: loss, KL, gradients (KL over ALL queries in both paths: the triton path draws")
+print("   its KL sample at selection time, the gather path inside the KL -- different RNG streams)")
+m.xq_index_loss_queries = 0
 G = {}
 for kn in ("gather", "triton"):
     mode(kn); m.train(); m.zero_grad(set_to_none=True)
@@ -86,6 +88,7 @@ for gname, f in groups.items():
     cos = F.cosine_similarity(a, b, dim=0).item(); r = (b.norm() / a.norm().clamp(min=1e-12)).item()
     rep(f"grad {gname}", cos > 0.99 and abs(r - 1) < 0.05, f"cos {cos:.5f} norm ratio {r:.4f} ({len(ns)} tensors)")
 
+m.xq_index_loss_queries = 1024
 print("3. causal (triton)")
 mode("triton")
 p = L // 2 + 37

@@ -2862,6 +2862,7 @@ class HierarchicalFlowGAT(nn.Module):
         xq_read_kernel: str = "gather",                  # descent read: gather (torch) | triton (fused)
         xq_select_kernel: str = "torch",                 # descent levels: torch loop | triton (fused)
         xq_read_merge: bool = False,                     # v2: picks LSE-merged into the packed softmax
+        xq_descent_exclude_band: bool = False,           # read levels: no candidate inside the packed band
         # Per-query differentiable relevance gate: hqd read output scaled by
         # sigmoid(w * stage1_top_score + b). Gives queries a no-op option (the ungated read
         # HURT never-recurring tokens by ~1.6% on the 100ep run) AND routes a task gradient
@@ -5559,6 +5560,16 @@ class HierarchicalFlowGAT(nn.Module):
         # scored like the static block's far keys (unrotated tail + level bias), disjoint
         # from the band / static block / chunk slots by exclusion, no sink, no sparse_out_proj
         self.xq_read_merge = bool(xq_read_merge)
+        # selection-time band exclusion: at the READ levels a node the query's packed window
+        # already holds (0 <= q_row - row <= local_pack_window) is not a candidate, so the
+        # whole top-k budget lands outside the band (read-time exclusion only DROPPED those
+        # picks). Navigation is unaffected in practice: children close earlier than their
+        # parent, so an out-of-band parent has only out-of-band children.
+        self.xq_descent_exclude_band = bool(xq_descent_exclude_band)
+        if self.xq_descent_exclude_band and not (self.xq_descent_enable and self.local_pack_cross_level
+                                                 and int(self.local_pack_window or 0) > 0):
+            raise ValueError("xq_descent_exclude_band needs xq_descent_enable and a packed window "
+                             "(local_pack_cross_level, local_pack_window > 0)")
         if self.xq_read_merge:
             _need = {"xq_descent_enable": self.xq_descent_enable, "xq_read_kernel triton": self.xq_read_kernel == "triton",
                      "xq_descent_read gather": self.xq_descent_read == "gather",
@@ -8527,6 +8538,8 @@ class HierarchicalFlowGAT(nn.Module):
             j += 2 * nl
         if ctx["has_prior"]:
             sal_a = ins[j]
+        band = ctx.get("band", None)          # (ins index of node -> packed row, window) or None
+        inv = ins[band[0]] if band is not None else None
         q_pos = torch.arange(n0, device=dev)
         levels_rec = []
         CH = 4096              # query chunk: bounds the [B, CH, n_l] score transient (bf16, ~0.5 GB at L0 16k)
@@ -8536,14 +8549,17 @@ class HierarchicalFlowGAT(nn.Module):
             tl = t[o[lvl]:o[lvl + 1]]
             if (ctx.get("sel_kernel") and par is not None and lvl >= fl and sal_a is None
                     and self.xq_descent_read != "staircase"
-                    and int(par.size(-1)) * int(tabs[lvl + 1].size(-1)) <= 128):
+                    and int(par.size(-1)) * int(tabs[lvl + 1].size(-1)) <= 1024):
                 # fused level (layers/descent_select.py): children -> mask -> dedup -> score
                 # only the candidates -> top-k, per query in registers (no [n0, n_l] GEMM)
                 from .layers.descent_select import descent_level_select
                 kk = min(k_keep, int(par.size(-1)) * int(tabs[lvl + 1].size(-1)))
+                _bm = 1 if (band is not None and lvl in read_levels) else 0
                 kept, keep_par = descent_level_select(
                     q_all, k_lv[lvl], par, tabs[lvl + 1], tl, q_t, kk, scale, tau, allow_same,
-                    lvl == 0, int(self.xq_descent_local_exclude))
+                    lvl == 0, int(self.xq_descent_local_exclude),
+                    prow_l=inv[o[lvl]:o[lvl + 1]] if _bm else None, qrow=inv[o[0]:o[1]] if _bm else None,
+                    band_w=band[1] if _bm else 0, band_mode=_bm)
                 levels_rec.append((lvl, kept, keep_par))
                 par = kept
                 continue
@@ -8591,6 +8607,9 @@ class HierarchicalFlowGAT(nn.Module):
                 ok &= (tc <= qt) if allow_same else (tc < qt)
                 if lvl == 0:
                     ok &= safe <= (q_pos[s0:e0].view(1, -1, 1) - int(self.xq_descent_local_exclude))
+                if band is not None and lvl in read_levels:
+                    _dr = inv[o[0] + s0:o[0] + e0].view(1, -1, 1) - inv[o[lvl]:o[lvl + 1]][safe]
+                    ok &= ~((_dr >= 0) & (_dr <= band[1]))
                 if below:
                     # salience of each child (available ones; others neutral 0) or recency
                     if self.xq_descent_l0_by_salience:
@@ -8728,6 +8747,20 @@ class HierarchicalFlowGAT(nn.Module):
             ins += [sal_w[l] for l in range(nl)] + [sal[1][l] for l in range(nl)]
         if sal_a is not None:
             ins += [sal_a]
+        if self.xq_descent_exclude_band:
+            # node -> packed row (the layers' cached pack spec; same inverse the merge uses)
+            _sc = getattr(self, "_local_pack_spec_cache", None)
+            _sp = _sc[1] if _sc is not None else None
+            if _sp is None or int(_sp["num_nodes"]) != int(o[-1]):
+                raise RuntimeError("xq_descent_exclude_band: no packed spec for this geometry")
+            _inv = _sp.get("xq_inv_perm", None)
+            if _inv is None:
+                _pm = _sp["perm"]
+                _inv = torch.empty_like(_pm)
+                _inv[_pm] = torch.arange(int(_pm.numel()), device=_pm.device, dtype=_pm.dtype)
+                _sp["xq_inv_perm"] = _inv
+            ctx["band"] = (len(ins), int(_sp["window"]))
+            ins += [_inv]
         _graphed = bool(self.xq_select_cuda_graph) and x.is_cuda
         if _graphed:
             levels_rec, cand_abs = self._xq_select_graphed(ins, ctx)
@@ -8746,6 +8779,11 @@ class HierarchicalFlowGAT(nn.Module):
                     # forward must stay sync-free so it can be captured as a CUDA graph
                     self._last_xq_nom_count = int(has_any.sum())
                     self._last_xq_nom_queries = int(has_any.any(-1).any(0).sum())
+        # the indexer KL's query sample, drawn HERE so a fused read computes the per-pick
+        # attention only for these rows (_xq_index_loss takes the (sel, mass) form)
+        _nq = int(self.xq_index_loss_queries)
+        self._xq_kl_sel = (torch.randperm(n0, device=dev)[:_nq].sort().values
+                           if (self.training and 0 < _nq < n0 and self.xq_read_kernel == "triton") else None)
         self._xq_desc_record = {"levels": levels_rec, "read_levels": col_map,
                                 "q": q_all, "k": k_lv, "scale": scale, "o": o,
                                 "q_t": q_t, "allow_same": allow_same,
@@ -16849,6 +16887,7 @@ class HierarchicalFlowGAT(nn.Module):
                                 _xq_fed_mp._xq_read_ckpt = bool(self.xq_read_ckpt)
                                 _xq_fed_mp._xq_read_fp32 = True
                                 _xq_fed_mp._xq_read_kernel = self.xq_read_kernel
+                                _xq_fed_mp._xq_kl_sel = getattr(self, "_xq_kl_sel", None)
                                 _xq_fed_mp._xq_merge = (self._xq_nom_edges[1] if self.xq_read_merge
                                                         else None)
                                 _xq_fed_mp._xq_level_tags = True
@@ -17030,6 +17069,7 @@ class HierarchicalFlowGAT(nn.Module):
                     _xq_fed_mp._xq_stair = None
                     _xq_fed_mp._xq_far = None
                     _xq_fed_mp._xq_merge = None
+                    _xq_fed_mp._xq_kl_sel = None
                     if self.training and _mass is not None:
                         _l = self._xq_index_loss(_mass)
                         if _l is not None:
