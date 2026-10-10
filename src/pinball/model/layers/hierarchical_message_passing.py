@@ -4400,6 +4400,18 @@ class HierarchicalMessagePassing(MessagePassing):
             )
         _store_mass = bool(getattr(self, "_xq_store_read_mass", False))
         _ckpt = bool(getattr(self, "_xq_read_ckpt", False)) and self.training and torch.is_grad_enabled()
+        if (str(getattr(self, "_xq_read_kernel", "gather")) == "triton" and contig and q.is_cuda
+                and v_dim == head_dim):
+            # xq descent, fused Triton read (xq_read_kernel: triton): the same per-query math
+            # with no materialised gather; the sink is one extra zero-value key row
+            msg, p_mass = self._xq_read_triton(q[:, d0:d0 + Q], k, v, candidate_nodes, _store_mass)
+            out_buf = torch.zeros((int(B), int(num_nodes), num_heads, v_dim), device=device, dtype=q.dtype)
+            out_buf[:, d0:d0 + Q] = msg.to(q.dtype)
+            out = self.sparse_out_proj(out_buf.reshape(int(B), int(num_nodes), num_heads * v_dim))
+            if _store_mass:
+                self._xq_read_mass = p_mass
+            self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
+            return out
         masses: list = []
         if bool(getattr(self, "_xq_read_fp32", getattr(self, "_xq_read_ckpt", False))):
             # xq descent: gather K/V in fp32. Many queries pick the SAME coarse rows, so the
@@ -4455,6 +4467,28 @@ class HierarchicalMessagePassing(MessagePassing):
             self._xq_read_mass = torch.cat(masses, dim=1) if len(masses) > 1 else masses[0]
         self._last_hqd_apply_ms = (time.monotonic() - _t0) * 1000.0 if profile_enabled else None
         return out
+
+    def _xq_read_triton(self, q_sl: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                        cand: torch.Tensor, store_mass: bool):
+        """Fused per-query read (layers/sparse_pick_attn.py) of _compute_hqd_packed_l0_attn's
+        contiguous xq path. q_sl [B, Q, H, D] (the L0 query slice), k/v [B, n_src, G, D], cand
+        [B, Q, K] node ids (-1 padding). The zero-value sink (hqd_read_sink_k, per head) rides
+        as key row n_src with a zero value row, picked by every query, so the softmax is the
+        gather path's [candidates | sink]. -> (msg [B, Q, H, D], head-mean candidate mass
+        [B, Q, K] detached, or None). Traced by the compiled layer: the kernels are registered
+        custom ops (pinball::sparse_pick_fwd / _bwd) with a sync-free backward."""
+        from .sparse_pick_attn import sparse_pick_attention
+        B, Q, H, D = (int(x) for x in q_sl.shape)
+        n_src, K = int(k.size(1)), int(cand.size(-1))
+        sink_k = getattr(self, "hqd_read_sink_k", None)
+        if sink_k is not None:
+            if int(k.size(2)) != H:
+                raise ValueError("xq_read_kernel triton with a read sink needs per-head k/v (G == H)")
+            k = torch.cat([k, sink_k.to(k.dtype).view(1, 1, H, D).expand(B, 1, H, D)], 1)
+            v = torch.cat([v, v.new_zeros(B, 1, H, int(v.size(-1)))], 1)
+            cand = torch.cat([cand, torch.full((B, Q, 1), n_src, dtype=cand.dtype, device=cand.device)], -1)
+        res = sparse_pick_attention(q_sl, k, v, cand, float(D) ** -0.5, return_p=store_mass)
+        return res[0], (res[2][..., :K] if store_mass else None)
 
     @torch._dynamo.disable
     def _xq_staircase_read(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -7906,8 +7940,8 @@ class HierarchicalMessagePassing(MessagePassing):
         # regardless of window.
         #
         # Deliberately ADDITIVE, matching the lane: a separate softmax summed in, not an
-        # LSE merge. The merge path double-counts keys present in both windows (a +ln2 bias)
-        # and measured WORSE than additive late in training on text. Additive also makes the
+        # LSE merge. The merge path double-counts keys present in both windows (a +ln2 bias);
+        # an old text A/B against additive was inconclusive (noise, dropout confound). Additive also makes the
         # overlap a non-issue: the ~28 coarse rows an L0 query already saw in its mixed
         # window are re-read here, which is duplicated FLOPs, not double-counted weight.
         # That duplication is bounded by the coarse bank being small and is not worth a

@@ -2859,6 +2859,8 @@ class HierarchicalFlowGAT(nn.Module):
         xq_far_kv_groups: int = 0,                       # grouped (MQA/GQA) far read; 0 = per-head k/v
         xq_read_ckpt: bool = True,                       # checkpoint the descent read per query chunk
         xq_select_cuda_graph: bool = False,              # descent selection as CUDA graphs
+        xq_read_kernel: str = "gather",                  # descent read: gather (torch) | triton (fused)
+        xq_select_kernel: str = "torch",                 # descent levels: torch loop | triton (fused)
         # Per-query differentiable relevance gate: hqd read output scaled by
         # sigmoid(w * stage1_top_score + b). Gives queries a no-op option (the ungated read
         # HURT never-recurring tokens by ~1.6% on the 100ep run) AND routes a task gradient
@@ -5539,6 +5541,18 @@ class HierarchicalFlowGAT(nn.Module):
         self.xq_read_ckpt = bool(xq_read_ckpt)
         # replay the descent selection as CUDA graphs (it is launch-bound); off = eager
         self.xq_select_cuda_graph = bool(xq_select_cuda_graph)
+        # descent read implementation: "gather" materialises each query chunk's picked K/V
+        # (torch); "triton" is the fused per-query sparse kernel (layers/sparse_pick_attn.py):
+        # same math -- the sink rides as one extra zero-value key row -- without the gather
+        self.xq_read_kernel = str(xq_read_kernel or "gather").lower()
+        if self.xq_read_kernel not in {"gather", "triton"}:
+            raise ValueError(f"xq_read_kernel must be 'gather' or 'triton', got {xq_read_kernel!r}")
+        # descent selection below the start level: "torch" = children + sort-dedup + GEMM over
+        # the whole level + column gather + topk; "triton" = one fused per-query kernel
+        # (layers/descent_select.py) scoring only the candidates. Same picks up to ties.
+        self.xq_select_kernel = str(xq_select_kernel or "torch").lower()
+        if self.xq_select_kernel not in {"torch", "triton"}:
+            raise ValueError(f"xq_select_kernel must be 'torch' or 'triton', got {xq_select_kernel!r}")
         self._xq_graph_cache: Dict[tuple, Any] = {}
         self._xq_graph_pool = None
         if self.xq_descent_read not in {"gather", "staircase"}:
@@ -8504,6 +8518,19 @@ class HierarchicalFlowGAT(nn.Module):
         for i, lvl in enumerate(range(start, -1, -1)):
             k_keep = beam[i] if lvl > 0 else int(self.xq_descent_topk_l0)
             tl = t[o[lvl]:o[lvl + 1]]
+            if (ctx.get("sel_kernel") and par is not None and lvl >= fl and sal_a is None
+                    and self.xq_descent_read != "staircase"
+                    and int(par.size(-1)) * int(tabs[lvl + 1].size(-1)) <= 128):
+                # fused level (layers/descent_select.py): children -> mask -> dedup -> score
+                # only the candidates -> top-k, per query in registers (no [n0, n_l] GEMM)
+                from .layers.descent_select import descent_level_select
+                kk = min(k_keep, int(par.size(-1)) * int(tabs[lvl + 1].size(-1)))
+                kept, keep_par = descent_level_select(
+                    q_all, k_lv[lvl], par, tabs[lvl + 1], tl, q_t, kk, scale, tau, allow_same,
+                    lvl == 0, int(self.xq_descent_local_exclude))
+                levels_rec.append((lvl, kept, keep_par))
+                par = kept
+                continue
             if par is None:
                 cand = torch.arange(sizes[lvl], device=dev).view(1, 1, -1).expand(B, n0, -1)
                 pslot = None
@@ -8675,7 +8702,8 @@ class HierarchicalFlowGAT(nn.Module):
 
         ctx = {"o": o, "sizes": sizes, "start": start, "beam": beam, "read_levels": read_levels, "tabs": tabs,
                "fl": fl, "tau": tau, "allow_same": allow_same, "B": B, "n0": n0, "scale": scale, "d": d,
-               "dev": dev, "has_sal": sal is not None, "has_prior": sal_a is not None}
+               "dev": dev, "has_sal": sal is not None, "has_prior": sal_a is not None,
+               "sel_kernel": self.xq_select_kernel == "triton" and x.is_cuda}
         if not any(l in read_levels for l in range(start, -1, -1)):
             return None
         col_map = [l for l in range(start, -1, -1) if l in read_levels]
@@ -8792,7 +8820,10 @@ class HierarchicalFlowGAT(nn.Module):
             use = (tot.squeeze(-1) > 1e-6) & (valid.sum(-1) > 1)
             # levels below the L1 stop were not chosen by the indexer: no KL there (their read
             # mass still flows up into the parents' subtree targets)
-            if bool(use.any()) and lvl in rec.get("index_levels", {lvl}):
+            # sync-free mode (xq_select_cuda_graph): no host read of `use`; a level with no
+            # usable query contributes 0 either way
+            _sf = bool(self.xq_select_cuda_graph)
+            if (_sf or bool(use.any())) and lvl in rec.get("index_levels", {lvl}):
                 safe = kept.clamp(min=0)
                 kg = k[lvl].gather(1, safe.reshape(B, -1, 1).expand(-1, -1, k[lvl].size(-1))).view(B, n0, kk, -1)
                 sc = (q.unsqueeze(2).float() * kg.float()).sum(-1) * scale
@@ -8807,7 +8838,11 @@ class HierarchicalFlowGAT(nn.Module):
                 logq = torch.log_softmax(sc.masked_fill(~valid, float("-inf")), dim=-1)
                 p = mass / tot.clamp(min=1e-12)
                 kl = (p * (torch.log(p.clamp(min=1e-12)) - logq)).masked_fill(~valid | (p <= 0), 0.0).sum(-1)
-                losses.append(kl[use].mean())
+                if _sf:
+                    _u = use.to(kl.dtype)
+                    losses.append((kl * _u).sum() / _u.sum().clamp(min=1.0))
+                else:
+                    losses.append(kl[use].mean())
             sub, below_par = mass, par_slot
         return torch.stack(losses).sum() if losses else None
 
@@ -16797,6 +16832,7 @@ class HierarchicalFlowGAT(nn.Module):
                                 _xq_fed_mp._xq_store_read_mass = bool(self.training)
                                 _xq_fed_mp._xq_read_ckpt = bool(self.xq_read_ckpt)
                                 _xq_fed_mp._xq_read_fp32 = True
+                                _xq_fed_mp._xq_read_kernel = self.xq_read_kernel
                                 _xq_fed_mp._xq_level_tags = True
                                 _st = self._xq_stair_state
                                 if _st is not None:
