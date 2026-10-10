@@ -245,7 +245,7 @@
 # is byte-identical to arm B, so this is a clean comparison against it.
 #
 # WHY FLEX HERE. Arm B runs local_pack_flex_union: false, inherited from cleaner_pack
-# where additive beat flex late-run. But the additive path normalises the window, the
+# where an inconclusive, dropout-confounded A/B favoured additive late-run. But the additive path normalises the window, the
 # coarse lane and the global block as SEPARATE softmaxes and adds them; flex_union is one
 # softmax over the union, with exact dedup. The mechanisms added below (content-selected
 # block, L0 rows in the block) are about WHICH keys a query sees, and they only mean what
