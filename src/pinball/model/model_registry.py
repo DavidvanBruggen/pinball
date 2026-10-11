@@ -391,6 +391,8 @@ def build_pinball_model(
         hier_level_qkv=str(getattr(args, "hier_level_qkv", "shared") or "shared"),
         hier_level_ffn=str(getattr(args, "hier_level_ffn", "shared") or "shared"),
         local_pack_upper_every=int(getattr(args, "local_pack_upper_every", 0) or 0),
+        local_pack_upper_start=(None if getattr(args, "local_pack_upper_start", None) is None
+                                else int(getattr(args, "local_pack_upper_start"))),
         local_pack_upper_depth=int(getattr(args, "local_pack_upper_depth", 1) or 1),
         local_pack_upper_budget=getattr(args, "local_pack_upper_budget", None),
         local_pack_upper_extend=int(getattr(args, "local_pack_upper_extend", 0) or 0),
@@ -399,6 +401,8 @@ def build_pinball_model(
         local_pack_upper_qkv=str(getattr(args, "local_pack_upper_qkv", "shared") or "shared"),
         local_pack_upper_ffn=str(getattr(args, "local_pack_upper_ffn", "shared") or "shared"),
         local_pack_upper_ffn_dim=int(getattr(args, "local_pack_upper_ffn_dim", 0) or 0),
+        local_pack_upper_qk_norm=(None if getattr(args, "local_pack_upper_qk_norm", None) is None
+                                  else bool(getattr(args, "local_pack_upper_qk_norm"))),
         flash_impl=str(getattr(args, "flash_impl", "auto") or "auto"),
         flash_nodropout_mode=str(getattr(args, "flash_nodropout_mode", "error") or "error"),
         local_pack_global_select=str(getattr(args, "local_pack_global_select", "levels")),

@@ -661,3 +661,4 @@ local_pack_upper_window: 32        # lane radius for extension levels
 local_pack_upper_qkv: shared       # shared | per_level
 local_pack_upper_ffn: shared       # shared | per_level
 local_pack_upper_ffn_dim: 0        # 0 = main-layer width; e.g. 4096 = fat
+local_pack_upper_qk_norm: false      # trained before the stage had q/k norm (2026-10-11); keeps its checkpoints exact

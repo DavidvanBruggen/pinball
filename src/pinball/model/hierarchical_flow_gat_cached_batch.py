@@ -491,6 +491,9 @@ class PinballUpperStageBlock(nn.Module):
                the per_level_ffn_dims semantics (inner ~ 8/3 * ffn_dim).
     Shared-QKV mode adds a zero-init level embedding to the normed input, BEFORE the rotation,
     so level identity reaches Q/K without the post-RoPE tag problem.
+    qk_norm:   per-head norm on q and k before RoPE, as the main layers' qk_norm (one weight
+               vector of head_dim shared across heads; per level when qkv_mode is per_level),
+               so the stage's logits are bounded instead of tracking its weight scale.
 
     Identity at init: every output projection and FFN down projection is zero-init (unlike
     a zero scalar gate, a zero matrix still receives gradient: dW = y^T g).
@@ -509,6 +512,8 @@ class PinballUpperStageBlock(nn.Module):
         ffn_mode: str = "shared",
         ffn_dim: int = 0,
         max_seq_len: int = 131072,
+        qk_norm: bool = False,
+        qk_norm_type: str = "rms",
     ):
         super().__init__()
         hidden_dim = int(hidden_dim)
@@ -530,6 +535,11 @@ class PinballUpperStageBlock(nn.Module):
         self.out_proj = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(n_q)])
         self.ffn = nn.ModuleList([PackedSwiGLUFFN(hidden_dim, ffn_dim=int(ffn_dim)) for _ in range(n_f)])
         self.level_emb = nn.Embedding(int(num_levels), hidden_dim) if n_q == 1 else None
+        self.qk_norm = bool(qk_norm)
+        if self.qk_norm:
+            _qk_kind = "layernorm" if str(qk_norm_type).lower().startswith("layer") else "rmsnorm"
+            self.q_head_norm = nn.ModuleList([make_norm(self.head_dim, norm_type=_qk_kind, eps=1e-6) for _ in range(n_q)])
+            self.k_head_norm = nn.ModuleList([make_norm(self.head_dim, norm_type=_qk_kind, eps=1e-6) for _ in range(n_q)])
         self.rope = RotaryPositionalEncoding(self.head_dim, max_seq_len=int(max_seq_len))
         self.drop = nn.Dropout(self.dropout_p)
         self.reset_identity()
@@ -562,6 +572,10 @@ class PinballUpperStageBlock(nn.Module):
             h = h + self.level_emb(row_level).unsqueeze(0).to(h.dtype)
         qkv = self._per_seg(self.qkv, h, segs, seg_mod)
         q, k, v = qkv.view(B, R, 3, self.num_heads, self.head_dim).unbind(2)
+        if self.qk_norm:
+            # cast back: autocast runs norms in fp32 (as the main layers' qk_norm)
+            q = self._per_seg(self.q_head_norm, q, segs, seg_mod).to(v.dtype)
+            k = self._per_seg(self.k_head_norm, k, segs, seg_mod).to(v.dtype)
         pos_rep = pos.view(1, R).expand(B, R).reshape(-1)
         q = self.rope.apply_rotary_pos_emb(q.reshape(B * R, self.num_heads, self.head_dim), pos_rep)
         k = self.rope.apply_rotary_pos_emb(k.reshape(B * R, self.num_heads, self.head_dim), pos_rep)
@@ -3007,6 +3021,9 @@ class HierarchicalFlowGAT(nn.Module):
         # unshared across stages), and written back. L0 never joins, so the stage costs a
         # small fraction of a main layer; the main layers keep sensing, the stage thinks.
         #   local_pack_upper_every      0 = off (no modules built = bit-identical)
+        #   local_pack_upper_start      first main layer the stage follows (then every
+        #       `every`); None = `every` (the historical schedule). Starting later lets the
+        #       main layers build token-derived coarse rows before the stage first writes them
         #   local_pack_upper_depth      blocks per stage
         #   local_pack_upper_budget     all-to-all CORE: whole levels top-down while their rows
         #       fit (null = local_pack_global_block, so core == global block by default)
@@ -3015,9 +3032,13 @@ class HierarchicalFlowGAT(nn.Module):
         #   local_pack_upper_from_level absolute override: every level >= this joins (wins
         #       over extend; must be >= 1)
         #   local_pack_upper_qkv / _ffn  shared | per_level;  _ffn_dim 0 = standard width
+        #   local_pack_upper_qk_norm    per-head q/k norm in the stage; None = follow qk_norm
+        #       (and qk_norm_type), like the main layers. false for stage checkpoints trained
+        #       before 2026-10-11 (they have no q/k norm weights)
         # Causal packs mask by (close time, level) -- the packed order -- so the stage is as
         # causal as the pack; bidirectional packs are unmasked in the core.
         local_pack_upper_every: int = 0,
+        local_pack_upper_start: Optional[int] = None,
         local_pack_upper_depth: int = 1,
         local_pack_upper_budget: Optional[int] = None,
         local_pack_upper_extend: int = 0,
@@ -3026,6 +3047,7 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_upper_qkv: str = "shared",
         local_pack_upper_ffn: str = "shared",
         local_pack_upper_ffn_dim: int = 0,
+        local_pack_upper_qk_norm: Optional[bool] = None,
         # L0 window flash implementation: auto (fa3 on Hopper else fa2, historical) |
         # fa2 | fa3 | fa4. Env PINBALL_FLASH_IMPL overrides. Process-wide (the resolved
         # backend is cached per device), so the LAST model constructed wins.
@@ -4876,6 +4898,8 @@ class HierarchicalFlowGAT(nn.Module):
 
         # Upper stage (see local_pack_upper_every). Off = nothing built.
         self.local_pack_upper_every = max(0, int(local_pack_upper_every or 0))
+        self.local_pack_upper_start = (self.local_pack_upper_every if local_pack_upper_start is None
+                                       else int(local_pack_upper_start))
         self.local_pack_upper_depth = max(1, int(local_pack_upper_depth or 1))
         self.local_pack_upper_budget = None if local_pack_upper_budget is None else max(0, int(local_pack_upper_budget))
         self.local_pack_upper_extend = max(0, int(local_pack_upper_extend or 0))
@@ -4884,6 +4908,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_upper_qkv = str(local_pack_upper_qkv or "shared").lower()
         self.local_pack_upper_ffn = str(local_pack_upper_ffn or "shared").lower()
         self.local_pack_upper_ffn_dim = max(0, int(local_pack_upper_ffn_dim or 0))
+        self.local_pack_upper_qk_norm = bool(qk_norm) if local_pack_upper_qk_norm is None else bool(local_pack_upper_qk_norm)
         self.upper_stage_blocks = None
         self._upper_stage_runs = 0
         if self.local_pack_upper_every > 0:
@@ -4908,7 +4933,11 @@ class HierarchicalFlowGAT(nn.Module):
                 _why.append("set local_pack_upper_budget (or local_pack_global_block, its default) "
                             "or local_pack_upper_from_level")
             _n_main = int(self.num_refinement_layers or 0)
-            _n_stages = (_n_main - 1) // self.local_pack_upper_every if _n_main > 1 else 0
+            _s0 = self.local_pack_upper_start
+            if _s0 < 1:
+                _why.append(f"local_pack_upper_start must be >= 1 (a stage follows a main layer), got {_s0}")
+            # stages follow layer steps _s0, _s0 + every, ... <= _n_main - 1 (never the last)
+            _n_stages = (_n_main - 1 - _s0) // self.local_pack_upper_every + 1 if 1 <= _s0 <= _n_main - 1 else 0
             if _n_stages <= 0:
                 _why.append(f"no stage fits: {_n_main} main layers, every {self.local_pack_upper_every} "
                             "(a stage never runs after the last layer)")
@@ -4934,16 +4963,18 @@ class HierarchicalFlowGAT(nn.Module):
                         ffn_mode=self.local_pack_upper_ffn,
                         ffn_dim=self.local_pack_upper_ffn_dim,
                         max_seq_len=self.max_seq_len,
+                        qk_norm=self.local_pack_upper_qk_norm,
+                        qk_norm_type=str(qk_norm_type),
                     )
                     for _ in range(self.local_pack_upper_depth)
                 ])
                 for _ in range(_n_stages)
             ])
             logger.info(
-                "Upper stage on: %d stages x %d blocks (every %d of %d layers), qkv %s, ffn %s (dim %d), "
-                "levels built %s.", _n_stages, self.local_pack_upper_depth, self.local_pack_upper_every,
-                _n_main, self.local_pack_upper_qkv, self.local_pack_upper_ffn,
-                self.local_pack_upper_ffn_dim, _levels)
+                "Upper stage on: %d stages x %d blocks (after layer %d, then every %d of %d layers), qkv %s, "
+                "ffn %s (dim %d), qk_norm %s, levels built %s.", _n_stages, self.local_pack_upper_depth,
+                self.local_pack_upper_start, self.local_pack_upper_every, _n_main, self.local_pack_upper_qkv,
+                self.local_pack_upper_ffn, self.local_pack_upper_ffn_dim, self.local_pack_upper_qk_norm, _levels)
 
         # Layer / RMS normalization
         self.layer_norm = make_norm(hidden_dim, norm_type=self.norm_type, eps=self.norm_eps)
@@ -17155,11 +17186,14 @@ class HierarchicalFlowGAT(nn.Module):
                 if per_layer_hook is not None:
                     x = per_layer_hook(x, int(layer_idx), int(entry_idx))
 
-                # Upper stage: after every k-th layer except the last (nothing would read it).
+                # Upper stage: after layer `start`, then every k-th layer, except the last
+                # (nothing would read it). start = every reproduces the historical schedule.
                 _ue = int(getattr(self, "local_pack_upper_every", 0) or 0)
+                _us = int(getattr(self, "local_pack_upper_start", _ue) or _ue)
                 if (_ue > 0 and self.upper_stage_blocks is not None
-                        and layer_step % _ue == 0 and layer_step < len(schedule_entries)):
-                    _si = layer_step // _ue - 1
+                        and layer_step >= _us and (layer_step - _us) % _ue == 0
+                        and layer_step < len(schedule_entries)):
+                    _si = (layer_step - _us) // _ue
                     if _si < len(self.upper_stage_blocks):
                         x = self._apply_upper_stage(x, base_nl, base_ar_time, _si)
                     elif not getattr(self, "_upper_stage_overrun_logged", False):

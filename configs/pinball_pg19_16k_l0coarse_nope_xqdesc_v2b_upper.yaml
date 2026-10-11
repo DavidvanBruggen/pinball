@@ -1115,3 +1115,4 @@ local_pack_upper_window: 32        # lane radius (own-level nodes) for the non-c
 local_pack_upper_qkv: per_level    # own Q/K/V/O per level, in every block
 local_pack_upper_ffn: per_level    # own SwiGLU per level, in every block
 local_pack_upper_ffn_dim: 0        # main-layer width
+local_pack_upper_qk_norm: false      # trained before the stage had q/k norm (2026-10-11); keeps its checkpoints exact

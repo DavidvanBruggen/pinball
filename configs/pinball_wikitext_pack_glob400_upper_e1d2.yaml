@@ -753,3 +753,4 @@ local_pack_upper_window: 32
 local_pack_upper_qkv: shared       # shared | per_level (per_level needs from_level: 1)
 local_pack_upper_ffn: shared       # shared | per_level
 local_pack_upper_ffn_dim: 0        # 0 = main-layer width
+local_pack_upper_qk_norm: false      # trained before the stage had q/k norm (2026-10-11); keeps its checkpoints exact
