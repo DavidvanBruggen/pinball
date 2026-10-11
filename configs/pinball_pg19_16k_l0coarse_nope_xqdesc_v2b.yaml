@@ -13,7 +13,11 @@
 #   +2.4 ms. KL per-pick mass now computed only for the 1024 sampled queries.
 # VERIFIED: verify_descent_select.py (band on: 0 in-band picks, == fp32 reference),
 #   verify_xq_merge.py, verify_sparse_pick.py, verify_xq_triton_read.py.
-# SCORES: (none yet)
+# SCORES (local Blackwell, 2026-10-11, 200 ep, 146.6k tok/s in training, 0 flex failures):
+#   best val ppl 21.56 @164 -- NEW BEST (nope_w640 21.74, descent 21.98, gqa 22.21, prope32 22.98).
+#   ep180-189 bucket ratio vs prope32: never 0.843, <128 0.962, 128-511 0.932, 512-2k 1.006,
+#   2k-8k 0.950, >8k 0.917; vs nope_w640 0.986/0.990/0.992/0.992/0.994/0.986 (ahead in every
+#   bucket). The 512-2k deficit of v2 (1.14x w640 at ep21) closed to 1.07x at ep21, 0.99x at end.
 # ============================================================================
 # ---- parent header (history) ----
 # ============================================================================
