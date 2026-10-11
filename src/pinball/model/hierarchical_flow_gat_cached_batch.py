@@ -483,7 +483,8 @@ class PinballUpperStageBlock(nn.Module):
     Rows are the upper levels' nodes in node order, i.e. level-major and ascending, so each
     level is one contiguous slice (`segs`) and per-level weights are a short loop of dense
     matmuls rather than a gather. Attention is ONE softmax over every upper row, restricted by
-    `mask` ([R, R] bool, True = attend; None = all-to-all). L0 never enters.
+    `mask` ([R, R] bool, True = attend; None = all-to-all). L0 enters only with
+    local_pack_upper_from_level 0 (short contexts; the mask is dense).
 
     qkv_mode:  shared | per_level  -- Q/K/V + output projection (and norm1) per level.
     ffn_mode:  shared | per_level  -- SwiGLU FFN (and norm2) per level.
@@ -3018,7 +3019,7 @@ class HierarchicalFlowGAT(nn.Module):
         # UPPER STAGE: extra compute cycles over the upper hierarchy only. After every
         # `every`-th main layer (never after the last), the upper levels' rows are sliced out
         # of node order, run through `depth` dedicated pre-norm blocks (PinballUpperStageBlock,
-        # unshared across stages), and written back. L0 never joins, so the stage costs a
+        # unshared across stages), and written back. L0 joins only on from_level 0, so the stage costs a
         # small fraction of a main layer; the main layers keep sensing, the stage thinks.
         #   local_pack_upper_every      0 = off (no modules built = bit-identical)
         #   local_pack_upper_start      first main layer the stage follows (then every
@@ -3028,9 +3029,12 @@ class HierarchicalFlowGAT(nn.Module):
         #   local_pack_upper_budget     all-to-all CORE: whole levels top-down while their rows
         #       fit (null = local_pack_global_block, so core == global block by default)
         #   local_pack_upper_extend     levels BELOW the core that also join, each reading its
-        #       same-level lane (+-local_pack_upper_window), its parents/children, and the core
+        #       same-level lane (+-local_pack_upper_window), its parents/children, and the core;
+        #       causal packs add the main graph's staggered read (most-recent CLOSED node of
+        #       every coarser level), since causality cuts every containing parent
         #   local_pack_upper_from_level absolute override: every level >= this joins (wins
-        #       over extend; must be >= 1)
+        #       over extend). 0 = L0 joins too (lane + staggered ancestors + core per token):
+        #       dense [R, R] mask, so short contexts only (R <= 16384) -- a test/ablation mode
         #   local_pack_upper_qkv / _ffn  shared | per_level;  _ffn_dim 0 = standard width
         #   local_pack_upper_qk_norm    per-head q/k norm in the stage; None = follow qk_norm
         #       (and qk_norm_type), like the main layers. false for stage checkpoints trained
@@ -4917,8 +4921,8 @@ class HierarchicalFlowGAT(nn.Module):
                            ("local_pack_upper_ffn", self.local_pack_upper_ffn)):
                 if _v not in ("shared", "per_level"):
                     _why.append(f"{_k} must be shared|per_level, got {_v!r}")
-            if self.local_pack_upper_from_level is not None and self.local_pack_upper_from_level < 1:
-                _why.append("local_pack_upper_from_level must be >= 1 (L0 never joins the stage)")
+            if self.local_pack_upper_from_level is not None and self.local_pack_upper_from_level < 0:
+                _why.append("local_pack_upper_from_level must be >= 0")
             if (self.local_pack_upper_from_level is None
                     and "per_level" in (self.local_pack_upper_qkv, self.local_pack_upper_ffn)):
                 # A budget-resolved core depends on the RUNTIME level sizes, but weights must
@@ -7630,8 +7634,11 @@ class HierarchicalFlowGAT(nn.Module):
         rows read the core, their same-level lane (+-local_pack_upper_window) and their
         parents/children (the pooling rule of _coarse_call_spec: parent j of level l owns
         level l-1 nodes [min(j*ratio, n-1), min(that + comp - 1, n-1)]); the core reads
-        everything. Causal packs additionally require key <= query in packed order
-        (close time, then level: lower levels first at equal close time). Content-independent,
+        everything. Causal packs cut every key that closes after its query (ties per
+        hier_ar_allow_same_time; disallowed = lower levels first at equal close time), which
+        removes every child -> containing-parent link, so each row also reads the most-recent
+        CLOSED node of every coarser stage level -- the staggered read of the main graph
+        (_downward_gather_plan). Bidi packs keep the containment links. Content-independent,
         so cached on tensor identity; the one host sync is on a cache miss."""
         N = int(x.size(1))
         key = (int(node_level.data_ptr()), N, str(x.device),
@@ -7643,7 +7650,8 @@ class HierarchicalFlowGAT(nn.Module):
         lvl = node_level.to(device=dev, dtype=torch.long)
         n_lv = int(getattr(self, "num_hier_levels", 1 + len(self.compression_ratios)))
         counts = torch.bincount(lvl, minlength=n_lv).tolist()
-        present = [l for l in range(1, len(counts)) if counts[l] > 0]
+        _l0 = 0 if self.local_pack_upper_from_level == 0 else 1     # L0 joins only on from_level 0
+        present = [l for l in range(_l0, len(counts)) if counts[l] > 0]
         if not present:
             self._upper_stage_spec_cache = (key, None)
             return None
@@ -7718,8 +7726,26 @@ class HierarchicalFlowGAT(nn.Module):
                      & (li.view(1, R) >= clo.view(R, 1)) & (li.view(1, R) <= chi.view(R, 1)))
             allow = allow | child | child.transpose(0, 1)
             if causal:
-                ok = pos * (len(counts) + 1) + rl
-                allow = allow & (ok.view(1, R) <= ok.view(R, 1))
+                # A containing parent closes at or after its child, so the causal cut removes
+                # every child -> parent link above. Restore the main graph's STAGGERED read
+                # (_downward_gather_plan): each row also reads the most-recent CLOSED node of
+                # every coarser stage level. Ties follow hier_ar_allow_same_time, as there: a
+                # node closing at t holds only tokens <= t, so reading it at close time t is
+                # leak-free; with ties disallowed, equal close times order lower levels first.
+                allow_same = bool(getattr(self, "hier_ar_allow_same_time", True))
+                ar = torch.arange(R, device=dev)
+                for (qa, qb), lq in zip(segs, stage):
+                    for (ma, mb), lm in zip(segs, stage):
+                        if lm <= lq:
+                            continue
+                        j = torch.searchsorted(pos[ma:mb].contiguous(), pos[qa:qb].contiguous(), right=allow_same) - 1
+                        ok_j = j >= 0
+                        allow[ar[qa:qb][ok_j], ma + j[ok_j]] = True
+                if allow_same:
+                    allow = allow & (pos.view(1, R) <= pos.view(R, 1))
+                else:
+                    ok = pos * (len(counts) + 1) + rl
+                    allow = allow & (ok.view(1, R) <= ok.view(R, 1))
             mask = allow.contiguous()
         spec = {
             "rows": rows, "slice": (r0, r1 + 1) if contiguous else None,
