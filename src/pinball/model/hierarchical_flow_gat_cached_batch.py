@@ -3078,6 +3078,7 @@ class HierarchicalFlowGAT(nn.Module):
         local_pack_global_nom_dim: int = 64,        # head only: bilinear nomination width
         local_pack_global_nom_gate: str = "raw",    # head only: raw | zscore (see the layer)
         local_pack_global_boost: str = "logit",     # head only: logit | key (see the layer)
+        local_pack_global_slot_memory: bool = False,  # head only: living slot memory (see the layer)
         local_pack_global_gumbel_norm: str = "raw", # head only: raw | chunk | prefix (see the layer)
         local_pack_global_select_impl: str = "dense",  # head only: dense | stream (see the layer)
         local_pack_global_nom_compile: bool = False,  # stream only: torch.compile the selector
@@ -3785,6 +3786,7 @@ class HierarchicalFlowGAT(nn.Module):
         self.local_pack_global_nom_dim = int(local_pack_global_nom_dim or 64)
         self.local_pack_global_nom_gate = str(local_pack_global_nom_gate or "raw").lower()
         self.local_pack_global_boost = str(local_pack_global_boost or "logit").lower()
+        self.local_pack_global_slot_memory = bool(local_pack_global_slot_memory)
         self.local_pack_global_gumbel_norm = str(local_pack_global_gumbel_norm or "raw").lower()
         self.local_pack_global_select_impl = str(local_pack_global_select_impl or "dense").lower()
         self.local_pack_global_nom_compile = bool(local_pack_global_nom_compile)
@@ -4666,6 +4668,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_dim=int(getattr(self, "local_pack_global_nom_dim", 64)),
                         local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
                         local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
+                        local_pack_global_slot_memory=bool(getattr(self, "local_pack_global_slot_memory", False)),
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
                         local_pack_global_select_impl=str(getattr(self, "local_pack_global_select_impl", "dense")),
                         local_pack_global_nom_compile=bool(getattr(self, "local_pack_global_nom_compile", False)),
@@ -4812,6 +4815,7 @@ class HierarchicalFlowGAT(nn.Module):
                         local_pack_global_nom_dim=int(getattr(self, "local_pack_global_nom_dim", 64)),
                         local_pack_global_nom_gate=str(getattr(self, "local_pack_global_nom_gate", "raw")),
                         local_pack_global_boost=str(getattr(self, "local_pack_global_boost", "logit")),
+                        local_pack_global_slot_memory=bool(getattr(self, "local_pack_global_slot_memory", False)),
                         local_pack_global_gumbel_norm=str(getattr(self, "local_pack_global_gumbel_norm", "raw")),
                         local_pack_global_select_impl=str(getattr(self, "local_pack_global_select_impl", "dense")),
                         local_pack_global_nom_compile=bool(getattr(self, "local_pack_global_nom_compile", False)),

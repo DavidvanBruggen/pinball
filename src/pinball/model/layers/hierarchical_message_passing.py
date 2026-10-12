@@ -1061,6 +1061,32 @@ def _nom_stream_compiled():
     return _NOM_STREAM_COMPILED
 
 
+class _ChainGather(torch.autograd.Function):
+    """y = x[idx] for an index that is injective except into one null row (a pointer-jump
+    step over linked lists, local_pack_global_slot_memory). Backward is a GATHER through
+    the inverse map instead of an atomic index_add (3.0 of 5.9 ms of the slot memory at
+    16k). inv[j] = the i with idx[i] == j, or len(idx) (a zero row) where there is none."""
+
+    @staticmethod
+    def forward(ctx, x, idx, inv):
+        ctx.save_for_backward(inv)
+        return x.index_select(0, idx)
+
+    @staticmethod
+    def backward(ctx, gy):
+        (inv,) = ctx.saved_tensors
+        return torch.cat([gy, gy.new_zeros(1, gy.size(1))]).index_select(0, inv), None, None
+
+
+def _chain_inverse(idx: torch.Tensor, n_x: int, nul: int) -> torch.Tensor:
+    """Inverse of an index injective outside `nul` -> [n_x]; unmapped -> len(idx). Writes for
+    idx == nul go to a dump slot (n_x), so the kept part is deterministic."""
+    m = int(idx.numel())
+    tgt = torch.where(idx == nul, torch.full_like(idx, n_x), idx)
+    inv = torch.full((n_x + 1,), m, dtype=idx.dtype, device=idx.device)
+    return inv.scatter(0, tgt, torch.arange(m, device=idx.device, dtype=idx.dtype))[:n_x]
+
+
 class HierarchicalMessagePassing(MessagePassing):
     """
     Custom message passing layer for hierarchical graphs with level awareness.
@@ -1224,6 +1250,17 @@ class HierarchicalMessagePassing(MessagePassing):
         # gradient into the nomination heads on top of the value gate. u is rotated at the
         # slot's position so the term stays relative, like every other key.
         local_pack_global_boost: str = "logit",
+        # LIVING SLOT MEMORY (head only, per-sequence chunk slots on the flex path). The
+        # nomination is untouched; only the slot VALUES change. Every query of tile c writes
+        # into the slots of its own tile, weighted by a softmax over that tile's live slots of
+        # the same far q.k the flex softmax scores them with (head-averaged, detached: the
+        # write follows the read), content A v_q (A [64, H], rank 64). Tile c then reads slot
+        # r as v_r + B (M / (S + 1)): M, S = the summed writes and weights r received in
+        # EARLIER tiles (an exclusive prefix along r's run of tiles, pointer jumping over each
+        # row's previous instance); B [H, 64] zero-init, so the arm starts bit-identical to
+        # plain slots. Causal by construction: tile c reads writes from rows < c*chunk only.
+        # Keys are unchanged, so what a slot is found by does not drift.
+        local_pack_global_slot_memory: bool = False,
         # EXPLORATION SCALE (head only, training only). "raw" (default): rank = w + tau*Gumbel on
         # the raw weight, so the heads can shrink exploration by growing |w|. "chunk": the noise
         # is scaled by each chunk's weight spread over its allowed candidates (stats detached),
@@ -1659,6 +1696,12 @@ class HierarchicalMessagePassing(MessagePassing):
                 raise ValueError("local_pack_global_select_impl='stream' does not support "
                                  "local_pack_global_region_cap yet")
         self.local_pack_global_boost = str(local_pack_global_boost or "logit").lower()
+        self.local_pack_global_slot_memory = bool(local_pack_global_slot_memory)
+        if self.local_pack_global_slot_memory and (
+                self.local_pack_global_nominator != "head"
+                or str(getattr(self, "local_pack_global_slot_read", "union")) != "union"):
+            raise ValueError("local_pack_global_slot_memory needs local_pack_global_nominator='head' "
+                             "and the union slot read (slots inside the flex softmax)")
         if self.local_pack_global_boost not in {"logit", "key"}:
             raise ValueError("local_pack_global_boost must be 'logit' or 'key', got "
                              f"{local_pack_global_boost!r}")
@@ -1730,6 +1773,12 @@ class HierarchicalMessagePassing(MessagePassing):
                     # (starts as "no boost", learns through ordinary key gradients). A
                     # [heads, head_dim] table, routed to AdamW by name in cli._build_optimizer.
                     self.nom_boost_u = nn.Parameter(torch.zeros(int(self.num_heads), int(self.head_dim)))
+                if self.local_pack_global_slot_memory:
+                    # rank-64 write (A, random) and read-out (B, zero = exact plain slots at
+                    # init); raw Parameters so the global Linear init cannot undo the zero.
+                    # The carry is 65 wide instead of H + 1: it is the memory's whole cost.
+                    self.nom_mem_a = nn.Parameter(torch.randn(self._SLOT_MEM_RANK, _H) * 0.02)
+                    self.nom_mem_b = nn.Parameter(torch.zeros(_H, self._SLOT_MEM_RANK))
                 self.local_pack_global_nom_dim = _d
             elif self.local_pack_global_nominator == "key":
                 self.global_nominate_vec = nn.Parameter(
@@ -6795,6 +6844,80 @@ class HierarchicalMessagePassing(MessagePassing):
             k = torch.cat([k[..., :-1], (bb * math.sqrt(D)).unsqueeze(-1)], -1)
         return k
 
+    _SLOT_MEM_RANK = 64
+
+    def _slot_memory(self, q_s: torch.Tensor, ks: torch.Tensor, vp: torch.Tensor,
+                     gsel) -> torch.Tensor:
+        """Living slot memory (local_pack_global_slot_memory) -> value delta [B, P, H, D].
+
+        q_s [B, H, n, D] packed queries; ks [B, P, H, D] the slot keys exactly as the flex
+        prefix uses them (boost, far keys); vp [B, n, H, D]; gsel the chunk-slot selection
+        (rows [B, P], P = nch*K, meta chunk/G/nch/ok). Tile c's queries are packed rows
+        [c*C, (c+1)*C) and its slots are instances [c*K, (c+1)*K).
+
+        1. writes: a[q, k] = head mean of the softmax over the tile's live slots of
+           q.k / sqrt(D) (the far score flex gives the slot), DETACHED; m_k = sum_q a[q, k]
+           A v_q (rank 64), s_k = sum_q a[q, k].
+        2. carry: each live instance's predecessor = the same row's instance in the latest
+           earlier tile (sort by (row, tile)); an inclusive prefix by pointer jumping, then
+           read at the predecessor -> the EXCLUSIVE prefix: only writes from earlier tiles,
+           never the tile's own queries (that would leak inside the tile). Every addition
+           combines instances of one row, so no other row's values enter a sum.
+        3. delta = B (M / (S + 1)).
+        Cost (16k, B=2, compiled, standalone): the carry dominated at width H + 1 = 385
+        (23.7 ms fwd+bwd per layer); hence rank 64 and the detached weights."""
+        B, H, n, D = (int(q_s.size(0)), int(q_s.size(1)), int(q_s.size(2)), int(q_s.size(3)))
+        meta = gsel[2]
+        C, K, nch = int(meta["chunk"]), int(meta["G"]), int(meta["nch"])
+        P = nch * K
+        r = int(self.nom_mem_a.size(0))
+        ok = meta["ok"].view(nch, K)
+        rows = gsel[0]
+        pad = nch * C - n
+        with torch.no_grad():
+            qt = F.pad(q_s.detach(), (0, 0, 0, pad)).view(B, H, nch, C, D)
+            kt = ks.detach().view(B, nch, K, H, D).permute(0, 3, 1, 2, 4)      # [B, H, nch, K, D]
+            sc = torch.einsum("bhcqd,bhckd->bhcqk", qt, kt).float() * (float(D) ** -0.5)
+            sc = sc.masked_fill(~ok.view(1, 1, nch, 1, K), torch.finfo(sc.dtype).min)
+            qv = (torch.arange(nch * C, device=q_s.device) < n).view(1, nch, C, 1)
+            a = torch.softmax(sc, -1).mean(1) * (ok.view(1, nch, 1, K) & qv).to(sc.dtype)  # [B, nch, C, K]
+        u = torch.matmul(vp.reshape(B, n, H * D), self.nom_mem_a.t().to(vp.dtype))  # [B, n, r]
+        ut = F.pad(u, (0, 0, 0, pad)).view(B, nch, C, r)
+        m = torch.einsum("bcqk,bcqr->bckr", a.to(ut.dtype), ut).float()        # [B, nch, K, r]
+        st = torch.cat([m, a.sum(2).unsqueeze(-1)], -1).reshape(B, P, r + 1)
+        # predecessor per instance: previous entry in (row, tile) order if it is the same row
+        tile = torch.arange(P, device=rows.device) // K
+        live = ok.view(1, P).expand(B, P)
+        key = torch.where(live, rows * nch + tile.view(1, P),
+                          (n + 1) * nch + torch.arange(P, device=rows.device).view(1, P))
+        order = torch.argsort(key, dim=1)
+        skey = key.gather(1, order)
+        srow, stile = skey // nch, skey % nch
+        same = torch.zeros_like(live)
+        # same row, live, and a STRICTLY earlier tile (a duplicate pick inside one tile must
+        # never chain, or the tile would read its own writes)
+        same[:, 1:] = ((srow[:, 1:] == srow[:, :-1]) & (stile[:, 1:] > stile[:, :-1])
+                       & live.gather(1, order)[:, 1:])
+        prev_sorted = torch.cat([order.new_full((B, 1), -1), order[:, :-1]], 1)
+        pred = torch.full_like(order, -1).scatter(1, order, torch.where(same, prev_sorted,
+                                                                         torch.full_like(order, -1)))
+        # flat row gathers (index_select on [B*P, r+1]): a dim-1 gather with an expanded
+        # index was 7.5 of 14 ms here. A missing predecessor points at a zero row (index B*P).
+        off = (torch.arange(B, device=rows.device) * P).view(B, 1)
+        nul = B * P
+        p = torch.where(pred >= 0, pred + off, torch.full_like(pred, nul)).reshape(-1)
+        p0 = p
+        inc = torch.cat([st.reshape(B * P, r + 1), st.new_zeros(1, r + 1)], 0)
+        pz = torch.cat([p, p.new_full((1,), nul)])
+        n_x = B * P + 1
+        for _ in range(max(1, (nch - 1).bit_length())):
+            # the null row stays zero (0 + 0); its gradient is dropped (a constant)
+            inc = inc + _ChainGather.apply(inc, pz, _chain_inverse(pz, n_x, nul))
+            pz = pz.index_select(0, pz)
+        exc = _ChainGather.apply(inc, p0, _chain_inverse(p0, n_x, nul)).view(B, P, r + 1)
+        mem = exc[..., :r] / (exc[..., r:] + 1.0)                              # [B, P, r]
+        return torch.matmul(mem.to(vp.dtype), self.nom_mem_b.t().to(vp.dtype)).view(B, P, H, D)
+
     def _flex_union_attn(
         self, qp: torch.Tensor, kp: torch.Tensor, vp: torch.Tensor, spec: Dict,
         causal: bool = True,
@@ -6849,6 +6972,9 @@ class HierarchicalMessagePassing(MessagePassing):
         _l0s = bool(gsel is not None and len(gsel) > 2 and gsel[2] is not None
                     and gsel[2].get("per_batch", False))
         _nope = int(getattr(self, "local_pack_far_nope_dims", 0) or 0) > 0
+        if self.local_pack_global_slot_memory and not _l0s:
+            raise RuntimeError("local_pack_global_slot_memory needs the per-sequence chunk slots "
+                               "(nominator head, union slot read) on the flex path")
         if _nope and not (_l0s or (gsel is None and spec.get("flex_kv_prefix", None) is not None)):
             raise RuntimeError("local_pack_far_nope_dims supports the static-block prefix "
                                "(levels) and static + per-sequence chunk slots only")
@@ -7297,6 +7423,8 @@ class HierarchicalMessagePassing(MessagePassing):
                 _ks = self._far_keys(_ks, _lv.index_select(0, gsel[0].reshape(-1)).view(_B0, -1))
             k_s = torch.cat([_kst, _ks, kp], 1).transpose(1, 2)
             _vsl = vp.gather(1, _ix)
+            if self.local_pack_global_slot_memory:
+                _vsl = _vsl + self._slot_memory(q_s, _ks, vp, gsel).to(_vsl.dtype)
             v_s = torch.cat([vp.index_select(1, _st), _vsl * _g if _g is not None else _vsl, vp],
                             1).transpose(1, 2)
         elif _pre is not None:
@@ -8808,6 +8936,7 @@ class HierarchicalTransformerLayer(nn.Module):
         local_pack_global_nom_dim: int = 64,  # head: bilinear nomination width
         local_pack_global_nom_gate: str = "raw",  # head: raw | zscore gate
         local_pack_global_boost: str = "logit",  # head: logit (detached) | key (query-conditioned)
+        local_pack_global_slot_memory: bool = False,  # head: living slot memory (tiles write into their slots)
         local_pack_global_gumbel_norm: str = "raw",  # head: raw | chunk | prefix (noise scale)
         local_pack_global_select_impl: str = "dense",  # head: dense | stream (linear selection)
         local_pack_global_nom_compile: bool = False,  # stream: compile the selector (train + CUDA eval)
@@ -8962,6 +9091,7 @@ class HierarchicalTransformerLayer(nn.Module):
             local_pack_global_nom_dim=local_pack_global_nom_dim,
             local_pack_global_nom_gate=local_pack_global_nom_gate,
             local_pack_global_boost=local_pack_global_boost,
+            local_pack_global_slot_memory=local_pack_global_slot_memory,
             local_pack_global_gumbel_norm=local_pack_global_gumbel_norm,
             local_pack_global_select_impl=local_pack_global_select_impl,
             local_pack_global_nom_compile=local_pack_global_nom_compile,

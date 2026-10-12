@@ -419,6 +419,7 @@ def build_pinball_model(
         local_pack_global_nom_dim=int(getattr(args, "local_pack_global_nom_dim", 64) or 64),
         local_pack_global_nom_gate=str(getattr(args, "local_pack_global_nom_gate", "raw") or "raw"),
         local_pack_global_boost=str(getattr(args, "local_pack_global_boost", "logit") or "logit"),
+        local_pack_global_slot_memory=bool(getattr(args, "local_pack_global_slot_memory", False)),
         local_pack_global_gumbel_norm=str(getattr(args, "local_pack_global_gumbel_norm", "raw") or "raw"),
         local_pack_global_select_impl=str(getattr(args, "local_pack_global_select_impl", "dense") or "dense"),
         local_pack_global_nom_compile=bool(getattr(args, "local_pack_global_nom_compile", False)),
