@@ -3,6 +3,7 @@
 One program per (batch, query) does what _xq_select_core's torch loop does for a level below
 the start level, in registers:
   children of the query's kept parents (window-rule table) -> causal / local-exclusion mask
+  (two-sided exclusion, no close-time rule, on bidirectional packs)
   -> indexer scores q . k_l[child] * scale over ONLY those candidates (+ Gumbel noise in
   training, drawn per NODE) -> top-k by repeated argmax (descending, like torch.topk), each
   pick retiring every slot of its node (dedup: a node reachable from two overlapping
@@ -21,7 +22,7 @@ def _desc_level_kernel(Q, KL, PAR, CH, TL, QT, PROW, QROW, OUT_ID, OUT_SLOT, SEE
                        n0, n_l, kp, Kc, scale, tau, excl, band_w,
                        D: tl.constexpr, DC: tl.constexpr, M: tl.constexpr, KK: tl.constexpr,
                        ALLOW_SAME: tl.constexpr, IS_L0: tl.constexpr, NOISE: tl.constexpr,
-                       BAND: tl.constexpr):
+                       BAND: tl.constexpr, CAUSAL: tl.constexpr):
     # Validity is carried as an int32 vector, never an i1 tensor reused as a 2-D mask: Triton
     # 3.6's RemoveLayoutConversions miscompiles i1 values that cross the 1-D / 2-D layouts.
     pid = tl.program_id(0)                        # = b * n0 + query
@@ -37,12 +38,16 @@ def _desc_level_kernel(Q, KL, PAR, CH, TL, QT, PROW, QROW, OUT_ID, OUT_SLOT, SEE
     safe = cid * okv.to(tl.int64)                 # cid where valid, else 0
     tc = tl.load(TL + safe)
     qt = tl.load(QT + i)
-    if ALLOW_SAME:
-        okv = okv * (tc <= qt).to(tl.int32)
-    else:
-        okv = okv * (tc < qt).to(tl.int32)
-    if IS_L0:
-        okv = okv * (cid <= i - excl).to(tl.int32)
+    if CAUSAL:
+        if ALLOW_SAME:
+            okv = okv * (tc <= qt).to(tl.int32)
+        else:
+            okv = okv * (tc < qt).to(tl.int32)
+        if IS_L0:
+            okv = okv * (cid <= i - excl).to(tl.int32)
+    elif IS_L0:
+        # bidirectional: no close-time rule; L0 picks at least excl tokens away on EITHER side
+        okv = okv * ((cid <= i - excl) | (cid >= i + excl)).to(tl.int32)
     if BAND > 0:
         # selection-time band exclusion: a node the packed window already gives this query
         # (0 <= q_row - row <= band_w causal, |.| <= band_w bidi) is not a candidate, so the
@@ -83,13 +88,15 @@ def _desc_level_kernel(Q, KL, PAR, CH, TL, QT, PROW, QROW, OUT_ID, OUT_SLOT, SEE
 def descent_level_select(q_all: torch.Tensor, k_l: torch.Tensor, par: torch.Tensor, ch: torch.Tensor,
                          t_l: torch.Tensor, q_t: torch.Tensor, kk: int, scale: float, tau: float,
                          allow_same: bool, is_l0: bool, local_exclude: int,
-                         prow_l=None, qrow=None, band_w: int = 0, band_mode: int = 0):
+                         prow_l=None, qrow=None, band_w: int = 0, band_mode: int = 0,
+                         causal: bool = True):
     """-> (kept [B, n0, kk] local node ids or -1, parent slot [B, n0, kk]).
     q_all [B, n0, d] indexer queries; k_l [B, n_l, d] indexer keys of the level; par [B, n0, kp]
     kept parents (local ids at level + 1, -1 padding); ch [n_{l+1}, Kc] children table (-1
     padding); t_l [n_l] close times; q_t [n0] query times. band_mode 1 (causal) / 2 (bidi):
     drop candidates with 0 <= qrow - prow_l <= band_w (|.| bidi) -- prow_l [n_l] the level's
-    packed rows, qrow [n0] the queries'. CUDA-graph safe (the noise seed is drawn on device)."""
+    packed rows, qrow [n0] the queries'. causal False (bidirectional packs): no close-time
+    rule, and the L0 exclusion is two-sided. CUDA-graph safe (the noise seed is drawn on device)."""
     B, n0, d = (int(x) for x in q_all.shape)
     n_l, kp, Kc = int(k_l.size(1)), int(par.size(-1)), int(ch.size(-1))
     M = max(16, triton.next_power_of_2(kp * Kc))
@@ -107,5 +114,5 @@ def descent_level_select(q_all: torch.Tensor, k_l: torch.Tensor, par: torch.Tens
         q_all.contiguous(), k_l.contiguous(), par.contiguous(), ch.contiguous(), t_l.contiguous(),
         q_t.contiguous(), prow_l, qrow, out_id, out_slot, seed, n0, n_l, kp, Kc, float(scale), float(tau),
         int(local_exclude), int(band_w), D=d, DC=16, M=M, KK=int(kk), ALLOW_SAME=bool(allow_same),
-        IS_L0=bool(is_l0), NOISE=noise, BAND=int(band_mode), num_warps=1)    # 1 warp: 0.07 ms (M 32) / 0.47 ms (L0, M 128, k 32) vs 0.33 / 1.69 at 4
+        IS_L0=bool(is_l0), NOISE=noise, BAND=int(band_mode), CAUSAL=bool(causal), num_warps=1)    # 1 warp: 0.07 ms (M 32) / 0.47 ms (L0, M 128, k 32) vs 0.33 / 1.69 at 4
     return out_id, out_slot

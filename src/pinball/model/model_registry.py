@@ -335,6 +335,7 @@ def build_pinball_model(
         xq_index_dim=int(getattr(args, "xq_index_dim", 64)),
         xq_index_gumbel=float(getattr(args, "xq_index_gumbel", 1.0)),
         lambda_xq_index=float(getattr(args, "lambda_xq_index", 1.0)),
+        xq_index_loss_to_hier_aux=bool(getattr(args, "xq_index_loss_to_hier_aux", False)),
         xq_index_loss_queries=int(getattr(args, "xq_index_loss_queries", 1024)),
         xq_descent_read=str(getattr(args, "xq_descent_read", "gather") or "gather"),
         xq_descent_tile=int(getattr(args, "xq_descent_tile", 128)),

@@ -1839,6 +1839,17 @@ class HierarchicalMessagePassing(MessagePassing):
         self.hier_node_dropout_rates = _nd
         self.hier_node_dropout_active = any(r > 0.0 for r in _nd)
         self.local_pack_bidirectional = bool(local_pack_bidirectional)
+        if self.local_pack_bidirectional and getattr(self, "local_pack_global_nominator", "key") == "head":
+            # BIDI NOMINATION: each chunk picks from rows outside its TWO-SIDED band (both
+            # directions), no availability rule. The stream selector and 'prefix' noise rest on
+            # NESTED causal candidate sets (a row that lost can never win later), which a
+            # two-sided band breaks -- refuse them rather than run a one-sided selector.
+            if str(getattr(self, "local_pack_global_select_impl", "dense")) == "stream":
+                raise ValueError("local_pack_global_select_impl='stream' needs causal (nested) candidate "
+                                 "sets; bidirectional packs use 'dense'")
+            if str(getattr(self, "local_pack_global_gumbel_norm", "raw")) == "prefix":
+                raise ValueError("local_pack_global_gumbel_norm='prefix' scales noise at a row's causal "
+                                 "activation chunk; bidirectional packs use 'raw' or 'chunk'")
         self.local_pack_rope_axial = bool(local_pack_rope_axial)
         if self.local_pack_level_bias:
             self.local_pack_level_k_emb = nn.Parameter(
@@ -6384,8 +6395,9 @@ class HierarchicalMessagePassing(MessagePassing):
         reg = self._nom_region_ids(spec, lvl_packed) if _cap > 0 else None
         # Candidate set, per-chunk allowed mask and live-slot count are pure geometry:
         # built once per skeleton (cached in the spec, shared by every layer).
+        _bidi = self._pack_is_bidi()
         _gk = ("nom_geom", C, W, K, self.local_pack_global_candidates,
-               _cap, int(self.local_pack_global_region_level) if _cap > 0 else 0)
+               _cap, int(self.local_pack_global_region_level) if _cap > 0 else 0, _bidi)
         _geo = spec.get(_gk, None)
         if _geo is None:
             gm = spec.get("global_block_mask", None)
@@ -6396,8 +6408,16 @@ class HierarchicalMessagePassing(MessagePassing):
                 cand = cand & (lvl_packed == 0)
             limit = (torch.arange(nch, device=dev) * C - W).clamp(min=0)      # [nch]
             idx = torch.arange(n, device=dev)
-            allowed = (cand.view(1, -1) & (idx.view(1, -1) < limit.view(-1, 1))
-                       & (spec["nom_avail"].view(1, -1) < limit.view(-1, 1)))  # [nch, n]
+            if _bidi:
+                # two-sided: outside every chunk query's +-W band, both directions (a row in
+                # [c*C - W, (c+1)*C - 1 + W] is already a band key of some query of chunk c);
+                # no availability rule -- nothing to leak, the open parent may score
+                hi = torch.arange(nch, device=dev) * C + C + W                  # first row past
+                allowed = cand.view(1, -1) & ((idx.view(1, -1) < limit.view(-1, 1))
+                                              | (idx.view(1, -1) >= hi.view(-1, 1)))
+            else:
+                allowed = (cand.view(1, -1) & (idx.view(1, -1) < limit.view(-1, 1))
+                           & (spec["nom_avail"].view(1, -1) < limit.view(-1, 1)))  # [nch, n]
             if _cap > 0:
                 # live slots = sum over regions of min(cap, allowed in region): geometry only
                 _cnt = torch.zeros(nch, 2 * n, dtype=torch.long, device=dev).scatter_add_(
@@ -6482,6 +6502,13 @@ class HierarchicalMessagePassing(MessagePassing):
                          "n_static": int(st.numel()), "static_rows": st, "per_batch": True}
 
     _NOM_STREAM_GROUP = 16   # chunks per running-top-K step (work ~ nch*K + 16*n, linear)
+
+    def _pack_is_bidi(self) -> bool:
+        """The packed attention's own causality test (see _apply_local_pack_out): two-sided
+        exactly when the runtime causal gates are off AND the pack is bidirectional."""
+        causal_rt = (bool(getattr(self, "local_attn_runtime_causal_gate", True))
+                     and bool(getattr(self, "l0_local_runtime_causal", self.l0_local_causal_default)))
+        return (not causal_rt) and bool(getattr(self, "local_pack_bidirectional", False))
 
     def _nom_stream_geom(self, spec: Dict, lvl_packed: torch.Tensor, C: int, W: int, K: int,
                          nch: int, n: int) -> Dict[str, Any]:
@@ -6847,7 +6874,7 @@ class HierarchicalMessagePassing(MessagePassing):
     _SLOT_MEM_RANK = 64
 
     def _slot_memory(self, q_s: torch.Tensor, ks: torch.Tensor, vp: torch.Tensor,
-                     gsel) -> torch.Tensor:
+                     gsel, qmask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Living slot memory (local_pack_global_slot_memory) -> value delta [B, P, H, D].
 
         q_s [B, H, n, D] packed queries; ks [B, P, H, D] the slot keys exactly as the flex
@@ -6864,6 +6891,8 @@ class HierarchicalMessagePassing(MessagePassing):
            never the tile's own queries (that would leak inside the tile). Every addition
            combines instances of one row, so no other row's values enter a sum.
         3. delta = B (M / (S + 1)).
+        qmask [n] (packed rows that read slots; None = all): rows that never read a slot write
+        nothing either (coarse queries alongside the coarse call).
         Cost (16k, B=2, compiled, standalone): the carry dominated at width H + 1 = 385
         (23.7 ms fwd+bwd per layer); hence rank 64 and the detached weights."""
         B, H, n, D = (int(q_s.size(0)), int(q_s.size(1)), int(q_s.size(2)), int(q_s.size(3)))
@@ -6879,7 +6908,10 @@ class HierarchicalMessagePassing(MessagePassing):
             kt = ks.detach().view(B, nch, K, H, D).permute(0, 3, 1, 2, 4)      # [B, H, nch, K, D]
             sc = torch.einsum("bhcqd,bhckd->bhcqk", qt, kt).float() * (float(D) ** -0.5)
             sc = sc.masked_fill(~ok.view(1, 1, nch, 1, K), torch.finfo(sc.dtype).min)
-            qv = (torch.arange(nch * C, device=q_s.device) < n).view(1, nch, C, 1)
+            qv = (torch.arange(nch * C, device=q_s.device) < n)
+            if qmask is not None:
+                qv = qv & F.pad(qmask, (0, pad))
+            qv = qv.view(1, nch, C, 1)
             a = torch.softmax(sc, -1).mean(1) * (ok.view(1, nch, 1, K) & qv).to(sc.dtype)  # [B, nch, C, K]
         u = torch.matmul(vp.reshape(B, n, H * D), self.nom_mem_a.t().to(vp.dtype))  # [B, n, r]
         ut = F.pad(u, (0, 0, 0, pad)).view(B, nch, C, r)
@@ -6980,6 +7012,18 @@ class HierarchicalMessagePassing(MessagePassing):
                                "(levels) and static + per-sequence chunk slots only")
         # far NoPE changes the static/band dedup (band-near static rows go through the band)
         _bm_key = _bm_key + (("far_nope",) if _nope else ())
+        # CHUNK SLOTS + COARSE CALL (highway / level lanes). The coarse call is disjoint from
+        # the union by construction (band + static prefix), but a coarse query's chunk slots
+        # can sit inside its highway span -- two keys for one row. Coarse queries therefore
+        # read no slots: they already see their whole span at full resolution, and the slots
+        # exist for the L0 queries' far reads. (Before, chunk slots silently DROPPED the
+        # coarse call; no config combined them.)
+        _rmode0 = str(spec.get("flex_ring_merge", "union"))
+        _ccl = bool(_l0s and spec.get("flex_cc", None) is not None
+                    and not (_rmode0 in ("additive", "lse") and "flex_ring_perm" in spec))
+        if _ccl:
+            _bm_key = _bm_key + ("slots_l0_only",)
+            _ql0 = (spec["levels"] == 0).contiguous()             # packed order = query order
         if _l0s:
             _bm_key = _bm_key + ("l0chunk", int(gsel[2]["G"]), int(gsel[2]["chunk"]),
                                  int(gsel[2]["n_static"]), int(gsel[0].size(1)),
@@ -7119,6 +7163,8 @@ class HierarchicalMessagePassing(MessagePassing):
                             st = st & ~sb
                         kc = _flex_idx_clamp(ki - _S2, 0, _PC - 1)
                         pre = ((kc // _G2) == (qi // _C2)) & _ok2[kc]
+                        if _ccl:
+                            pre = pre & _ql0[qi]
                         p = _flex_idx_clamp(ki - _P2, 0, _nq2 - 1)
                         dr = qi - p
                         band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
@@ -7145,7 +7191,11 @@ class HierarchicalMessagePassing(MessagePassing):
                     # topk over an all-masked row -- which returns arbitrary indices that can
                     # point at FUTURE rows. Do not rely on a derived invariant for causality
                     # when the direct test is one comparison.
-                    pre = same & _ok2[kpre] & (qi >= _rows2[kpre])
+                    pre = same & _ok2[kpre]
+                    if _ccl:
+                        pre = pre & _ql0[qi]
+                    if causal_mask:
+                        pre = pre & (qi >= _rows2[kpre])
                     p = _flex_idx_clamp(ki - _P2, 0, _nq2 - 1)
                     dr = qi - p
                     band = (dr >= 0) & (dr <= w_mix) if causal_mask else (dr.abs() <= w_mix)
@@ -7424,7 +7474,8 @@ class HierarchicalMessagePassing(MessagePassing):
             k_s = torch.cat([_kst, _ks, kp], 1).transpose(1, 2)
             _vsl = vp.gather(1, _ix)
             if self.local_pack_global_slot_memory:
-                _vsl = _vsl + self._slot_memory(q_s, _ks, vp, gsel).to(_vsl.dtype)
+                _vsl = _vsl + self._slot_memory(q_s, _ks, vp, gsel,
+                                                qmask=_ql0 if _ccl else None).to(_vsl.dtype)
             v_s = torch.cat([vp.index_select(1, _st), _vsl * _g if _g is not None else _vsl, vp],
                             1).transpose(1, 2)
         elif _pre is not None:
@@ -7499,7 +7550,8 @@ class HierarchicalMessagePassing(MessagePassing):
         _ring = _rmode in ("additive", "lse") and "flex_ring_perm" in spec
         # Coarse call: prefix layout only (identity queries, so union row == packed row), and
         # the model refuses the knobs without a levels-mode global block and without rings.
-        _cc = spec.get("flex_cc", None) if (_pre is not None and gsel is None and not _ring) else None
+        _cc = (spec.get("flex_cc", None)
+               if (_pre is not None and (gsel is None or _ccl) and not _ring) else None)
         _lse = (_ring and _rmode == "lse") or (_cc is not None)
         # nomination KL (training): the main call's LSE gives the slot mass exactly, provided
         # the slots' scores are plain q.k (no score_mod) and no ring shares the softmax

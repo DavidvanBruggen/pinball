@@ -2856,10 +2856,17 @@ class HierarchicalFlowGAT(nn.Module):
         xq_descent_topk_l0: int = 32,
         xq_descent_start_level: int = -1,                  # -1 = lowest static-block level
         xq_descent_read_levels: Optional[Sequence[int]] = None,  # None = every level below start
-        xq_descent_local_exclude: int = 128,               # L0 picks must be >= this far back
+        xq_descent_local_exclude: int = 128,               # L0 picks must be >= this far back (either side, bidi)
         xq_index_dim: int = 64,
         xq_index_gumbel: float = 1.0,
         lambda_xq_index: float = 1.0,
+        # HOSTS WITHOUT pinball-train (ChromScape): the indexer trains ONLY through
+        # _last_xq_index_loss, which only train/trainer.py adds. True folds
+        # lambda_xq_index * that loss into _last_hier_aux_loss (the channel the notebook
+        # already reads, scaled there by its hier_aux_weight) and clears _last_xq_index_loss,
+        # so it is never counted twice. Refused together with use_aux_loss (one logged value,
+        # two objectives -- the PC rule).
+        xq_index_loss_to_hier_aux: bool = False,
         xq_index_loss_queries: int = 1024,               # queries sampled per round for the KL (0 = all)
         xq_descent_read: str = "gather",                 # gather (per-query) | staircase (tile union, flex)
         xq_descent_tile: int = 128,                      # staircase: queries per tile
@@ -3762,8 +3769,16 @@ class HierarchicalFlowGAT(nn.Module):
                 _why.append("local_pack_global_block must be > 0 (the call is built on the prefix layout)")
             if local_pack_ring_windows and any(int(v) > 0 for v in local_pack_ring_windows):
                 _why.append("local_pack_ring_windows must be off (it owns the other lse slot)")
-            if str(local_pack_global_select).lower() != "levels":
-                _why.append("local_pack_global_select must be 'levels' (the key exclusion uses the static block)")
+            if str(local_pack_global_select).lower() != "levels" and not (
+                    str(local_pack_global_select).lower() == "content"
+                    and str(local_pack_global_coarse).lower() == "levels"
+                    and str(local_pack_global_nominator).lower() == "head"):
+                # chunk slots (head nominator, coarse 'levels') keep the static block as the
+                # prefix, so the exclusion still holds; their coarse queries read no slots
+                # (see _flex_union_attn), which keeps the two calls disjoint
+                _why.append("local_pack_global_select must be 'levels', or 'content' with the head "
+                            "nominator and local_pack_global_coarse 'levels' (the key exclusion uses "
+                            "the static block)")
             if _why:
                 raise ValueError("local_pack_level_windows / local_pack_down_highway: " + "; ".join(_why))
             logger.info("Coarse call on: level windows %s, down highway %s.", _lw, self.local_pack_down_highway)
@@ -5530,6 +5545,10 @@ class HierarchicalFlowGAT(nn.Module):
         self.xq_index_dim = max(8, int(xq_index_dim))
         self.xq_index_gumbel = float(xq_index_gumbel)
         self.lambda_xq_index = float(lambda_xq_index)
+        self.xq_index_loss_to_hier_aux = bool(xq_index_loss_to_hier_aux)
+        if self.xq_index_loss_to_hier_aux and bool(use_aux_loss):
+            raise ValueError("xq_index_loss_to_hier_aux and use_aux_loss are both set: the indexer KL "
+                             "would be summed with the consistency aux into one logged value")
         self.xq_index_loss_queries = max(0, int(xq_index_loss_queries))
         self._last_xq_index_loss: Optional[torch.Tensor] = None
         self._xq_desc_record = None
@@ -5559,6 +5578,9 @@ class HierarchicalFlowGAT(nn.Module):
         # candidate (the gather arm); "tile" = shared per (tile, candidate), so a tile's queries
         # explore alike and its union stays small (staircase read only)
         self.xq_descent_noise = str(xq_descent_noise or "query").lower()
+        if self.xq_descent_read == "staircase" and bool(getattr(self, "local_pack_bidirectional", False)):
+            raise ValueError("xq_descent_read='staircase' is a causal (first-voter) mask; "
+                             "bidirectional packs use the gather read")
         if self.xq_descent_noise not in {"query", "tile"}:
             raise ValueError(f"xq_descent_noise must be 'query' or 'tile', got {xq_descent_noise!r}")
         # SALIENCE (nope's hierarchy nomination weight, per node): w(c) = <Q(x_parent), K(x_c)>
@@ -8601,6 +8623,7 @@ class HierarchicalFlowGAT(nn.Module):
             sal_a = ins[j]
         band = ctx.get("band", None)          # (ins index of node -> packed row, window) or None
         inv = ins[band[0]] if band is not None else None
+        causal = bool(ctx.get("causal", True))   # False on bidirectional packs (see the nominate)
         q_pos = torch.arange(n0, device=dev)
         levels_rec = []
         CH = 4096              # query chunk: bounds the [B, CH, n_l] score transient (bf16, ~0.5 GB at L0 16k)
@@ -8615,12 +8638,12 @@ class HierarchicalFlowGAT(nn.Module):
                 # only the candidates -> top-k, per query in registers (no [n0, n_l] GEMM)
                 from .layers.descent_select import descent_level_select
                 kk = min(k_keep, int(par.size(-1)) * int(tabs[lvl + 1].size(-1)))
-                _bm = 1 if (band is not None and lvl in read_levels) else 0
+                _bm = (1 if causal else 2) if (band is not None and lvl in read_levels) else 0
                 kept, keep_par = descent_level_select(
                     q_all, k_lv[lvl], par, tabs[lvl + 1], tl, q_t, kk, scale, tau, allow_same,
                     lvl == 0, int(self.xq_descent_local_exclude),
                     prow_l=inv[o[lvl]:o[lvl + 1]] if _bm else None, qrow=inv[o[0]:o[1]] if _bm else None,
-                    band_w=band[1] if _bm else 0, band_mode=_bm)
+                    band_w=band[1] if _bm else 0, band_mode=_bm, causal=causal)
                 levels_rec.append((lvl, kept, keep_par))
                 par = kept
                 continue
@@ -8665,12 +8688,18 @@ class HierarchicalFlowGAT(nn.Module):
                 safe = c.clamp(min=0)
                 tc = tl.index_select(0, safe.reshape(-1)).view_as(safe)
                 qt = q_t[s0:e0].view(1, -1, 1)
-                ok &= (tc <= qt) if allow_same else (tc < qt)
-                if lvl == 0:
-                    ok &= safe <= (q_pos[s0:e0].view(1, -1, 1) - int(self.xq_descent_local_exclude))
+                _ex = int(self.xq_descent_local_exclude)
+                if causal:
+                    ok &= (tc <= qt) if allow_same else (tc < qt)
+                    if lvl == 0:
+                        ok &= safe <= (q_pos[s0:e0].view(1, -1, 1) - _ex)
+                elif lvl == 0:
+                    # bidirectional: no close-time rule; L0 picks >= exclude tokens away, either side
+                    _dq = safe - q_pos[s0:e0].view(1, -1, 1)
+                    ok &= (_dq <= -_ex) | (_dq >= _ex)
                 if band is not None and lvl in read_levels:
                     _dr = inv[o[0] + s0:o[0] + e0].view(1, -1, 1) - inv[o[lvl]:o[lvl + 1]][safe]
-                    ok &= ~((_dr >= 0) & (_dr <= band[1]))
+                    ok &= ~(((_dr >= 0) & (_dr <= band[1])) if causal else (_dr.abs() <= band[1]))
                 if below:
                     # salience of each child (available ones; others neutral 0) or recency
                     if self.xq_descent_l0_by_salience:
@@ -8764,7 +8793,9 @@ class HierarchicalFlowGAT(nn.Module):
         and the top beam[i] kept; at L0 the top xq_descent_topk_l0. A node is a candidate only
         if CLOSED before the query (ar_time rule of the pack) and, at L0, at least
         xq_descent_local_exclude tokens back. Children of a closed parent close earlier, so the
-        whole beam is causal by construction. Selection is no-grad (chunked over queries);
+        whole beam is causal by construction. BIDIRECTIONAL packs (local_pack_bidirectional):
+        no close-time rule, L0 picks >= xq_descent_local_exclude away on either side, the band
+        exclusion two-sided, and every node's salience available. Selection is no-grad (chunked over queries);
         the kept slots are re-scored WITH grad for the indexer loss.
 
         Returns the packed-read marker (zeros(1), candidates [B, n0, K] absolute node ids or
@@ -8793,13 +8824,18 @@ class HierarchicalFlowGAT(nn.Module):
         sal = None
         if self.xq_salience_prior or self.xq_salience_boost or self.xq_descent_l0_by_salience:
             sal = self._xq_salience(x, o, sizes, t, tabs)               # w WITH grad (boost path)
+        _causal = not bool(getattr(self, "local_pack_bidirectional", False))
+        if sal is not None and not _causal:
+            # bidirectional: every node's salience is usable by every query (availability 0;
+            # the prior, the boost and the indexer loss all test avail <= q_t)
+            sal = (sal[0], {l: torch.zeros_like(v) for l, v in sal[1].items()})
         sal_w = {l: w.detach() for l, w in sal[0].items()} if sal is not None else None
         sal_a = self.xq_sal_alpha.detach().float() if self.xq_salience_prior else None
 
         ctx = {"o": o, "sizes": sizes, "start": start, "beam": beam, "read_levels": read_levels, "tabs": tabs,
                "fl": fl, "tau": tau, "allow_same": allow_same, "B": B, "n0": n0, "scale": scale, "d": d,
                "dev": dev, "has_sal": sal is not None, "has_prior": sal_a is not None,
-               "sel_kernel": self.xq_select_kernel == "triton" and x.is_cuda}
+               "sel_kernel": self.xq_select_kernel == "triton" and x.is_cuda, "causal": _causal}
         if not any(l in read_levels for l in range(start, -1, -1)):
             return None
         col_map = [l for l in range(start, -1, -1) if l in read_levels]
@@ -17673,6 +17709,12 @@ class HierarchicalFlowGAT(nn.Module):
                     self._last_hier_aux_loss = (
                         self._last_hier_pc_loss if self._last_hier_aux_loss is None
                         else self._last_hier_aux_loss + self._last_hier_pc_loss)
+                if self.xq_index_loss_to_hier_aux and self._last_xq_index_loss is not None:
+                    # host route for the descent indexer (see the constructor knob)
+                    _xl = self.lambda_xq_index * self._last_xq_index_loss
+                    self._last_hier_aux_loss = (_xl if self._last_hier_aux_loss is None
+                                                else self._last_hier_aux_loss + _xl)
+                    self._last_xq_index_loss = None
                 self._last_hier_predaux_loss = self._compute_predictive_aux_loss(
                     self._latent_exit_norm_apply(x_tb, "predaux"), tb_lo)
                 self._last_sigreg_loss = self._compute_sigreg_loss(
