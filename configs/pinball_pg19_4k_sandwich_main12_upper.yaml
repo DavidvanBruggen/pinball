@@ -9,7 +9,7 @@
 #   same tokens, same 12 layers of depth -- does the stage learn more with the main layers
 #   doing the sensing? At 4k the core is L3-L5 (glob400), so L2 joins via lane + stagger.
 # Stage causal mask includes the staggered read (fixed 2026-10-11).
-# SCORES: (none yet)
+# SCORES: val ppl ep0-3 228.58 / 120.45 / 98.49 / 87.90 (182.2M params).
 # ============================================================================
 # ---- parent header (history) ----
 # ============================================================================

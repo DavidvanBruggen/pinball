@@ -15,7 +15,7 @@
 #   L1..L5) and the core (L3-L5, all-to-all past); everything else comes through the hierarchy.
 # Stage causal mask now includes the staggered read (most-recent CLOSED node of every coarser
 #   level, ties per hier_ar_allow_same_time), fixed 2026-10-11.
-# SCORES: (none yet)
+# SCORES: val ppl ep0-3 194.17 / 110.98 / 91.95 / 82.58. Stage skipped +2.53 nats, mean control +2.74.
 # ============================================================================
 # ---- parent header (history) ----
 # ============================================================================
