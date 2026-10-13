@@ -16462,6 +16462,13 @@ class HierarchicalFlowGAT(nn.Module):
         layer_step = 0
         self._xq_nom_edges = None  # per-forward; filled once layer_step reaches _xq_nom_after
         self._last_xq_index_loss = None   # xq descent indexer loss, summed over rounds
+        if getattr(self, "xq_index_loss_to_hier_aux", False) and bool(getattr(self, "use_aux_loss", False)):
+            # the constructor refuses this pair, but a host can flip use_aux_loss afterwards
+            # (the ChromScape aux helper did): the indexer KL and the consistency aux would be
+            # summed into one _last_hier_aux_loss and logged as one number
+            raise RuntimeError("xq_index_loss_to_hier_aux is on and use_aux_loss was set after "
+                               "construction: both would be summed into _last_hier_aux_loss. "
+                               "Keep use_aux_loss False for this config.")
         self._last_nom_kl_loss = None     # nomination KL, mean over the layers that computed it
         self._nom_kl_acc = None
         self._xq_desc_record = None
